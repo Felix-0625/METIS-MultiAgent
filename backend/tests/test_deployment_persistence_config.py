@@ -80,6 +80,17 @@ def test_render_repairs_runtime_volume_permissions_before_starting_services() ->
     )
 
 
+def test_railway_uses_standard_dockerfile_and_writable_runtime_home() -> None:
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
+    railway = (ROOT / "railway.toml").read_text(encoding="utf-8")
+
+    assert "HOME=/var/data" in dockerfile
+    assert 'builder = "DOCKERFILE"' in railway
+    assert 'dockerfilePath = "Dockerfile"' in railway
+    assert 'healthcheckPath = "/health"' in railway
+    assert "healthcheckTimeout = 300" in railway
+
+
 def test_container_shell_scripts_use_unix_line_endings() -> None:
     assert b"\r\n" not in (ROOT / "backend" / "startup.sh").read_bytes()
 

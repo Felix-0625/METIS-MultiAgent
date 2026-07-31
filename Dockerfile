@@ -53,7 +53,8 @@ COPY nginx-render.conf /etc/nginx/templates/metis.conf.template
 COPY supervisor.conf /etc/supervisor/conf.d/metis.conf
 
 # 创建必要目录。Render 持久盘统一挂载到 /var/data。
-ENV METIS_DATA_DIR=/var/data
+ENV METIS_DATA_DIR=/var/data \
+    HOME=/var/data
 RUN mkdir -p memory projects skills logs data data/chat_history \
     /var/data/memory /var/data/pools /var/data/projects /var/data/snapshots
 
