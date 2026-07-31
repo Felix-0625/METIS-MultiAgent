@@ -1,0 +1,64 @@
+# ══════════════════════════════════════════════════════════════════════════
+#  Caddy 配置文件 — HTTPS + 自动 Let's Encrypt 证书
+#
+#  Set METIS_SITE_ADDRESS and ACME_EMAIL before an Internet deployment.
+#  Ensure DNS resolves to the server and ports 80/443 are open.
+# ══════════════════════════════════════════════════════════════════════════
+
+{$METIS_SITE_ADDRESS:localhost} {
+    # 自动获取 Let's Encrypt 证书
+    tls {$ACME_EMAIL:internal}
+
+    # 安全头（含 HSTS + CSP）
+    header {
+        X-Content-Type-Options nosniff
+        X-Frame-Options DENY
+        X-XSS-Protection "1; mode=block"
+        Referrer-Policy strict-origin-when-cross-origin
+        Strict-Transport-Security "max-age=31536000; includeSubDomains; preload"
+        Content-Security-Policy "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https:; connect-src 'self' https:; font-src 'self' data:;"
+        -Server
+    }
+
+    # 静态资源缓存
+    @static {
+        path *.js *.css *.png *.jpg *.jpeg *.gif *.ico *.svg *.woff *.woff2 *.ttf *.eot
+    }
+    header @static Cache-Control "public, max-age=31536000, immutable"
+
+    # API 反代到后端 — handle_path 自动剥离 /api 前缀
+    # 即：https://domain/api/auth/login → 后端收到 /auth/login
+    handle_path /api/* {
+        reverse_proxy backend:8000 {
+            header_up Host {upstream_hostport}
+            header_up X-Real-IP {remote_host}
+            header_up X-Forwarded-For {remote_host}
+            header_up X-Forwarded-Proto https
+            # SSE 流式响应需要关闭缓冲
+            flush_interval -1
+        }
+    }
+
+    # 健康检查
+    handle /health {
+        reverse_proxy backend:8000
+    }
+
+    handle /app/* {
+        reverse_proxy frontend:80
+    }
+
+    handle / {
+        redir /app/ 302
+    }
+
+    # 日志（JSON 格式，方便收集）
+    log {
+        output file /var/log/caddy/access.log {
+            roll_size 100MiB
+            roll_keep 10
+            roll_keep_for 720h
+        }
+        format json
+    }
+}

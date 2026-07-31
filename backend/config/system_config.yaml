@@ -1,0 +1,114 @@
+# 系统配置文件
+
+# Herms API 配置
+hermes:
+  base_url: "http://localhost:8000"
+  api_key: ""
+  timeout: 120
+  retry_times: 3
+  retry_delay: 1
+
+# 默认 LLM 配置
+llm:
+  default_model: "hermes-3"
+  default_temperature: 0.7
+  default_max_tokens: 20480
+  stream: false
+
+# 子代理配置
+subagent:
+  max_rounds: 30
+  context_empty: true
+  forbid_task_tool: true
+  return_summary_only: true
+  auto_cleanup: true
+
+# 数据库配置
+database:
+  memory_db: "memory/memory.db"
+  vector_db: "memory/vectors.db"
+  vector_dim: 384
+  
+# 记忆系统配置
+memory:
+  sqlite_enabled: true
+  vector_enabled: true
+  context_decay_rate: 0.95
+  max_context_entries: 100
+
+# 项目存储配置
+storage:
+  project_root: "projects"
+  memory_root: "memory"
+  skill_pool_root: "skills"
+  
+# 文件管理配置
+file_manager:
+  allow_user_edit: true
+  staging_enabled: true
+  auto_version: true
+  max_versions: 50
+
+# 任务调度配置
+scheduler:
+  check_interval_seconds: 5
+  max_concurrent_tasks: 10
+  block_timeout_hours: 2
+  auto_retry: true
+  max_retries: 3
+
+# 验收证书配置
+certificate:
+  signature_algorithm: "sha256"
+  expiry_hours: 24
+  verify_hash: true
+  verify_signature: true
+
+# 质检配置
+quality_assurance:
+  qa_enabled: true
+  perf_enabled: true
+  sec_enabled: true
+  uxo_enabled: true
+  
+  independent_reporting: true
+  has_veto_power: true
+
+# CCB 配置
+ccb:
+  block_timeout_hours: 2
+  require_user_confirmation: true
+
+# 日志配置
+logging:
+  level: "INFO"
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+  file: "logs/system.log"
+  max_bytes: 10485760  # 10MB
+  backup_count: 5
+
+# 前端配置
+frontend:
+  host: "0.0.0.0"
+  port: 3000
+  title: "AI 多 Agent 项目管理系统"
+  theme: "light"
+
+# 后端配置
+backend:
+  host: "0.0.0.0"
+  port: 8000
+  debug: false
+  cors_enabled: true
+
+# WebSocket 配置（用于实时通信）
+websocket:
+  enabled: true
+  port: 8001
+  heartbeat_interval: 30
+
+# 安全配置
+security:
+  allow_external_skill_import: false
+  scan_malicious_content: true
+  rate_limit_per_minute: 60

@@ -1,0 +1,21 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+pydantic>=2.0.0
+httpx>=0.25.0
+requests>=2.31.0
+python-dotenv>=1.0.0
+pyyaml>=6.0.0
+python-multipart>=0.0.6
+pdfplumber>=0.11.0
+python-docx>=1.1.0
+docx2txt>=0.8
+# PostgreSQL driver (production); local dev falls back to SQLite
+psycopg2-binary>=2.9.9
+# JWT authentication
+PyJWT>=2.8.0
+# Encryption at rest for persisted API and agent configuration secrets
+cryptography>=42.0.0
+# Security scanning
+bandit==1.7.5
+# bandit 1.7.5 imports pbr at runtime but its wheel omits that dependency.
+pbr==7.0.3

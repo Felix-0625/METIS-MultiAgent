@@ -1,0 +1,396 @@
+# Agent 配置文件
+
+# PM Agent 配置
+pm_agent:
+  name: "PM Agent"
+  type: "pm"
+  description: "项目经理 Agent，负责需求分析和项目规划"
+  
+  # 基本能力极值（不可删除）
+  essential_capabilities:
+    - "需求分析"
+    - "方案设计"
+    - "流程建模"
+    - "RACI矩阵"
+    - "逐项目确认"
+  
+  # LLM 配置
+  llm:
+    model: "hermes-3"
+    temperature: 0.7
+    max_tokens: 4096
+  
+  # 输出配置
+  output:
+    format: "markdown"
+    include_state_machine: true
+    include_raci: true
+
+# HR Agent 配置
+hr_agent:
+  name: "HR Agent"
+  type: "hr"
+  description: "人力资源 Agent，负责动态组建项目团队"
+  
+  essential_capabilities:
+    - "岗位需求分析"
+    - "动态分组策略"
+    - "组长任命逻辑"
+    - "Agent创建"
+    - "Skill授权"
+    - "状态监控"
+  
+  # 分组策略
+  grouping:
+    default_strategy: "by_tech_stack"
+    allow_manual_adjust: true
+    max_group_size: 10
+  
+  # 组长任命规则
+  lead_assignment:
+    default_rule: "first_agent"
+    # 可选: first_agent, by_experience, manual
+  
+  llm:
+    model: "hermes-3"
+    temperature: 0.6
+    max_tokens: 2048
+
+# SMAgent 配置
+sm_agent:
+  name: "SMAgent"
+  type: "sm"
+  description: "Skill管理 Agent，负责 Skill 的解析、分类和质量评估"
+  
+  essential_capabilities:
+    - "Skill解析"
+    - "分类判断"
+    - "质量评估"
+    - "版本控制"
+  
+  # Skill 维度体系
+  skill_dimensions:
+    capability_type:
+      - "工具型"
+      - "知识型"
+      - "认知型"
+    application_scenario:
+      business_domain:
+        - "法律"
+        - "医疗"
+        - "金融"
+        - "教育"
+        - "通用"
+      role:
+        - "分析师"
+        - "顾问"
+        - "审核员"
+        - "助理"
+        - "工程师"
+  
+  # 导入配置
+  import:
+    sources:
+      - "GitHub"
+      - "Gitee"
+      - "file_upload"
+      - "zip_import"
+    validation:
+      min_content_length: 100
+      check_malicious: true
+  
+  # 版本控制
+  version_control:
+    staging_enabled: true
+    recovery_period_days: 7
+  
+  llm:
+    model: "hermes-3"
+    temperature: 0.5
+
+# PG Agent 配置
+pg_agent:
+  name: "PG Agent"
+  type: "pg"
+  description: "项目文件管理 Agent，负责目录构建、文件归档和版本控制"
+  
+  essential_capabilities:
+    - "目录构建"
+    - "文件归档"
+    - "进度追踪"
+    - "版本控制"
+    - "产出管理"
+  
+  # 目录结构模板
+  directory_template:
+    - ".project"
+    - "docs"
+    - "src"
+    - "tests"
+    - "deploy"
+    - "assets"
+  
+  # 证书验证配置
+  certificate:
+    signature_algorithm: "sha256"
+    expiry_hours: 24
+    required_checks:
+      - "self_check_passed"
+      - "supervisor_accepted"
+      - "qa_approved"
+      - "perf_approved"
+      - "sec_approved"
+      - "uxo_approved"
+  
+  llm:
+    model: "hermes-3"
+    temperature: 0.5
+
+# Supervisor Agent 配置
+supervisor_agent:
+  name: "Supervisor Agent"
+  type: "supervisor"
+  description: "调度中枢 Agent，负责任务派发和进度监控"
+  
+  essential_capabilities:
+    - "状态机调度"
+    - "资源协调"
+    - "进度监控"
+    - "质检触发"
+    - "子代理派发"
+  
+  # 子代理配置
+  subagent:
+    max_rounds: 30
+    context_empty: true
+    forbid_recursion: true
+    return_summary_only: true
+  
+  # 三重保护机制
+  protection:
+    forbid_task_tool: true
+    max_rounds_limit: 30
+    summary_only_return: true
+  
+  llm:
+    model: "hermes-3"
+    temperature: 0.6
+    max_tokens: 8192
+
+# 组长 Agent 配置
+lead_agent:
+  name: "Lead Agent"
+  type: "lead"
+  description: "组长 Agent，负责验收组内产出"
+  
+  essential_capabilities:
+    - "组内任务验收"
+    - "接口规范审查"
+    - "产出完整性检查"
+    - "签发组内验收证书"
+    - "向上汇报阻塞/风险"
+  
+  # 验收规则
+  validation:
+    check_task_completion: true
+    check_interface_standard: true
+    check_code_style: true
+    check_self_check: true
+  
+  # 跨组协调
+  cross_group:
+    forbid_direct_communication: true
+    require_supervisor_relay: true
+  
+  llm:
+    model: "hermes-3"
+    temperature: 0.6
+
+# 员工 Agent 配置
+employee_agent:
+  name: "Employee Agent"
+  type: "employee"
+  description: "员工 Agent，负责执行具体任务"
+  
+  # Self-Check 自检配置
+  self_check:
+    enabled: true
+    block_on_failure: true
+    checks:
+      - "edge_cases"
+      - "error_handling"
+      - "performance_issues"
+  
+  # 约束规则
+  constraints:
+    forbid_direct_communication: true
+    forbid_skip_level_report: true
+    forbid_create_subagent: true
+    block_timeout_hours: 2
+  
+  # 允许的工具
+  allowed_tools:
+    - "ReadFile"
+    - "WriteFile"
+    - "Shell"
+    - "Glob"
+    - "Grep"
+  
+  forbidden_tools:
+    - "Agent"
+    - "AskUserQuestion"
+  
+  llm:
+    model: "hermes-3"
+    temperature: 0.7
+
+# 质检 Agent 配置
+qa_agent:
+  name: "QA Agent"
+  type: "qa"
+  description: "质量保证 Agent，负责功能完整性检查"
+  
+  essential_capabilities:
+    - "测试用例执行"
+    - "回归测试"
+    - "功能覆盖率检查"
+  
+  # 汇报线
+  reporting:
+    direct_to_supervisor: true
+    bypass_lead: true
+    has_veto_power: true
+  
+  # 触发时机
+  trigger:
+    on_subproject_complete: true
+    on_integration: true
+
+perf_agent:
+  name: "Perf Agent"
+  type: "perf"
+  description: "性能 Agent，负责性能基准测试"
+  
+  essential_capabilities:
+    - "负载测试"
+    - "瓶颈分析"
+    - "Core Web Vitals"
+  
+  reporting:
+    direct_to_supervisor: true
+    has_veto_power: true
+  
+  trigger:
+    on_module_integration: true
+
+sec_agent:
+  name: "Sec Agent"
+  type: "sec"
+  description: "安全 Agent，负责安全审计"
+  
+  essential_capabilities:
+    - "漏洞扫描"
+    - "合规检查"
+    - "密钥泄露检测"
+  
+  reporting:
+    direct_to_supervisor: true
+    has_veto_power: true
+  
+  trigger:
+    on_code_commit: true
+    on_pre_release: true
+
+uxo_agent:
+  name: "UXO Agent"
+  type: "uxo"
+  description: "用户体验优化 Agent，负责 UI/UX 审查"
+  
+  essential_capabilities:
+    - "UI/UX审查"
+    - "等待时间检测"
+    - "交互流程优化"
+  
+  reporting:
+    direct_to_supervisor: true
+    has_veto_power: true
+  
+  trigger:
+    on_pre_release: true
+
+# IdeaLanding Agent 配置
+idea_landing_agent:
+  name: "IdeaLanding Agent"
+  type: "idea_landing"
+  description: "想法落地顾问，帮助用户把模糊想法变成可执行的需求文档"
+
+  essential_capabilities:
+    - "压力测试想法"
+    - "生成需求文档"
+    - "优化补充需求"
+    - "对话隔离管理"
+    - "个人记忆维护"
+
+  # 三阶段工作流
+  workflow:
+    phase_1:
+      name: "压力测试"
+      description: "对用户想法进行多维度拷问，识别假设、盲区、矛盾点"
+      reference: "start-pressure-test"
+    phase_2:
+      name: "需求文档"
+      description: "生成结构化需求文档（目标/用户故事/功能清单/约束/验收标准）"
+      reference: "grill"
+    phase_3:
+      name: "优化补充"
+      description: "逐条讨论，补充细节，消除歧义，完善边界条件"
+
+  # 对话管理
+  conversation:
+    isolation: true           # 每个对话记忆隔离
+    allow_new_conversation: true
+    support_pin: true         # 支持置顶
+    support_tags: true        # 支持标签
+    support_category: true    # 支持分类
+    compress_threshold: 12    # 超过12条消息触发历史压缩
+    keep_recent: 6            # 压缩后保留最近6条原文
+
+  # 个人记忆（跨对话共享）
+  personal_memory:
+    enabled: true
+    max_idea_summaries: 50    # 最多保存50条历史idea摘要
+    max_frequent_tags: 20     # 最多记录20个常用标签
+
+  llm:
+    model: "hermes-3"
+    temperature: 0.7
+    max_tokens: 4096
+
+# CCB Agent 配置
+ccb_agent:
+  name: "CCB Agent"
+  type: "ccb"
+  description: "变更控制委员会 Agent，负责仲裁变更和争议"
+  
+  essential_capabilities:
+    - "变更影响分析"
+    - "风险评估"
+    - "决策建议"
+    - "冲突调解"
+  
+  # 决策选项
+  decisions:
+    - "修"    # 接受变更，打回修改
+    - "排期"  # 接受变更，放入下一版本
+    - "拒绝"  # 拒绝变更，维持原方案
+  
+  # 触发条件
+  triggers:
+    - "需求变更"
+    - "架构调整"
+    - "阻塞超时_2h"
+    - "质检争议"
+  
+  llm:
+    model: "hermes-3"
+    temperature: 0.6

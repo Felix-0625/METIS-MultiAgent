@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8"/>
+  <meta name="viewport" content="width=device-width,initial-scale=1.0"/>
+  <title>MeTis — AI Multi-Agent System</title>
+  <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><text y='28' font-size='28'>M</text></svg>"/>
+  <link rel="preconnect" href="https://fonts.googleapis.com"/>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin/>
+  <link href="https://fonts.googleapis.com/css2?family=Inter:opsz,wght@14..32,400;14..32,500;14..32,600;14..32,700;14..32,800;14..32,900&display=swap" rel="stylesheet"/>
+  <link rel="stylesheet" href="css/style.css?v=20260703"/>
+  <link rel="stylesheet" href="css/promo-effects.css?v=20260703"/>
+</head>
+<body>
+  <!-- ════ Intro Screen (accelerated: 6s auto-dismiss) ════ -->
+  <div class="intro-screen" id="introScreen">
+    <div class="intro-text"></div>
+    <div class="intro-sub">点击下方按钮进入</div>
+    <button class="intro-enter-btn">进入介绍 →</button>
+  </div>
+
+  <!-- ════ Background Canvas ════ -->
+  <div id="bg-canvas"></div>
+
+  <!-- ════ Pill Navigation ════ -->
+  <nav class="pill-nav" id="navbar">
+    <span class="pill-logo cursor-target">M E T I S</span>
+    <ul class="pill-list">
+      <li><a href="#" class="pill active cursor-target" data-nav="0">首页</a></li>
+      <li><a href="#" class="pill cursor-target" data-nav="1">特性</a></li>
+      <li><a href="#" class="pill cursor-target" data-nav="2">历程</a></li>
+      <li><a href="#" class="pill cursor-target" data-nav="3">流程</a></li>
+      <li><a href="#" class="pill cursor-target" data-nav="4">架构</a></li>
+      <li><a href="#" class="pill cursor-target" data-nav="5">登录</a></li>
+    </ul>
+    <button class="btn-primary navbar-cta cursor-target" onclick="openLogin()">
+      <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round">
+        <path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/>
+      </svg>进入系统
+    </button>
+  </nav>
+
+  <!-- ════ Page Indicator ════ -->
+  <div class="page-indicator" id="pageIndicator">
+    <button class="page-dot active cursor-target" data-index="0"></button>
+    <button class="page-dot cursor-target" data-index="1"></button>
+    <button class="page-dot cursor-target" data-index="2"></button>
+    <button class="page-dot cursor-target" data-index="3"></button>
+    <button class="page-dot cursor-target" data-index="4"></button>
+    <button class="page-dot cursor-target" data-index="5"></button>
+  </div>
+
+  <!-- ════ Scroll Container ════ -->
+  <main class="scroll-container" id="scrollContainer">
+
+    <!-- ── Section 0: Hero ── -->
+    <section class="section" data-index="0">
+      <div class="section-content hero-content">
+        <div class="hero-badge"><span class="hero-badge-dot"></span>AI 多智能体协作平台</div>
+        <h1 class="hero-title">M E T I S</h1>
+        <p class="hero-subtitle">AI Multi-Agent System</p>
+        <p class="hero-desc">将需求、编码、质检、部署拆解给专业 AI Agent，用矩阵协作替代单人开发</p>
+        <div class="hero-actions">
+          <button class="btn-primary btn-lg cursor-target" onclick="openLogin()">
+            <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>进入系统
+          </button>
+          <button class="btn-secondary cursor-target" onclick="scrollToSection(1)">了解特性</button>
+        </div>
+        <div class="hero-flow">
+          <div class="hero-flow-item"><div class="hero-flow-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div><span class="hero-flow-label">想法提交</span></div>
+          <svg class="hero-flow-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          <div class="hero-flow-item"><div class="hero-flow-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><span class="hero-flow-label">PM 拆解</span></div>
+          <svg class="hero-flow-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          <div class="hero-flow-item"><div class="hero-flow-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><span class="hero-flow-label">专家执行</span></div>
+          <svg class="hero-flow-arrow" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+          <div class="hero-flow-item"><div class="hero-flow-icon"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div><span class="hero-flow-label">质检交付</span></div>
+        </div>
+      </div>
+      <div class="site-footer">
+        <div class="site-footer-inner">
+          <span class="footer-brand">M E T I S</span>
+          <div class="footer-divider"></div>
+          <span class="footer-info">AI 多智能体协作平台 · 将想法交给矩阵</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Section 1: Features / BorderGlow ── -->
+    <section class="section" data-index="1">
+      <div class="section-content">
+        <span class="section-label">核心能力</span>
+        <h2 class="section-title">不止于对话的智能协作</h2>
+        <p class="section-desc">MeTis 融合多种专业 AI 智能体，覆盖产品、工程、质量全流程</p>
+        <div class="features-grid">
+          <div class="feature-card border-glow-card cursor-target"><div class="feature-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></div><h3 class="feature-name">多智能体协作</h3><p class="feature-desc">PM 组长、全栈工程师、监督组长、QA 测试等角色各司其职，形成高效的虚拟研发团队。</p></div>
+          <div class="feature-card border-glow-card cursor-target"><div class="feature-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div><h3 class="feature-name">阶段看板</h3><p class="feature-desc">可视化项目阶段，支持冲突检测、审查链、团队健康度，让进度一目了然。</p></div>
+          <div class="feature-card border-glow-card cursor-target"><div class="feature-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><h3 class="feature-name">全栈工程能力</h3><p class="feature-desc">AI 工程师独立完成从代码生成、调试到部署的完整闭环，支持多种技术栈。</p></div>
+          <div class="feature-card border-glow-card cursor-target"><div class="feature-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div><h3 class="feature-name">质量保障</h3><p class="feature-desc">自动化测试看板、缺陷追踪、压力测试报告，确保交付质量可量化可追溯。</p></div>
+          <div class="feature-card border-glow-card cursor-target"><div class="feature-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></div><h3 class="feature-name">实时协作</h3><p class="feature-desc">PM 团队聊天、监督审查、进度同步，所有交互实时可见，沟通即记录。</p></div>
+          <div class="feature-card border-glow-card cursor-target"><div class="feature-icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></div><h3 class="feature-name">想法落地</h3><p class="feature-desc">从灵感到需求文档、优化建议、压力测试，一站式将想法转化为可执行项目。</p></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Section 2: Journey / FlowingMenu ── -->
+    <section class="section" data-index="2">
+      <div class="section-content">
+        <span class="section-label">项目历程</span>
+        <h2 class="section-title">从单 Agent 到多智能体矩阵</h2>
+        <p class="section-desc">一路迭代，每一次突破都源于对职责边界的重新思考</p>
+        <div class="menu-wrap">
+          <div class="menu">
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">起点</span> 初识 Vibe Coding</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>Vibe Coding — Trae 本地单 Agent 客服 — </span><span>Vibe Coding — Trae 本地单 Agent 客服 — </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">困境</span> 单 Agent 之痛</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>上下文膨胀 · 记忆混乱 · 功能丢失 · </span><span>上下文膨胀 · 记忆混乱 · 功能丢失 · </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">转折</span> 从一个人到一个团队</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>职责拆分 — 需求 · 编码 · 质检 — </span><span>职责拆分 — 需求 · 编码 · 质检 — </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V1</span> 全自动流水线</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>PM → HR → 执行 → 质检 → </span><span>PM → HR → 执行 → 质检 → </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V2</span> 质检循环闭环</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>质检 → 反馈 → 修复 → 复验 → </span><span>质检 → 反馈 → 修复 → 复验 → </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V3</span> 精准返工</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>文件看板 · Agent 编号绑定 · </span><span>文件看板 · Agent 编号绑定 · </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V4</span> 双层架构</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>PM 组长+成员 · 监督组长+成员 · </span><span>PM 组长+成员 · 监督组长+成员 · </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V5</span> 专家池 + Skill 匹配</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>9类专家 · 两层记忆 · 跨项目沉淀 — </span><span>9类专家 · 两层记忆 · 跨项目沉淀 — </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V6</span> 全能工程师</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>人工介入 · 全局上下文 · 闭环修复 — </span><span>人工介入 · 全局上下文 · 闭环修复 — </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V7</span> 工作群</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>@PM → 拆解 → HR → 执行 → 质检 — </span><span>@PM → 拆解 → HR → 执行 → 质检 — </span></div></div></div></div></div>
+            <div class="menu__item cursor-target"><div class="menu__item-link"><span class="journey-tag">V8</span> 基础设施重构</div><div class="marquee"><div class="marquee__inner-wrap"><div class="marquee__inner"><div class="marquee__part"><span>ExpertLock · Orchestrator · TaskDispatcher — </span><span>ExpertLock · Orchestrator · TaskDispatcher — </span></div></div></div></div></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Section 3: Workflow ── -->
+    <section class="section" data-index="3">
+      <div class="section-content">
+        <span class="section-label">系统工作流程</span>
+        <h2 class="section-title">矩阵协作流水线</h2>
+        <p class="section-desc">从想法提交到交付完成，全程由 AI 专家矩阵自动流转</p>
+        <div class="workflow-diagram">
+          <div class="wf-row">
+            <div class="wf-card cursor-target"><div class="wf-card-icon wf-icon-idea"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div><span class="wf-card-label">想法提交</span><span class="wf-card-sub">Idea Input</span></div>
+            <svg class="wf-arrow" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-card cursor-target"><div class="wf-card-icon wf-icon-pm"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><span class="wf-card-label">PM 拆解</span><span class="wf-card-sub">需求分析</span></div>
+            <svg class="wf-arrow" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-card cursor-target"><div class="wf-card-icon wf-icon-hr"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></div><span class="wf-card-label">HR 分配</span><span class="wf-card-sub">专家匹配</span></div>
+          </div>
+          <div class="wf-row">
+            <div class="wf-gap"></div><svg class="wf-arrow-down" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-gap"></div><svg class="wf-arrow-down" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-gap"></div><svg class="wf-arrow-down" width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-gap"></div>
+          </div>
+          <div class="wf-row">
+            <div class="wf-card cursor-target"><div class="wf-card-icon wf-icon-expert"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><span class="wf-card-label">专家执行</span><span class="wf-card-sub">开发实现</span></div>
+            <svg class="wf-arrow" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-card cursor-target"><div class="wf-card-icon wf-icon-qa"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div><span class="wf-card-label">质检验证</span><span class="wf-card-sub">QA Check</span></div>
+            <svg class="wf-arrow" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-card cursor-target"><div class="wf-card-icon wf-icon-supervisor"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div><span class="wf-card-label">监督审核</span><span class="wf-card-sub">终验收</span></div>
+            <svg class="wf-arrow" width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="wf-card cursor-target"><div class="wf-card-icon wf-icon-delivery"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div><span class="wf-card-label">交付完成</span><span class="wf-card-sub">Delivery</span></div>
+          </div>
+          <div class="wf-loop"><svg class="wf-loop-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="1 4 1 10 7 10"/><path d="M3.51 15a9 9 0 1 0 2.13-9.36L1 10"/></svg><span class="wf-loop-text">质检不通过 · 自动返工循环</span></div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Section 4: Architecture / glow-hover ── -->
+    <section class="section" data-index="4">
+      <div class="section-content">
+        <span class="section-label">系统架构</span>
+        <h2 class="section-title">智能体协作网络</h2>
+        <p class="section-desc">每个项目由多位专业 AI 智能体分工协作，模拟真实研发团队运作</p>
+        <div class="arch-layers">
+          <div class="arch-layer"><span class="arch-layer-line"></span><span class="arch-layer-label">用户交互层</span><span class="arch-layer-line"></span></div>
+          <div class="arch-row ui-row">
+            <div class="arch-box arch-box-ui glow-hover cursor-target"><div class="arch-box-icon abi-dashboard"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><line x1="3" y1="9" x2="21" y2="9"/><line x1="9" y1="21" x2="9" y2="9"/></svg></div><span class="arch-box-label">项目看板</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-ui glow-hover cursor-target"><div class="arch-box-icon abi-phase"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 22 8.5 22 15.5 12 22 2 15.5 2 8.5"/><line x1="12" y1="22" x2="12" y2="15.5"/><polyline points="22 8.5 12 15.5 2 8.5"/></svg></div><span class="arch-box-label">阶段看板</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-ui glow-hover cursor-target"><div class="arch-box-icon abi-workspace"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><span class="arch-box-label">工程师工作台</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-ui glow-hover cursor-target"><div class="arch-box-icon abi-idea"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div><span class="arch-box-label">想法落地</span></div>
+          </div>
+          <div class="arch-vconn"><svg width="16" height="24" viewBox="0 0 16 24" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="1.5"><line x1="8" y1="0" x2="8" y2="24"/><polyline points="8 16 12 12 8 8"/></svg></div>
+          <div class="arch-layer"><span class="arch-layer-line"></span><span class="arch-layer-label">智能体协作层</span><span class="arch-layer-line"></span></div>
+          <div class="arch-row agent-row">
+            <div class="arch-box arch-box-agent glow-hover cursor-target"><div class="arch-box-icon abi-agent-pm"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg></div><span class="arch-box-label">PM 组长</span><span class="arch-box-sub">需求拆解 · 阶段规划</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-agent glow-hover cursor-target"><div class="arch-box-icon abi-agent-hr"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></svg></div><span class="arch-box-label">HR 调度</span><span class="arch-box-sub">专家匹配 · 下发执行</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-agent arch-box-accent glow-hover cursor-target"><div class="arch-box-icon abi-agent-engineer"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></svg></div><span class="arch-box-label">全栈工程师</span><span class="arch-box-sub">代码开发 · 部署运维</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-agent glow-hover cursor-target"><div class="arch-box-icon abi-agent-qa"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div><span class="arch-box-label">QA 测试</span><span class="arch-box-sub">质量验证 · 缺陷追踪</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-agent glow-hover cursor-target"><div class="arch-box-icon abi-agent-supervisor"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg></div><span class="arch-box-label">监督组长</span><span class="arch-box-sub">审查验收 · 终审调整</span></div>
+          </div>
+          <div class="arch-vconn"><svg width="16" height="24" viewBox="0 0 16 24" fill="none" stroke="rgba(255,255,255,0.15)" stroke-width="1.5"><line x1="8" y1="0" x2="8" y2="24"/><polyline points="12 16 8 12 4 16"/></svg></div>
+          <div class="arch-layer"><span class="arch-layer-line"></span><span class="arch-layer-label">基础设施层</span><span class="arch-layer-line"></span></div>
+          <div class="arch-row infra-row">
+            <div class="arch-box arch-box-infra glow-hover cursor-target"><div class="arch-box-icon abi-infra-orch"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 6v6l4 2"/></svg></div><span class="arch-box-label">Orchestrator</span><span class="arch-box-sub">流程编排 · 阶段协调</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-infra glow-hover cursor-target"><div class="arch-box-icon abi-infra-lock"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg></div><span class="arch-box-label">ExpertLock</span><span class="arch-box-sub">文件级租约锁</span></div>
+            <svg class="arch-inline-arrow" width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5"><line x1="5" y1="12" x2="19" y2="12"/><polyline points="12 5 19 12 12 19"/></svg>
+            <div class="arch-box arch-box-infra glow-hover cursor-target"><div class="arch-box-icon abi-infra-task"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M9 11l3 3L22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></svg></div><span class="arch-box-label">TaskDispatcher</span><span class="arch-box-sub">全生命周期管理</span></div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── Section 5: CTA / TextPressure ── -->
+    <section class="section" data-index="5">
+      <div class="section-content cta-content">
+        <div class="text-pressure-wrap" data-text="准备好创建你的项目了吗？"></div>
+        <p class="cta-desc">无需复杂配置，即刻开启多智能体协作体验</p>
+        <button class="btn-primary btn-lg cursor-target" onclick="openLogin()" style="margin-top:12px">
+          <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>进入 MeTis
+        </button>
+        <p class="cta-footnote">免费使用 · 无需注册 · 即刻开始</p>
+      </div>
+    </section>
+
+  </main>
+
+  <!-- ════ Login Modal ════ -->
+  <div class="modal-overlay" id="loginOverlay" onclick="closeLogin(event)">
+    <div class="modal" onclick="event.stopPropagation()">
+      <button class="modal-close cursor-target" onclick="closeLogin()"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></svg></button>
+      <div class="modal-brand">M E T I S</div>
+      <div class="modal-subtitle">AI 多智能体协作平台</div>
+      <div class="auth-tabs">
+        <button class="auth-tab active cursor-target" onclick="switchAuthTab('login')">登录</button>
+        <button class="auth-tab cursor-target" onclick="switchAuthTab('register')">注册</button>
+      </div>
+      <div id="loginPanel">
+        <form class="login-form" onsubmit="handleLogin(event)">
+          <div class="form-group"><label class="form-label" for="loginName">用户名或邮箱</label><input class="form-input cursor-target" id="loginName" type="text" placeholder="输入用户名或邮箱" required autocomplete="username"/></div>
+          <div class="form-group"><label class="form-label" for="loginPass">密码</label><div class="password-wrapper"><input class="form-input cursor-target" id="loginPass" type="password" placeholder="输入密码" required autocomplete="current-password"/><button type="button" class="password-toggle cursor-target" onclick="togglePassword('loginPass', this)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
+          <button class="btn-primary btn-block cursor-target" type="submit"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>登录并进入</button>
+        </form>
+        <p style="text-align:center;margin-top:10px"><a href="#" onclick="switchAuthTab('forgot');return false" style="color:var(--text-secondary);font-size:12px">忘记密码？</a></p>
+      </div>
+      <div id="registerPanel" style="display:none">
+        <form class="login-form" onsubmit="handleRegister(event)">
+          <div class="form-group"><label class="form-label" for="regName">用户名</label><input class="form-input cursor-target" id="regName" type="text" placeholder="设置你的用户名" required/></div>
+          <div class="form-group"><label class="form-label" for="regEmail">邮箱</label><input class="form-input cursor-target" id="regEmail" type="email" placeholder="输入你的邮箱" required/></div>
+          <div class="form-group"><label class="form-label" for="regPass">密码</label><div class="password-wrapper"><input class="form-input cursor-target" id="regPass" type="password" placeholder="设置密码（至少6位）" required minlength="6"/><button type="button" class="password-toggle cursor-target" onclick="togglePassword('regPass', this)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div></div>
+          <button class="btn-primary btn-block cursor-target" type="submit"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 3h4a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2h-4"/><polyline points="10 17 15 12 10 7"/><line x1="15" y1="12" x2="3" y2="12"/></svg>注册并进入</button>
+        </form>
+        <div id="registerVerifyPanel" style="display:none;text-align:center;margin-top:16px">
+          <p style="color:var(--text-secondary);font-size:13px;margin-bottom:12px">验证邮件已发送至 <strong id="verifyEmailDisplay"></strong></p>
+          <input class="form-input cursor-target" id="regVerifyCode" type="text" placeholder="输入6位验证码" maxlength="6" style="text-align:center;letter-spacing:4px;margin-bottom:10px"/>
+          <button class="btn-primary btn-block cursor-target" onclick="handleVerifyEmail()">验证邮箱</button>
+          <button class="btn-secondary btn-block cursor-target" onclick="handleResendVerification()" style="margin-top:8px">重发验证码</button>
+          <button type="button" style="margin-top:8px;background:none;border:none;color:var(--text-secondary);font-size:12px;cursor:pointer;text-decoration:underline" onclick="(function(){document.getElementById('registerVerifyPanel').style.display='none';var f=document.querySelector('#registerPanel form');if(f)f.style.display='';window._registerEmail=null;})()">← 返回修改注册信息</button>
+        </div>
+      </div>
+      <!-- ── 忘记密码面板 ── -->
+      <div id="forgotPasswordPanel" style="display:none">
+        <form class="login-form" onsubmit="handleForgotPassword(event)">
+          <div class="form-group"><label class="form-label" for="forgotEmail">请输入注册邮箱</label><input class="form-input cursor-target" id="forgotEmail" type="email" placeholder="输入邮箱以发送验证码" required/></div>
+          <button class="btn-primary btn-block cursor-target" type="submit"><svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 20h9"/><path d="M16.5 3.5a2.121 2.121 0 0 1 3 3L7 19l-4 1 1-4L16.5 3.5z"/></svg>发送验证码</button>
+        </form>
+        <div id="fpVerifyPanel" style="display:none;text-align:center;margin-top:16px">
+          <p style="color:var(--text-secondary);font-size:13px;margin-bottom:8px">验证码已发送，请输入6位验证码和新密码</p>
+          <input class="form-input cursor-target" id="fpVerifyCode" type="text" placeholder="6位验证码" maxlength="6" style="text-align:center;letter-spacing:4px;margin-bottom:10px"/>
+          <div class="password-wrapper"><input class="form-input cursor-target" id="fpNewPass" type="password" placeholder="新密码（至少6位）" minlength="6" style="margin-bottom:10px"/><button type="button" class="password-toggle cursor-target" onclick="togglePassword('fpNewPass', this)"><svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg></button></div>
+          <button class="btn-primary btn-block cursor-target" onclick="handleFpReset()">重置密码</button>
+        </div>
+        <p style="text-align:center;margin-top:12px"><a href="#" onclick="switchAuthTab('login');return false" style="color:var(--text-secondary);font-size:12px">← 返回登录</a></p>
+      </div>
+    </div>
+  </div>
+
+  <!-- ════ Scripts ════ -->
+  <!-- Intro: auto-dismiss in 6s (speed up from 15s) -->
+  <script>
+    function dismissIntro(){var el=document.getElementById("introScreen");if(el){el.classList.add("fadeout");setTimeout(function(){el.style.display="none"},800);}}
+    setTimeout(dismissIntro,6000);
+  </script>
+  <!-- Intro typing animation (accelerated: 40ms/char typing, 15ms deleting, 800ms pause) -->
+  <script>
+    !function(){var s=document.getElementById("introScreen"),t=s.querySelector(".intro-text"),u=s.querySelector(".intro-sub"),b=s.querySelector(".intro-enter-btn"),w=["METIS","多智能体协作平台","AI Multi-Agent System","想法交给矩阵"],wi=0,ci=0,d=false,h;function type(){var wd=w[wi];if(!d&&ci<wd.length){ci++;t.textContent=wd.substring(0,ci);h=setTimeout(type,40+25*Math.random())}else if(!d&&ci>=wd.length){d=true;h=setTimeout(type,800)}else if(d&&ci>0){ci--;t.textContent=wd.substring(0,ci);h=setTimeout(type,15+10*Math.random())}else{d=false;wi=(wi+1)%w.length;if(wi===0){t.textContent=w[0];u.classList.add("show");setTimeout(function(){b.classList.add("show")},300)}else{h=setTimeout(type,200)}}}type();function dismiss(){s.classList.add("fadeout");setTimeout(function(){s.style.display="none"},800)}b.addEventListener("click",dismiss);s.addEventListener("click",function(e){if(e.target===s)dismiss()})}();
+  </script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/gsap/3.12.5/gsap.min.js"></script>
+  <script type="importmap">{"imports":{"three":"https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js","three/addons/":"https://cdn.jsdelivr.net/npm/three@0.180.0/examples/jsm/","postprocessing":"https://cdn.jsdelivr.net/npm/postprocessing@6.39.1/build/index.js"}}</script>
+  <script type="module" src="js/background.js"></script>
+  <script src="js/promo-effects.js"></script>
+  <script src="js/main.js?v=20260703"></script>
+</body>
+</html>

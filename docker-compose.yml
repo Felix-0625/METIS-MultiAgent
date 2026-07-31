@@ -1,0 +1,153 @@
+services:
+  # ── PostgreSQL 数据库 ────────────────────────────────────────────────────────
+  db:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: dagent
+      POSTGRES_USER: dagent
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?err: 生产环境必须设置 POSTGRES_PASSWORD}"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    networks:
+      - agent-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dagent -d dagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+          cpus: '1.0'
+        reservations:
+          memory: 128M
+          cpus: '0.25'
+
+  # ── 后端 ────────────────────────────────────────────────────────────────────
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    expose:
+      - "8000"
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    tmpfs:
+      - /tmp:size=128M,mode=1777
+    volumes:
+      - metis_data:/var/data
+    environment:
+      # LLM API
+      - HERMES_API_URL=${HERMES_API_URL:-https://api.openai.com/v1}
+      - HERMES_API_KEY=${HERMES_API_KEY:-}
+      # 数据库（PostgreSQL）
+      - "DATABASE_URL=${DATABASE_URL:-postgresql://dagent:${POSTGRES_PASSWORD}@db:5432/dagent}"
+      - REQUIRE_DATABASE_URL=true
+      - METIS_DATA_DIR=/var/data
+      - "METIS_DATA_ENCRYPTION_KEY=${METIS_DATA_ENCRYPTION_KEY:?err: METIS_DATA_ENCRYPTION_KEY is required}"
+      # JWT 安全
+      - JWT_SECRET=${JWT_SECRET:-}
+      - JWT_EXPIRY_HOURS=${JWT_EXPIRY_HOURS:-24}
+      # 管理员初始账号
+      - ADMIN_USERNAME=${ADMIN_USERNAME:-admin}
+      - ADMIN_PASSWORD=${ADMIN_PASSWORD:-}
+      # CORS（生产环境设为你的域名）
+      - CORS_ORIGINS=${CORS_ORIGINS:-https://YOUR_DOMAIN,http://localhost:3000}
+      # 限流
+      - RATE_LIMIT_RPM=${RATE_LIMIT_RPM:-60}
+      - RATE_LIMIT_READ_RPM=${RATE_LIMIT_READ_RPM:-120}
+      - RATE_LIMIT_WRITE_RPM=${RATE_LIMIT_WRITE_RPM:-60}
+      - RATE_LIMIT_LOGIN_RPM=${RATE_LIMIT_LOGIN_RPM:-10}
+      - MAX_FAILED_ATTEMPTS=${MAX_FAILED_ATTEMPTS:-5}
+      - LOCKOUT_DURATION=${LOCKOUT_DURATION:-300}
+      - TRUSTED_PROXY_IPS=${TRUSTED_PROXY_IPS:-127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16}
+      - RUNTIME_ACCEPTANCE_REQUIRED=${RUNTIME_ACCEPTANCE_REQUIRED:-false}
+      - RUNTIME_ACCEPTANCE_ENABLED=${RUNTIME_ACCEPTANCE_ENABLED:-false}
+      # 请求体大小限制
+      - MAX_BODY_SIZE=${MAX_BODY_SIZE:-10485760}
+    depends_on:
+      db:
+        condition: service_healthy
+    healthcheck:
+      test:
+        - CMD
+        - python
+        - -c
+        - "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=5).read()"
+      interval: 10s
+      timeout: 6s
+      retries: 6
+      start_period: 30s
+    stop_grace_period: 30s
+    restart: unless-stopped
+    networks:
+      - agent-network
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: '2.0'
+        reservations:
+          memory: 512M
+          cpus: '0.5'
+
+  # ── 前端（Nginx 静态服务）───────────────────────────────────────────────────
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_URL=/api
+    expose:
+      - "80"
+    depends_on:
+      backend:
+        condition: service_healthy
+    restart: unless-stopped
+    networks:
+      - agent-network
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+        reservations:
+          memory: 64M
+          cpus: '0.1'
+
+  # ── Caddy（HTTPS + Let's Encrypt + 反代）───────────────────────────────────
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    networks:
+      - agent-network
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: '0.5'
+        reservations:
+          memory: 32M
+          cpus: '0.1'
+
+volumes:
+  pg_data:       # PostgreSQL 数据持久化
+  metis_data:    # Agent memory, pools, and generated workspaces
+  caddy_data:    # Let's Encrypt 证书
+  caddy_config:  # Caddy 配置
+
+networks:
+  agent-network:
+    driver: bridge

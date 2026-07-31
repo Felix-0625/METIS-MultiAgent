@@ -1,0 +1,225 @@
+/* ═══════════════════════════════════════════════════════════════
+   Metis Design System v2 — Premium Dark-Toned Palette
+   ═══════════════════════════════════════════════════════════════ */
+
+:root {
+  /* ── 主色调 ──────────────────────────────────────────────── */
+  --metis-primary: #5b5ea6;
+  --metis-primary-light: #eeeff8;
+  --metis-primary-gradient: linear-gradient(135deg, #5b5ea6 0%, #8b5cf6 100%);
+
+  /* ── 语义色 ──────────────────────────────────────────────── */
+  --metis-success: #0ea371;
+  --metis-success-light: #e8f8f0;
+  --metis-warning: #d97706;
+  --metis-warning-light: #fef7ed;
+  --metis-error: #dc2626;
+  --metis-error-light: #fef2f2;
+
+  /* ── 中性色 ──────────────────────────────────────────────── */
+  --metis-bg: #f7f6f3;
+  --metis-card-bg: #ffffff;
+  --metis-border: #e7e5e2;
+  --metis-text: #1e1b1b;
+  --metis-text-secondary: #6b6b6b;
+  --metis-text-muted: #a1a1a1;
+
+  /* ── 侧边栏（深色） ──────────────────────────────────────── */
+  --metis-sidebar-bg: #1c1b1f;
+  --metis-sidebar-text: #d4d4d8;
+  --metis-sidebar-active: #2d2b32;
+  --metis-sidebar-hover: #28262c;
+
+  /* ── 阴影 ────────────────────────────────────────────────── */
+  --metis-shadow-sm: 0 1px 2px rgba(0, 0, 0, 0.04);
+  --metis-shadow: 0 1px 3px rgba(0, 0, 0, 0.06), 0 1px 2px rgba(0, 0, 0, 0.04);
+  --metis-shadow-hover: 0 4px 16px rgba(0, 0, 0, 0.08);
+  --metis-radius: 10px;
+  --metis-radius-sm: 6px;
+}
+
+/* ── 全局背景 ──────────────────────────────────────────────── */
+.ant-layout-content {
+  background: var(--metis-bg) !important;
+}
+
+/* ── antd ConfigProvider 覆盖（最安全的方式） ──────────────── */
+.ant-btn-primary {
+  background: var(--metis-primary) !important;
+  border-color: var(--metis-primary) !important;
+  box-shadow: 0 2px 8px rgba(91, 94, 166, 0.3) !important;
+}
+.ant-btn-primary:hover {
+  background: #4e5194 !important;
+  border-color: #4e5194 !important;
+  box-shadow: 0 4px 14px rgba(91, 94, 166, 0.4) !important;
+}
+.ant-tag-blue {
+  background: var(--metis-primary-light) !important;
+  border-color: #d5d6f0 !important;
+  color: var(--metis-primary) !important;
+}
+
+/* ── 卡片 ──────────────────────────────────────────────────── */
+.metis-card {
+  background: var(--metis-card-bg);
+  border: 1px solid var(--metis-border);
+  border-radius: var(--metis-radius);
+  box-shadow: var(--metis-shadow);
+  transition: box-shadow 0.25s ease, border-color 0.25s ease;
+}
+.metis-card:hover {
+  box-shadow: var(--metis-shadow-hover);
+}
+
+/* ── 统计卡片 ──────────────────────────────────────────────── */
+.metis-stat-card {
+  background: var(--metis-card-bg);
+  border: 1px solid var(--metis-border);
+  border-radius: var(--metis-radius);
+  box-shadow: var(--metis-shadow);
+  padding: 18px 20px;
+  transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+  position: relative;
+  overflow: hidden;
+}
+.metis-stat-card::before {
+  content: '';
+  position: absolute;
+  top: 0; left: 0;
+  width: 3px;
+  height: 100%;
+  background: var(--metis-primary);
+  border-radius: 3px 0 0 3px;
+  opacity: 0;
+  transition: opacity 0.25s ease;
+}
+.metis-stat-card:hover {
+  box-shadow: var(--metis-shadow-hover);
+  border-color: #d5d6f0;
+  transform: translateY(-2px);
+}
+.metis-stat-card:hover::before {
+  opacity: 1;
+}
+
+/* ── 面板头部 ──────────────────────────────────────────────── */
+.metis-section-header {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-bottom: 16px;
+}
+.metis-section-header .metis-header-icon {
+  font-size: 18px;
+  width: 36px;
+  height: 36px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--metis-radius-sm);
+  background: var(--metis-primary-light);
+  color: var(--metis-primary);
+}
+.metis-section-header .metis-header-title {
+  font-weight: 700;
+  font-size: 15px;
+  color: var(--metis-text);
+  letter-spacing: -0.01em;
+}
+
+/* ── 表格 ──────────────────────────────────────────────────── */
+.ant-table {
+  border-radius: var(--metis-radius) !important;
+  overflow: hidden;
+  font-size: 13px;
+}
+.ant-table-thead > tr > th {
+  background: #fafaf8 !important;
+  font-weight: 600 !important;
+  color: var(--metis-text-secondary) !important;
+  font-size: 11px !important;
+  text-transform: uppercase;
+  letter-spacing: 0.8px;
+  border-bottom: 2px solid var(--metis-border) !important;
+}
+.ant-table-tbody > tr:hover > td {
+  background: #fafaf8 !important;
+}
+
+/* ── 标签 ──────────────────────────────────────────────────── */
+.ant-tag {
+  border-radius: 4px;
+  font-weight: 500;
+  font-size: 12px;
+  padding: 1px 8px;
+  line-height: 20px;
+}
+
+/* ── 输入框 ────────────────────────────────────────────────── */
+.ant-input,
+.ant-input-affix-wrapper,
+.ant-input-textarea textarea {
+  border-radius: var(--metis-radius-sm) !important;
+  border-color: var(--metis-border) !important;
+}
+.ant-input:focus,
+.ant-input-affix-wrapper:focus,
+.ant-input-affix-wrapper-focused {
+  border-color: var(--metis-primary) !important;
+  box-shadow: 0 0 0 2px rgba(91, 94, 166, 0.12) !important;
+}
+
+/* ── 模态框 ────────────────────────────────────────────────── */
+.ant-modal-content {
+  border-radius: 12px;
+  padding: 24px;
+}
+.ant-modal-header {
+  border-radius: 12px 12px 0 0;
+  margin-bottom: 16px;
+}
+.ant-modal-title {
+  font-size: 16px;
+  font-weight: 700;
+  color: var(--metis-text);
+}
+
+/* ── Drawer / Popover ──────────────────────────────────────── */
+.ant-drawer-content {
+  border-radius: 12px 0 0 12px;
+}
+.ant-popover-inner {
+  border-radius: 8px;
+  box-shadow: var(--metis-shadow-hover);
+}
+
+/* ── Spin ──────────────────────────────────────────────────── */
+.ant-spin-dot-item {
+  background: var(--metis-primary) !important;
+}
+
+/* ── 开关 ──────────────────────────────────────────────────── */
+.ant-switch-checked {
+  background: var(--metis-primary) !important;
+}
+
+/* ── 进度条 ────────────────────────────────────────────────── */
+.ant-progress-bg {
+  background: var(--metis-primary) !important;
+}
+
+/* ── 菜单（全局） ──────────────────────────────────────────── */
+.ant-menu-item {
+  border-radius: 8px !important;
+  margin: 2px 8px !important;
+  width: auto !important;
+  transition: all 0.2s ease !important;
+  font-weight: 500;
+}
+
+/* ── 统计数字 ──────────────────────────────────────────────── */
+.ant-statistic-content-value {
+  font-weight: 800 !important;
+  letter-spacing: -0.02em;
+}

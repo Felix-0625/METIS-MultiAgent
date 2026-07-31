@@ -1,0 +1,11 @@
+# Bandit security scan configuration (YAML; consumed with `bandit -c .bandit`).
+exclude_dirs:
+  - backend/tests
+  - backend/.venv
+  - backend/__pycache__
+  - backend/projects
+  - frontend
+  - .git
+  - dist
+  - build
+skips: []

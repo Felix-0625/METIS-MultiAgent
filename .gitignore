@@ -1,0 +1,279 @@
+# ══════════════════════════════════════════════════════════════════════════════
+# Python
+# ══════════════════════════════════════════════════════════════════════════════
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+/lib/
+/lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 虚拟环境
+# ══════════════════════════════════════════════════════════════════════════════
+venv/
+.venv/
+env/
+ENV/
+virtualenv/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# IDE / 编辑器
+# ══════════════════════════════════════════════════════════════════════════════
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 操作系统
+# ══════════════════════════════════════════════════════════════════════════════
+.DS_Store
+Thumbs.db
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 日志文件
+# ══════════════════════════════════════════════════════════════════════════════
+*.log
+logs/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 测试 / 覆盖率
+# ══════════════════════════════════════════════════════════════════════════════
+.pytest_cache/
+.coverage
+htmlcov/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 环境变量（含 API Key，绝对不提交）
+# ══════════════════════════════════════════════════════════════════════════════
+.env
+.env.local
+.env.production
+.env.*.local
+.agents/
+.codex/
+.uploads/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 运行时数据目录
+# ══════════════════════════════════════════════════════════════════════════════
+memory/
+projects/
+data/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Backend 运行时数据（含密钥，不提交）
+# ══════════════════════════════════════════════════════════════════════════════
+backend/data/agents_config.json
+backend/data/gitee_config.json
+backend/data/default_api_config.json
+backend/data/snapshot_*.json
+backend/data/chat_history/
+backend/data/projects.json
+backend/data/skills.json
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Node / 前端
+# ══════════════════════════════════════════════════════════════════════════════
+node_modules/
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/src-tauri/target/
+frontend/src-tauri/gen/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# SQLite 数据库
+# ══════════════════════════════════════════════════════════════════════════════
+*.db
+*.sqlite
+*.sqlite3
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 独立仓库 / 备份目录（不作为子模块）
+# ══════════════════════════════════════════════════════════════════════════════
+DAgent/
+.git_disabled/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 测试脚本目录
+# ══════════════════════════════════════════════════════════════════════════════
+sim-test/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ProIntro 生成目录（非项目核心代码）
+# ══════════════════════════════════════════════════════════════════════════════
+ProIntro html/
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 根目录临时测试 / 运维脚本（不提交）
+# ══════════════════════════════════════════════════════════════════════════════
+
+# 执行/工作流脚本
+execute_phase1.py
+execute_phase2.py
+execute_phase3.py
+execute_phases.py
+execute_remaining_phases.py
+execute_workflow.py
+run_phase1.py
+run_phase2.py
+run_phase3.py
+run_phases.py
+run_phases.js
+run_phases_23.py
+run_phases.ps1
+run_remaining.py
+run_review.py
+run_workflow.py
+run_medical_it_a.py
+run_script.bat
+
+# 阶段管理脚本
+init_phases.py
+init_phases.ps1
+complete_phases.py
+check_db.py
+check_phases.py
+clean_db.py
+poll_phase.py
+poll_phase.ps1
+poll_phase1.log
+continue_phases.py
+continue_workflow.py
+
+# 手动工作流 step 脚本
+start_phase1.ps1
+start_phase2.ps1
+start_phase3.ps1
+p1_start.ps1
+p1_review.ps1
+p2_start.ps1
+p2_review.ps1
+p3_start.ps1
+p3_review.ps1
+phase_start.ps1
+phase_review.ps1
+phase2_start.ps1
+phase2_review.ps1
+phase3_start.ps1
+phase3_review.ps1
+review_phase1.ps1
+review_phase2.ps1
+review_phase3.ps1
+
+# 项目创建/操作脚本
+create_project.py
+create_project.ps1
+create_hw_project.py
+create_proj.ps1
+confirm_plan.py
+confirm_plan.ps1
+pm_synthesize.py
+synthesize_pm.py
+synthesize.ps1
+get_metrics.py
+get_metrics.ps1
+get_proj_metrics.py
+get_summary.ps1
+get_summary_metrics.py
+get_global_metrics.ps1
+get_phases.ps1
+get_phases.py
+
+# step 脚本
+step1_create.ps1
+step2_synthesize.ps1
+step3_confirm.ps1
+step4_init.ps1
+step7_metrics.ps1
+
+# 确认/等待脚本
+confirm_complete.ps1
+confirm_p1.py
+review_phase.ps1
+review_p1.py
+wait_check.ps1
+wait_phase.ps1
+wait_phase1.ps1
+start_p2.py
+find_line.py
+
+# 其他临时脚本
+step1.py
+step2.py
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 根目录临时 JSON / 请求文件
+# ══════════════════════════════════════════════════════════════════════════════
+confirm_plan_body.json
+confirm_plan.json
+create_project.json
+create_result.json
+global_metrics.json
+metrics_result.json
+metrics.json
+phase1_confirm.json
+phase1_start.json
+phase2_start.json
+phases_init.json
+phases_status.json
+pm_synthesize.json
+project_metrics.json
+p2_review.json
+p3_review.json
+p3_start.json
+request.json
+result.txt
+step1_create.json
+step2_synthesize.json
+step3_confirm.json
+step4_init.json
+step5_phases.json
+synthesize_body.json
+temp_confirm.json
+temp_project.json
+temp_synthesize.json
+workflow_result.json
+phases_init.ps1
+pm_synthesize.ps1
+phases_23.log
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 测试输出 / 报告文件
+# ══════════════════════════════════════════════════════════════════════════════
+output.txt
+review_output.txt
+workflow_log.txt
+e2e_test_report.html
+e2e_test_report.json
+e2e_test_report.*
+ISSUE_REPORT.md
+TEST_REPORT.md
+TEST_METRICS_SUMMARY.md
+PHASE4_REPORT.md
+OPTIMIZATION_REPORT.md
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 根目录临时 Python 脚本
+# ══════════════════════════════════════════════════════════════════════════════
+tmp_*.py
+
+# Local acceptance workspaces
+work/acceptance/

@@ -1,0 +1,81 @@
+services:
+  # Web 服务（Nginx + FastAPI 合并为一个容器）
+  - type: web
+    name: metis
+    runtime: docker
+    dockerfilePath: ./Dockerfile.render
+    dockerContext: .
+    envVars:
+      - key: HERMES_API_URL
+        sync: false
+      - key: HERMES_API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: REQUIRE_DATABASE_URL
+        value: "true"
+      - key: METIS_DATA_DIR
+        value: /var/data
+      - key: JWT_SECRET
+        sync: false
+      - key: JWT_EXPIRY_HOURS
+        value: "24"
+      - key: METIS_DATA_ENCRYPTION_KEY
+        sync: false
+      - key: ADMIN_USERNAME
+        value: admin
+      - key: ADMIN_PASSWORD
+        sync: false
+      - key: RATE_LIMIT_READ_RPM
+        value: "600"
+      - key: RATE_LIMIT_WRITE_RPM
+        value: "120"
+      - key: RATE_LIMIT_LOGIN_RPM
+        value: "10"
+      - key: MAX_FAILED_ATTEMPTS
+        value: "5"
+      - key: LOCKOUT_DURATION
+        value: "300"
+      - key: MAX_BODY_SIZE
+        value: "10485760"
+      - key: TRUSTED_PROXY_IPS
+        value: "127.0.0.1,10.0.0.0/8,172.16.0.0/12,192.168.0.0/16"
+      - key: CORS_ORIGINS
+        value: "https://metis-cho3.onrender.com"
+      - key: BREVO_API_KEY
+        sync: false
+      - key: BREVO_SENDER_NAME
+        value: MeTis
+      - key: BREVO_SENDER_EMAIL
+        value: zml2407@outlook.com
+      # Render 默认要求最终质检包含独立运行验收。以下凭据仅在 Dashboard 设置。
+      - key: RUNTIME_ACCEPTANCE_REQUIRED
+        value: "false"
+      - key: RUNTIME_ACCEPTANCE_ENABLED
+        value: "false"
+      - key: RUNTIME_ACCEPTANCE_GITHUB_TOKEN
+        sync: false
+      - key: RUNTIME_ACCEPTANCE_GITHUB_REPOSITORY
+        sync: false
+      - key: RUNTIME_ACCEPTANCE_RENDER_API_KEY
+        sync: false
+      - key: RUNTIME_ACCEPTANCE_RENDER_SERVICE_ID
+        sync: false
+      - key: RUNTIME_ACCEPTANCE_GITHUB_BRANCH
+        value: metis-runtime-acceptance
+      - key: RUNTIME_ACCEPTANCE_GITHUB_BASE_BRANCH
+        value: develop
+      - key: RUNTIME_ACCEPTANCE_REQUEST_TIMEOUT
+        value: "30"
+      - key: RUNTIME_ACCEPTANCE_DEPLOY_TIMEOUT
+        value: "900"
+      - key: RUNTIME_ACCEPTANCE_HEALTH_TIMEOUT
+        value: "120"
+      - key: RUNTIME_ACCEPTANCE_POLL_INTERVAL
+        value: "5"
+    healthCheckPath: /health
+    plan: starter
+    disk:
+      name: metis-data
+      mountPath: /var/data
+      sizeGB: 1

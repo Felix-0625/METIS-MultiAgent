@@ -1,0 +1,16 @@
+{
+  "name": "node_react_express",
+  "version": 4,
+  "files": [
+    "package.json.tpl",
+    ".env.example.tpl",
+    ".dockerignore.tpl",
+    "Dockerfile.tpl",
+    "docker-compose.yml.tpl",
+    "frontend/index.html.tpl",
+    "frontend/tsconfig.json.tpl",
+    "backend/src/runtime/auth.js.tpl",
+    "backend/src/runtime/errors.js.tpl",
+    "backend/src/runtime/health.js.tpl"
+  ]
+}
