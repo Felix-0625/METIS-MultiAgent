@@ -190,7 +190,7 @@ def register(req: RegisterRequest, request: Request):
                 logger.error("回滚用户创建失败: %s", del_e)
             raise HTTPException(
                 status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-                detail="邮件发送失败，请检查邮箱地址后重新注册"
+                detail="邮件服务暂时不可用，请稍后重试或联系管理员"
             )
 
         audit_log("USER_REGISTERED", req.username, ip, f"email={req.email}")

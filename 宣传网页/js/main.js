@@ -185,6 +185,24 @@
   }
 
   /* ── API Helper ────────────────────────────────────────── */
+  function apiErrorMessage(detail, fallback) {
+    if (typeof detail === 'string' && detail.trim()) return detail;
+    if (Array.isArray(detail)) {
+      var messages = detail.map(function(item) {
+        if (typeof item === 'string') return item;
+        return item && typeof item.msg === 'string'
+          ? item.msg.replace(/^Value error,\s*/, '')
+          : '';
+      }).filter(Boolean);
+      return messages.length ? messages.join('；') : fallback;
+    }
+    if (detail && typeof detail === 'object') {
+      if (typeof detail.message === 'string') return detail.message;
+      if (typeof detail.detail === 'string') return detail.detail;
+    }
+    return fallback;
+  }
+
   function apiPost(path, data) {
     return fetch(API_BASE_URL + path, {
       method: 'POST',
@@ -194,7 +212,7 @@
     }).then(function(res) {
       if (!res.ok) {
         return res.json().then(function(err) {
-          throw new Error(err.detail || '请求失败');
+          throw new Error(apiErrorMessage(err.detail, '请求失败'));
         });
       }
       return res.json();
@@ -294,6 +312,10 @@ function clearModalError() {
     var password = passEl.value;
     if (!username || !email || !password) {
       showModalError('请填写所有字段');
+      return;
+    }
+    if (!/^[A-Za-z0-9][A-Za-z0-9._-]{2,63}$/.test(username)) {
+      showModalError('用户名须为3-64位，以字母或数字开头，且只能包含字母、数字、点、下划线和连字符');
       return;
     }
     if (password.length < 6) {

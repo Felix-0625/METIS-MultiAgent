@@ -79,3 +79,32 @@ def test_register_route_returns_409_for_duplicate_username(monkeypatch):
 
     assert response.status_code == 409
     assert response.json()["detail"] == "用户名 'existing' 已存在"
+
+
+def test_register_route_reports_provider_failure_without_blame_email(monkeypatch):
+    class User:
+        user_id = "created-user"
+
+    deleted = []
+    app = FastAPI()
+    app.include_router(routes_auth.router)
+    monkeypatch.setattr(routes_auth, "check_email_rate_limit", lambda *_: (True, ""))
+    monkeypatch.setattr(routes_auth, "is_verify_locked", lambda *_: (False, 0))
+    monkeypatch.setattr(routes_auth, "is_email_configured", lambda: True)
+    monkeypatch.setattr(routes_auth, "create_user", lambda **_: User())
+    monkeypatch.setattr(routes_auth, "save_verification_code", lambda *_: None)
+    monkeypatch.setattr(
+        routes_auth,
+        "send_verification_email",
+        lambda *_: (_ for _ in ()).throw(RuntimeError("provider rejected credentials")),
+    )
+    monkeypatch.setattr(routes_auth, "delete_user", deleted.append)
+
+    response = TestClient(app).post(
+        "/auth/register",
+        json={"username": "valid_user", "password": "password", "email": "user@example.test"},
+    )
+
+    assert response.status_code == 503
+    assert response.json()["detail"] == "邮件服务暂时不可用，请稍后重试或联系管理员"
+    assert deleted == ["created-user"]
