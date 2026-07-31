@@ -41,6 +41,23 @@ def test_member_and_expert_pools_are_isolated_by_active_user(monkeypatch, tmp_pa
         current_user_id.reset(token)
 
 
+def test_new_user_expert_pool_contains_nine_presets(monkeypatch, tmp_path):
+    monkeypatch.setattr(expert_pool, "metis_data_path", lambda *_a, **_k: tmp_path / "experts")
+    expert_pool._user_expert_pools.clear()
+    token = current_user_id.set("new-user")
+    try:
+        pool = expert_pool.get_expert_pool()
+        presets = [item for item in pool.list_experts() if item.expert_id.startswith("preset-")]
+        assert len(presets) == 9
+        assert {item.role for item in presets} == {
+            "前端专家", "后端专家", "数据库专家", "API设计专家", "架构师",
+            "DevOps专家", "安全专家", "测试专家", "数据专家",
+        }
+    finally:
+        current_user_id.reset(token)
+        expert_pool._user_expert_pools.clear()
+
+
 def test_skill_pool_is_an_independent_seeded_copy_per_user():
     _user_sm_agents.clear()
     _persisted_user_skills.clear()

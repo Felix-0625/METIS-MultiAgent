@@ -190,8 +190,8 @@ const Settings: React.FC = () => {
       };
       await apiClient.put(`/config/api/default`, payload);
       message.success('你的 API 配置已保存（仅对你生效）');
-    } catch {
-      message.error('保存失败');
+    } catch (e: any) {
+      message.error(e.response?.data?.detail || '保存失败');
     } finally {
       setSaving(false);
     }
@@ -320,6 +320,7 @@ const Settings: React.FC = () => {
                     </div>
                     <Select
                       style={{ width: '100%' }}
+                      optionLabelProp="label"
                       placeholder="选择一个预设模型，或直接在下方手动填写..."
                       value={selectedPreset || undefined}
                       onChange={handlePresetSelect}

@@ -437,12 +437,31 @@ class ExpertPool:
 
     def _init_preset_experts(self) -> None:
         """首次启动时预置9类专家（已存在则跳过）"""
-        try:
-            from agents.hr_agent import PRESET_EXPERTS
-        except ImportError:
-            return
+        presets = (
+            ("frontend", "前端工程师", "前端专家", "🎨", ["React", "TypeScript", "响应式界面", "可访问性"]),
+            ("backend", "后端工程师", "后端专家", "⚙️", ["Python", "FastAPI", "业务建模", "并发控制"]),
+            ("database", "数据库工程师", "数据库专家", "🗄️", ["PostgreSQL", "数据建模", "迁移", "查询优化"]),
+            ("api", "API 设计师", "API设计专家", "🔌", ["REST API", "接口契约", "鉴权", "错误处理"]),
+            ("architect", "系统架构师", "架构师", "🏗️", ["系统设计", "模块边界", "可扩展性", "技术决策"]),
+            ("devops", "DevOps 工程师", "DevOps专家", "🚀", ["Docker", "CI/CD", "部署", "可观测性"]),
+            ("security", "安全工程师", "安全专家", "🔐", ["OWASP", "威胁建模", "权限控制", "安全审计"]),
+            ("testing", "测试工程师", "测试专家", "🧪", ["自动化测试", "集成测试", "边界分析", "回归测试"]),
+            ("data", "数据工程师", "数据专家", "📊", ["数据处理", "ETL", "质量校验", "指标设计"]),
+        )
         changed = False
-        for ep in PRESET_EXPERTS:
+        for key, name, role, avatar, skills in presets:
+            ep = {
+                "expert_id": f"preset-{key}",
+                "name": name,
+                "role": role,
+                "type": "pg",
+                "avatar": avatar,
+                "skills": skills,
+                "domains": skills,
+                "role_description": f"负责项目中的{role}工作，输出可验证、可维护的交付结果。",
+                "working_style": "先明确边界和验收标准，再实施并完成自检",
+                "behavior_rules": ["不编造执行结果", "交付必须包含可验证证据"],
+            }
             if ep["expert_id"] not in self._experts:
                 profile = ExpertProfile(
                     expert_id=ep["expert_id"],

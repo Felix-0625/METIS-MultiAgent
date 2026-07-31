@@ -1,6 +1,9 @@
 import asyncio
 from types import SimpleNamespace
 
+import pytest
+from fastapi import HTTPException
+
 from api import routes_config
 from models.schemas import DefaultApiConfigRequest
 
@@ -64,6 +67,29 @@ def test_get_user_api_config_returns_only_current_users_masked_key():
         assert "model-b" not in str(response)
         assert "key-a" not in str(response)
         assert "key-b" not in str(response)
+    finally:
+        routes_config.user_api_configs.clear()
+        routes_config.user_api_configs.update(saved)
+
+
+def test_failed_persistence_rolls_back_in_memory_user_config(monkeypatch):
+    saved = dict(routes_config.user_api_configs)
+    original = {**routes_config.DEFAULT_API_CONFIG, "model": "old", "api_key": "old-key"}
+    routes_config.user_api_configs.clear()
+    routes_config.user_api_configs["user-a"] = original
+
+    async def fail_persist():
+        raise RuntimeError("database unavailable")
+
+    monkeypatch.setattr(routes_config, "_persist_all_async", fail_persist)
+    try:
+        with pytest.raises(HTTPException) as exc:
+            asyncio.run(routes_config.update_default_api_config(
+                DefaultApiConfigRequest(model="new", api_key="new-key"),
+                SimpleNamespace(user_id="user-a"),
+            ))
+        assert exc.value.status_code == 500
+        assert routes_config.user_api_configs["user-a"] == original
     finally:
         routes_config.user_api_configs.clear()
         routes_config.user_api_configs.update(saved)

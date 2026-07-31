@@ -107,9 +107,18 @@ def _fernet() -> Fernet | None:
     if raw:
         try:
             return Fernet(raw.encode("ascii"))
-        except (TypeError, ValueError) as exc:
-            logger.error("%s is not a valid Fernet key", ENCRYPTION_KEY_ENV)
-            raise SecretStorageError(f"{ENCRYPTION_KEY_ENV} is not a valid Fernet key") from exc
+        except (TypeError, ValueError, UnicodeEncodeError):
+            # Railway/Render users commonly provide a strong random secret
+            # instead of a pre-encoded Fernet key.  Derive a stable Fernet key
+            # from that secret so saving user API credentials remains secure
+            # and does not fail after the in-memory update already succeeded.
+            if len(raw.encode("utf-8")) < 32:
+                logger.error("%s must contain at least 32 bytes", ENCRYPTION_KEY_ENV)
+                raise SecretStorageError(f"{ENCRYPTION_KEY_ENV} must contain at least 32 bytes")
+            derived = hashlib.sha256(
+                b"metis:explicit-data-encryption:v1:" + raw.encode("utf-8")
+            ).digest()
+            return Fernet(base64.urlsafe_b64encode(derived))
 
     jwt_secret = os.getenv(FALLBACK_KEY_ENV, "").strip()
     if not jwt_secret:

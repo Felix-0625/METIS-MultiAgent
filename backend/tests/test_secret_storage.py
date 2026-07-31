@@ -38,6 +38,18 @@ def test_secret_config_is_encrypted_and_round_trips(monkeypatch):
     assert restored.replacement is None
 
 
+def test_random_32_byte_encryption_secret_is_derived_and_round_trips(monkeypatch):
+    monkeypatch.setenv("METIS_DATA_ENCRYPTION_KEY", "strong-random-secret-with-32-bytes!")
+    config = {"model": "test", "api_key": "sk-live-secret"}
+
+    stored = protect_config(config)
+    restored = restore_config(stored)
+
+    assert isinstance(stored, str) and stored.startswith(ENCRYPTED_PREFIX)
+    assert "sk-live-secret" not in stored
+    assert restored.value == config
+
+
 def test_missing_key_clears_secrets_before_persistence(monkeypatch):
     monkeypatch.delenv("METIS_DATA_ENCRYPTION_KEY", raising=False)
     monkeypatch.delenv("JWT_SECRET", raising=False)

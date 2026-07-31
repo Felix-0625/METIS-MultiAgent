@@ -225,10 +225,22 @@ async def update_default_api_config(
 
     user_cfg = _normalize_api_config(user_cfg)
 
+    previous_cfg = user_api_configs.get(user_id)
     user_api_configs[user_id] = user_cfg
-    hermes_client.update_config(user_cfg)
+    try:
+        await _persist_all_async()
+    except Exception:
+        # Do not leave a configuration active only in memory when the API
+        # reports that saving failed.  That made "save failed" immediately
+        # followed by a successful connection test possible.
+        if previous_cfg is None:
+            user_api_configs.pop(user_id, None)
+        else:
+            user_api_configs[user_id] = previous_cfg
+        logger.exception("Failed to persist user API configuration user=%s", user_id)
+        raise HTTPException(status_code=500, detail="API 配置持久化失败，请检查数据加密密钥")
 
-    await _persist_all_async()
+    hermes_client.update_config(user_cfg)
     return {
         "success": True,
         "model": user_cfg["model"],

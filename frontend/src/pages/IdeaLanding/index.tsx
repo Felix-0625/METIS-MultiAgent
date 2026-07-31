@@ -103,14 +103,9 @@ const ConvItem: React.FC<{
           />
         </Dropdown>
       </div>
-      {conv.last_message && (
-        <div style={{ fontSize: 11, color: '#8c8c8c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-          {conv.last_message}
-        </div>
-      )}
-      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginTop: 4 }}>
+      <div style={{ display: 'flex', alignItems: 'flex-start', justifyContent: 'space-between', marginTop: 2 }}>
         <div style={{ display: 'flex', gap: 3, flexWrap: 'wrap' }}>
-          {conv.tags.slice(0, 3).map(tag => (
+          {conv.tags.map(tag => (
             <Tag key={tag} style={{ fontSize: 10, padding: '0 4px', lineHeight: '16px', margin: 0 }}>{tag}</Tag>
           ))}
           {conv.has_requirements_doc && (
@@ -121,6 +116,11 @@ const ConvItem: React.FC<{
         </div>
         <span style={{ fontSize: 10, color: '#bfbfbf', flexShrink: 0 }}>{fmtTime(conv.updated_at)}</span>
       </div>
+      {conv.last_message && (
+        <div style={{ marginTop: 4, fontSize: 11, color: '#8c8c8c', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+          {conv.last_message}
+        </div>
+      )}
     </div>
   );
 };
