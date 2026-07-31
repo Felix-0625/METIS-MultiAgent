@@ -60,7 +60,7 @@ from core.persistence import (
     save_pm_teams, load_pm_teams,
     save_phase_managers, load_phase_managers,
     save_supervisor_leaders, load_supervisor_leaders,
-    save_idea_landing, load_idea_landing,
+    save_idea_landing, load_idea_landing, migrate_legacy_idea_landing_to_user,
     save_application_state,
 )
 from agents.idea_landing_agent import IdeaLandingAgent
@@ -1450,15 +1450,48 @@ _pm_teams: Dict[str, PMLeaderAgent] = {}
 _supervisor_leaders: Dict[str, SupervisorLeaderAgent] = {}
 _phase_managers: Dict[str, PhaseManager] = {}
 
-def _get_idea_landing() -> IdeaLandingAgent:
-    if not hasattr(_get_idea_landing, "_instance"):
-        _get_idea_landing._instance = IdeaLandingAgent(hermes_client=hermes_client)
-    return _get_idea_landing._instance
+_idea_landing_agents: Dict[str, IdeaLandingAgent] = {}
+
+
+def _get_idea_landing(user_id: str = "") -> IdeaLandingAgent:
+    """返回当前用户独立的 IdeaLanding，并在首次访问时恢复持久化状态。"""
+    from core.user_scope import active_user_id, user_storage_key
+
+    owner_id = active_user_id(user_id)
+    key = user_storage_key(owner_id)
+    existing = _idea_landing_agents.get(key)
+    if existing is not None:
+        return existing
+
+    saved = load_idea_landing(owner_id)
+    if owner_id and not saved:
+        # 历史版本只有一份全局记录，无法证明普通用户的所有权。仅允许部署
+        # 管理员在首次访问时接管，杜绝新注册用户抢占旧数据。
+        try:
+            from core.auth import get_user_by_id
+            user = get_user_by_id(owner_id)
+            if user and user.role == "admin":
+                saved = migrate_legacy_idea_landing_to_user(owner_id)
+        except Exception:
+            logger.exception("Failed to migrate legacy IdeaLanding state")
+
+    agent = IdeaLandingAgent(hermes_client=hermes_client)
+    if saved:
+        try:
+            agent.from_persist(saved)
+            logger.info("恢复用户想法落地记录 user=%s conversations=%d", owner_id, len(agent.conversations))
+        except Exception:
+            logger.exception("Ignore invalid persisted IdeaLanding state user=%s", owner_id)
+    _idea_landing_agents[key] = agent
+    return agent
 
 async def _persist_idea_landing():
-    """持久化想法落地 Agent 状态"""
+    """持久化当前用户的想法落地 Agent 完整状态。"""
+    from core.user_scope import active_user_id
+
     loop = asyncio.get_running_loop()
-    agent = _get_idea_landing()
-    data = {"conversations": {k: v.to_dict() for k, v in agent.conversations.items()}}
-    await loop.run_in_executor(None, lambda: save_idea_landing(data))
+    owner_id = active_user_id()
+    agent = _get_idea_landing(owner_id)
+    data = agent.to_persist()
+    await loop.run_in_executor(None, lambda: save_idea_landing(data, owner_id))
 version_manager = VersionManager()

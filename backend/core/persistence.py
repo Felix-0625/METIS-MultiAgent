@@ -214,13 +214,34 @@ def load_supervisor_leaders() -> Dict[str, Any]:
 
 # ─── IdeaLanding Agent 持久化 ────────────────────────────────────────────────
 
-def save_idea_landing(data: Dict[str, Any]) -> None:
-    """保存 IdeaLanding Agent 完整状态（包含所有对话 + 用户记忆）"""
-    kv_set("idea_landing", data)
+def _idea_landing_key(user_id: str = "") -> str:
+    if not str(user_id or "").strip():
+        return "idea_landing"
+    from core.user_scope import user_storage_key
+    return f"idea_landing:user:{user_storage_key(user_id)}"
 
 
-def load_idea_landing() -> Dict[str, Any]:
-    return kv_get("idea_landing", {})
+def save_idea_landing(data: Dict[str, Any], user_id: str = "") -> None:
+    """保存按用户隔离的 IdeaLanding 完整状态。"""
+    kv_set(_idea_landing_key(user_id), data)
+
+
+def load_idea_landing(user_id: str = "") -> Dict[str, Any]:
+    value = kv_get(_idea_landing_key(user_id), {})
+    return value if isinstance(value, dict) else {}
+
+
+def migrate_legacy_idea_landing_to_user(user_id: str) -> Dict[str, Any]:
+    """将历史全局记录一次性归属给部署管理员，避免跨用户泄露。"""
+    user_id = str(user_id or "").strip()
+    if not user_id or load_idea_landing(user_id):
+        return {}
+    legacy = load_idea_landing()
+    if not legacy:
+        return {}
+    save_idea_landing(legacy, user_id)
+    kv_delete("idea_landing")
+    return legacy
 
 # --- execution_status persistence ---
 def save_execution_status(data: dict) -> None:
