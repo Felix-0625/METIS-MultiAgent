@@ -69,6 +69,10 @@ EXPOSE 10000
 # 先验证并渲染动态端口，再让 supervisor 成为 PID 1。
 CMD PORT="${PORT:-10000}"; \
     case "$PORT" in ''|*[!0-9]*) echo "PORT must be numeric" >&2; exit 64;; esac; \
+    case "$METIS_DATA_DIR" in /var/data) ;; *) echo "METIS_DATA_DIR must be /var/data" >&2; exit 64;; esac; \
+    mkdir -p "$METIS_DATA_DIR/memory" "$METIS_DATA_DIR/pools" \
+        "$METIS_DATA_DIR/projects" "$METIS_DATA_DIR/snapshots"; \
+    chown -R www-data:www-data "$METIS_DATA_DIR"; \
     export PORT; \
     envsubst '$PORT' < /etc/nginx/templates/metis.conf.template > /etc/nginx/conf.d/default.conf; \
     exec supervisord -n -c /etc/supervisor/supervisord.conf

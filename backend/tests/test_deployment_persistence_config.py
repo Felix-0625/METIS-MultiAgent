@@ -69,6 +69,21 @@ def test_render_nginx_and_container_follow_dynamic_port_and_proxy_protocol() -> 
     assert "postgresql-client" in dockerfile
 
 
+def test_render_repairs_runtime_volume_permissions_before_starting_services() -> None:
+    dockerfile = (ROOT / "Dockerfile.render").read_text(encoding="utf-8")
+
+    runtime_chown = 'chown -R www-data:www-data "$METIS_DATA_DIR"'
+    assert 'case "$METIS_DATA_DIR" in /var/data)' in dockerfile
+    assert runtime_chown in dockerfile
+    assert dockerfile.index(runtime_chown) < dockerfile.index(
+        "exec supervisord -n -c /etc/supervisor/supervisord.conf"
+    )
+
+
+def test_container_shell_scripts_use_unix_line_endings() -> None:
+    assert b"\r\n" not in (ROOT / "backend" / "startup.sh").read_bytes()
+
+
 def test_compose_serves_the_vite_app_prefix_and_supports_external_database() -> None:
     compose = (ROOT / "docker-compose.yml").read_text(encoding="utf-8")
     frontend_dockerfile = (ROOT / "frontend" / "Dockerfile").read_text(encoding="utf-8")
