@@ -218,6 +218,36 @@ def test_postgres_connection_policy_is_bounded_and_tls_enabled(
     assert "lock_timeout=3000" in policy["options"]
 
 
+def test_postgres_migrations_do_not_chain_execute_and_fetchall(monkeypatch):
+    class PsycopgCursor:
+        def __init__(self):
+            self.statements = []
+
+        def execute(self, statement, params=None):
+            self.statements.append((statement, params))
+            return None
+
+        def fetchall(self):
+            return []
+
+    class PsycopgConnection:
+        def __init__(self):
+            self.cursor_instance = PsycopgCursor()
+
+        def cursor(self):
+            return self.cursor_instance
+
+    connection = PsycopgConnection()
+    monkeypatch.setattr(database, "MIGRATIONS", ())
+
+    database._run_migrations(connection, postgres=True)
+
+    assert any(
+        "SELECT version, name, checksum FROM schema_migrations" in statement
+        for statement, _params in connection.cursor_instance.statements
+    )
+
+
 def test_postgres_business_exception_keeps_healthy_connection(monkeypatch):
     class FakeConnection:
         closed = 0

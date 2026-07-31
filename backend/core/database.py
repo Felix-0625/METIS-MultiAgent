@@ -613,9 +613,8 @@ def _run_migrations(conn, *, postgres: bool) -> None:
         conn.commit()
         cursor.execute("BEGIN IMMEDIATE")
 
-    applied_rows = cursor.execute(
-        "SELECT version, name, checksum FROM schema_migrations"
-    ).fetchall()
+    cursor.execute("SELECT version, name, checksum FROM schema_migrations")
+    applied_rows = cursor.fetchall()
     applied = {
         str(row[0]): (str(row[1]), str(row[2] or ""))
         for row in applied_rows
