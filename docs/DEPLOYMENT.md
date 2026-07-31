@@ -16,7 +16,7 @@ Railway Volume：/var/data
 └── 项目工作区、Agent 记忆、资源池和快照
 ```
 
-当前 `Dockerfile.render` 支持平台注入的 `PORT`，可在 Railway 复用。文件名仍带有 Render，但运行结构不依赖 Render 专属 API。部署前无需复制 `docker-compose.yml` 到 Railway。
+当前标准 `Dockerfile` 支持平台注入的 `PORT`，可同时用于 Railway 和 Render。部署前无需复制 `docker-compose.yml` 到 Railway。
 
 > 本文是配置说明，不代表已经完成 Railway 在线验收。
 
@@ -40,7 +40,7 @@ Railway Volume：/var/data
 4. 在 Web Service 设置：
 
 ```text
-RAILWAY_DOCKERFILE_PATH=Dockerfile.render
+RAILWAY_DOCKERFILE_PATH=Dockerfile
 ```
 
 Railway 默认只自动识别根目录的 `Dockerfile`；自定义文件名必须显式指定。
@@ -121,7 +121,7 @@ RUNTIME_ACCEPTANCE_REQUIRED=true
 
 按顺序验证：
 
-1. 构建日志显示使用 `Dockerfile.render`。
+1. 构建日志显示使用 `Dockerfile`。
 2. Nginx 监听 Railway 注入的 `PORT`。
 3. `/health` 返回 `200` 且数据库为 healthy。
 4. `/app/` 可打开。
@@ -151,7 +151,7 @@ RUNTIME_ACCEPTANCE_REQUIRED=true
 ## 6. 当前限制
 
 - 尚无 Railway 专用 `railway.toml`；当前依赖 Dashboard 配置。
-- `Dockerfile.render` 可复用，但名称不直观，后续可在实际 Railway 验收后改为平台中立的 `Dockerfile`。
+- `Dockerfile` 为平台中立的标准构建入口，可同时用于 Railway 和 Render。
 - 单个 Web Service 内同时运行 Nginx 与 FastAPI，便于部署但限制独立扩缩容。
 - 文件资源池和工作区依赖共享 Volume；未完成多副本并发验证前，保持单副本。
 - Railway 在线数据库、Volume 权限、WebSocket 和完整业务流程仍需部署后实测。

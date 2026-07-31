@@ -46,7 +46,7 @@ def test_deprecated_render_env_is_rejected(monkeypatch) -> None:
                         "type": "web",
                         "name": "metis",
                         "env": "docker",
-                        "dockerfilePath": "Dockerfile.render",
+                        "dockerfilePath": "Dockerfile",
                         "dockerContext": ".",
                         "healthCheckPath": "/health",
                         "envVars": [
@@ -76,7 +76,7 @@ def test_literal_render_secret_is_rejected(monkeypatch) -> None:
                         "type": "web",
                         "name": "metis",
                         "runtime": "docker",
-                        "dockerfilePath": "Dockerfile.render",
+                        "dockerfilePath": "Dockerfile",
                         "dockerContext": ".",
                         "healthCheckPath": "/health",
                         "envVars": [
@@ -97,7 +97,7 @@ def test_literal_render_secret_is_rejected(monkeypatch) -> None:
 
 
 def test_render_runtime_image_keeps_node_toolchain_for_generated_project_qa() -> None:
-    dockerfile = ROOT / "Dockerfile.render"
+    dockerfile = ROOT / "Dockerfile"
     content = dockerfile.read_text(encoding="utf-8")
 
     assert "FROM node:20-bookworm-slim AS node-runtime" in content

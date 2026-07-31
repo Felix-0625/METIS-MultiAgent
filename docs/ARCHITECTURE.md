@@ -181,7 +181,7 @@ FastAPI -> metis_data 持久卷
 
 ### 9.3 Render 单服务
 
-`Dockerfile.render` 构建前端并将 Nginx、FastAPI 和 Supervisor 放入同一服务容器；PostgreSQL 使用外部托管实例，持久文件写入挂载卷。Nginx 监听平台注入的端口并反向代理 API 与 WebSocket。
+`Dockerfile` 构建前端并将 Nginx、FastAPI 和 Supervisor 放入同一服务容器；PostgreSQL 使用外部托管实例，持久文件写入挂载卷。Nginx 监听平台注入的端口并反向代理 API 与 WebSocket。
 
 ## 10. 可观测性与验证
 

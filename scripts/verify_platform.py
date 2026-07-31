@@ -119,7 +119,7 @@ def check_blueprint(findings: list[Finding]) -> None:
 
 def check_container_contract(findings: list[Finding]) -> None:
     try:
-        dockerfile = _read("Dockerfile.render")
+        dockerfile = _read("Dockerfile")
         nginx = _read("nginx-render.conf")
         supervisor = _read("supervisor.conf")
         startup = _read("backend/startup.sh")

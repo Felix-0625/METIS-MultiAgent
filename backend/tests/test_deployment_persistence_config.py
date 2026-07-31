@@ -59,7 +59,7 @@ def test_render_uses_paid_persistent_disk_and_explicit_acceptance_policy() -> No
 
 def test_render_nginx_and_container_follow_dynamic_port_and_proxy_protocol() -> None:
     nginx = (ROOT / "nginx-render.conf").read_text(encoding="utf-8")
-    dockerfile = (ROOT / "Dockerfile.render").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
     assert "listen ${PORT};" in nginx
     assert "$metis_forwarded_proto" in nginx
@@ -70,7 +70,7 @@ def test_render_nginx_and_container_follow_dynamic_port_and_proxy_protocol() -> 
 
 
 def test_render_repairs_runtime_volume_permissions_before_starting_services() -> None:
-    dockerfile = (ROOT / "Dockerfile.render").read_text(encoding="utf-8")
+    dockerfile = (ROOT / "Dockerfile").read_text(encoding="utf-8")
 
     runtime_chown = 'chown -R www-data:www-data "$METIS_DATA_DIR"'
     assert 'case "$METIS_DATA_DIR" in /var/data)' in dockerfile
@@ -103,5 +103,5 @@ def test_compose_serves_the_vite_app_prefix_and_supports_external_database() -> 
 
 
 def test_both_backend_images_include_postgresql_recovery_tools() -> None:
-    assert "postgresql-client" in (ROOT / "Dockerfile.render").read_text(encoding="utf-8")
+    assert "postgresql-client" in (ROOT / "Dockerfile").read_text(encoding="utf-8")
     assert "postgresql-client" in (ROOT / "backend" / "Dockerfile").read_text(encoding="utf-8")

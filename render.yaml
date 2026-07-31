@@ -3,7 +3,7 @@ services:
   - type: web
     name: metis
     runtime: docker
-    dockerfilePath: ./Dockerfile.render
+    dockerfilePath: ./Dockerfile
     dockerContext: .
     envVars:
       - key: HERMES_API_URL
