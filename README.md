@@ -171,4 +171,4 @@ docker-compose.yml
 
 ## 许可证
 
-[MIT License](LICENSE) © 2026 METIS Contributors
+[MIT License](https://github.com/Felix-0625/METIS-MultiAgent/blob/main/LICENSE) © 2026 Felix-0625
