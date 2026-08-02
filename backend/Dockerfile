@@ -6,6 +6,7 @@ WORKDIR /app
 
 # 安装 PostgreSQL 备份/恢复工具与 Python 依赖
 RUN apt-get update && apt-get install -y --no-install-recommends \
+    git \
     postgresql-client \
     && rm -rf /var/lib/apt/lists/*
 

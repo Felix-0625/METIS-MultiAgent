@@ -1,142 +1,174 @@
-﻿<p align="center">
-  <img src="https://img.shields.io/badge/Status-Active-success?style=flat-square" alt="Status" />
-  <img src="https://img.shields.io/badge/Python-3.11+-blue?style=flat-square&logo=python" alt="Python" />
-  <img src="https://img.shields.io/badge/React-18-61DAFB?style=flat-square&logo=react" alt="React" />
-  <img src="https://img.shields.io/badge/License-MIT-yellow?style=flat-square" alt="License" />
-</p>
+<div align="center">
+  <img src="docs/assets/metis-logo.svg" width="760" alt="METIS — Multi-Agent Delivery Platform" />
 
-<p align="center">
-  <img src="https://readme-typing-svg.demolab.com/?font=Inter&weight=900&size=42&duration=1&pause=1&color=764BA2&center=true&vCenter=true&repeat=false&width=400&lines=M+E+T+I+S" alt="METIS" />
-</p>
+  <p><strong>把需求、执行、质检与交付组织成可追踪的多 Agent 工作流</strong></p>
 
-<p align="center"><strong>AI Multi-Agent System</strong> — 将想法交给矩阵</p>
-
----
-
-## ✨ 简介
-
-METIS 是一个由多个专业 AI Agent 协同驱动的软件项目全流程管理平台。从灵感捕捉、需求分析、团队组建、代码执行到质量检测与交付，全程由 AI 专家矩阵自动流转。
-
-- **多智能体协作** — PM 组长、全栈工程师、监督组长、QA 测试等角色各司其职
-- **阶段看板** — 可视化项目阶段，支持冲突检测、审查链、团队健康度
-- **全栈工程能力** — AI 工程师独立完成代码生成、调试到部署的完整闭环
-- **质量保障** — 自动化测试看板、缺陷追踪，质量可量化可追溯
-- **实时协作** — PM 团队聊天、监督审查、进度同步，所有交互实时可见
-- **完整认证体系** — JWT + HttpOnly Cookie + 邮箱验证 + 密码重置 + 暴力破解防护
+  <p>
+    <a href="https://metis-multiagent.up.railway.app"><img src="https://img.shields.io/badge/在线体验-Railway-7C3AED?style=for-the-badge&logo=railway" alt="Railway 在线体验" /></a>
+    <img src="https://img.shields.io/badge/版本-2.1.0-4F46E5?style=for-the-badge" alt="Version 2.1.0" />
+    <img src="https://img.shields.io/badge/Python-3.10+-3776AB?style=for-the-badge&logo=python&logoColor=white" alt="Python 3.10+" />
+    <img src="https://img.shields.io/badge/React-18-149ECA?style=for-the-badge&logo=react&logoColor=white" alt="React 18" />
+    <a href="LICENSE"><img src="https://img.shields.io/badge/License-MIT-F59E0B?style=for-the-badge" alt="MIT License" /></a>
+  </p>
+</div>
 
 ---
 
-## 🛠 技术栈
+## 项目简介
+
+METIS 是一个面向软件项目交付的多 Agent 协作平台。用户与 PM Agent 确认需求和阶段计划后，系统组织专业 Agent 执行任务、管理共享工作区，并通过阶段 QA/QC、Final QA/QC 和签收链路记录交付证据。
+
+当前交付形态为 **Web 应用**；桌面端本地存储能力仅作预留，尚未发布。
+
+## 核心能力
+
+- **需求与阶段规划**：从想法讨论、需求确认到可执行的阶段任务。
+- **多 Agent 执行**：按专家角色分配任务，存在文件交集时自动调整执行波次。
+- **质量闭环**：阶段 QA/QC、问题聚合返修、重复缺陷移交与最终验收。
+- **全站工程师工作台**：项目咨询、功能变更讨论、代码整改和定向复检。
+- **项目数据与工作区持久化**：PostgreSQL 保存业务状态，持久化卷保存项目工作区。
+- **项目级 Git 同步**：每个项目可独立绑定 GitHub 或 Gitee 仓库，Token 加密保存。
+- **MCP 服务**：支持为外部客户端签发具名 Token，并按用户和项目隔离访问。
+- **可观测数据看板**：按项目聚合 Token 消耗、Agent 执行时长和交付文件数量。
+
+## 工作流程
+
+```text
+想法落地 → 总 PM 需求确认 → 阶段 PM 规划 → 专家 Agent 执行
+       → 阶段 QA/QC → 阶段确认 → Final QA/QC → 项目签收
+                              ↘ 重复缺陷 → 全站工程师整改
+```
+
+## 技术栈
 
 | 层级 | 技术 |
 |:---|:---|
-| 前端 | React 18 · TypeScript · Ant Design 5 · Vite 5 · Zustand |
-| 桌面端 | Tauri v2 |
-| 后端 | Python · FastAPI · Uvicorn · PyJWT · Pydantic |
-| 数据库 | PostgreSQL（生产）· SQLite（本地开发） |
-| 部署 | Docker · Caddy (HTTPS + Let's Encrypt) |
-| 邮件 | SMTP（smtplib，支持 TLS） |
+| Web 前端 | React 18 · TypeScript · Ant Design 5 · Vite 6 · Zustand |
+| 后端 | Python 3.10+ · FastAPI · Uvicorn · Pydantic |
+| 数据 | PostgreSQL（生产）· SQLite（本地测试）· 持久化项目工作区 |
+| 网关与部署 | Nginx · Docker · Railway |
+| 安全 | HttpOnly JWT · PBKDF2-SHA256 · Fernet 加密 · 限流与审计 |
+| 集成 | OpenAI 兼容模型 API · MCP · GitHub/Gitee |
 
----
+## 环境要求
 
-## 🚀 快速开始
-
-### 1. 克隆 & 环境配置
-
-```bash
-git clone https://gitee.com/feline-grace/metis.git
-cd metis
-cp .env.example .env   # 编辑 .env 填入 API Key 等配置
-```
-
-### 2. 启动后端
-
-```bash
-cd backend
-pip install -r requirements.txt
-python main.py           # 默认监听 http://0.0.0.0:8000
-```
-
-### 3. 启动前端
-
-```bash
-cd frontend
-npm install
-npm run dev              # Vite 开发服务器 → http://localhost:3000
-```
-
-### 4. 宣传网页（可选）
-
-```bash
-cd 宣传网页
-python -m http.server 8080   # → http://localhost:8080
-```
-
-### 5. Docker 部署
-
-```bash
-docker-compose up -d     # 包含 PostgreSQL + 后端 + 前端 + Caddy HTTPS
-```
-
----
-
-## 🔐 认证系统
-
-| 功能 | 说明 |
+| 使用方式 | 必要环境 |
 |:---|:---|
-| 登录 | 支持用户名或邮箱，JWT 通过 HttpOnly Secure SameSite Cookie 下发 |
-| 注册 | 开放自主注册，SMTP 配置后发送邮箱验证码；开发模式自动验证 |
-| 忘记密码 | 邮件重置链接 + 一次性令牌 + 10 分钟有效期 |
-| 修改密码 | 需验证旧密码，修改后所有旧 Token 立即失效 |
-| 安全 | PBKDF2-SHA256 密码哈希 · 暴力破解锁定 · 用户枚举防护 · 双维度限流 |
+| Docker（推荐） | Docker Engine / Docker Desktop · Docker Compose v2 · 至少 2 GB 可用内存 |
+| 源码运行 | Python 3.10+ · Node.js 18+ · npm 9+ · Git 2.x |
+| 生产数据 | PostgreSQL 16（推荐）· 可写的 `/var/data` 持久化目录 |
+| 本地开发 | SQLite 可作为开发回退；不代表 PostgreSQL 生产行为已验证 |
 
----
+项目执行需要用户在“设置 → API 配置”中提供兼容的模型名称、API Base URL 和 API Key。模型凭据按用户隔离并加密保存，不应写入 `.env` 或仓库。
 
-## 📁 项目结构
+## 快速开始
 
-```
-├── backend/
-│   ├── api/              # 27 个路由模块（auth / projects / pm / phases / …）
-│   ├── agents/           # Agent 实现（PM / HR / Supervisor / Engineer / QA / …）
-│   ├── core/             # 核心引擎（auth / email / orchestrator / expert_lock / …）
-│   ├── models/           # Pydantic 数据模型
-│   └── tests/            # 后端测试
-├── frontend/
-│   ├── src/pages/        # 页面组件（登录 / 项目管理 / 阶段看板 / …）
-│   ├── src/services/     # API 服务层（axios + WebSocket）
-│   └── src-tauri/        # Tauri 桌面端配置
-├── 宣传网页/              # 产品宣传单页（GridScan 背景 + Three.js 特效）
-├── prompts/              # Agent 提示词模板
-├── scripts/              # 部署脚本
-├── docker-compose.yml    # 容器编排
-└── Caddyfile             # HTTPS 反代配置
+### Docker Compose
+
+```powershell
+git clone https://github.com/Felix-0625/METIS-MultiAgent.git
+Set-Location METIS-MultiAgent
+Copy-Item .env.example .env
+# 编辑 .env，至少设置数据库密码、管理员密码、JWT 与数据加密密钥
+docker compose up --build -d
 ```
 
----
+部署前请阅读 [部署指南](docs/DEPLOYMENT.md)，不要提交 `.env`、API Key、仓库 Token 或数据库文件。
 
-## 📚 文档
+### 生产环境关键配置
+
+| 变量 | 要求 |
+|:---|:---|
+| `DATABASE_URL` | PostgreSQL 连接地址；生产环境必填 |
+| `REQUIRE_DATABASE_URL` | 生产环境设为 `true`，禁止静默回退 SQLite |
+| `METIS_DATA_DIR` | Railway/Docker 使用 `/var/data` |
+| `JWT_SECRET` | 至少 32 UTF-8 字节的稳定随机密钥 |
+| `METIS_DATA_ENCRYPTION_KEY` | 至少 32 UTF-8 字节；用于加密 API Key、Git Token 等敏感配置 |
+| `ADMIN_USERNAME` / `ADMIN_PASSWORD` | 初始管理员账号；密码必须自行设置 |
+| `CORS_ORIGINS` | 只填写实际允许访问的 Web 域名 |
+| `DB_SSLMODE` | 托管 PostgreSQL 通常使用 `require` |
+| `BREVO_API_KEY` / `BREVO_SENDER_EMAIL` | 邮件验证可选；也可改用完整的 `SMTP_*` 配置 |
+
+密钥生成示例：
+
+```powershell
+# 生成 64 个十六进制字符（32 字节随机数据）
+python -c "import secrets; print(secrets.token_hex(32))"
+```
+
+### 本地开发
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+python -m pip install -r backend\requirements.txt
+
+Set-Location backend
+python -m uvicorn main:app --reload --host 0.0.0.0 --port 8000
+```
+
+另开终端启动前端：
+
+```powershell
+Set-Location frontend
+npm ci
+npm run dev
+```
+
+- Web 前端：`http://localhost:3000`
+- 后端健康检查：`http://localhost:8000/health`
+- OpenAPI：`http://localhost:8000/docs`
+
+## Railway 部署摘要
+
+1. 使用本仓库根目录的 `Dockerfile` 构建 Web Service。
+2. 添加 Railway PostgreSQL，并将 `DATABASE_URL` 引用到 Web Service。
+3. 创建 Volume，挂载路径固定为 `/var/data`。
+4. 配置上表中的生产环境变量，健康检查路径设为 `/health`。
+5. 将服务连接到本仓库 `main` 分支；推送后由 Railway 自动构建部署。
+
+当前公开地址：[https://metis-multiagent.up.railway.app](https://metis-multiagent.up.railway.app)
+
+## 验证
+
+```powershell
+python -m pytest backend\tests -q
+Set-Location frontend
+npm run build
+```
+
+自动化测试通过不等同于真实模型、生产网络、邮件服务或第三方仓库权限已经可用；上线前仍需完成相应环境的实际验证。
+
+## 项目结构
+
+```text
+backend/        FastAPI 路由、Agent、执行与质量引擎
+frontend/       React Web 应用
+docs/           架构、接口、部署和使用文档
+prompts/        Agent 提示词
+skills/         各角色 Skill 定义
+宣传网页/       产品首页
+Dockerfile      Railway 单容器生产镜像
+docker-compose.yml
+```
+
+## 文档导航
 
 - [使用指南](docs/USER_GUIDE.md)
-- [系统架构](ARCHITECTURE.md)
-- [接口文档](API.md)
-- [部署指南](DEPLOYMENT.md)
+- [系统架构](docs/ARCHITECTURE.md)
+- [API 接口](docs/API.md)
+- [Railway 与 Docker 部署](docs/DEPLOYMENT.md)
 - [安全策略](SECURITY.md)
-- [变更日志](CHANGE.md)
+- [版本变更](CHANGE.md)
+- [开源许可证](LICENSE)
 
----
+## 安全说明
 
-## 🎨 宣传页效果
+- API Key、Git Token 和 MCP Token 不应写入代码或提交到仓库。
+- 生产环境必须提供稳定且足够强的 `JWT_SECRET` 与 `METIS_DATA_ENCRYPTION_KEY`。
+- Git 拉取会修改所选项目工作区，执行前应确认远端仓库和本地改动。
+- 安全问题请按照 [SECURITY.md](SECURITY.md) 中的方式报告。
 
-![预览](https://img.shields.io/badge/GridScan-Background-FF9FFC?style=flat-square)
-![预览](https://img.shields.io/badge/Three.js-Shader-2F293A?style=flat-square)
+## 许可证
 
-- 深色地平网格线 + 粉色扫描波
-- Bloom 泛光 + 色差后处理
-- 鼠标跟随 3D 透视
-- 登录/注册已对接真实后端 API
-
----
-
-## 📄 许可证
-
-MIT License © 2025 METIS Team
+[MIT License](LICENSE) © 2026 METIS Contributors

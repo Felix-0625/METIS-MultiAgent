@@ -139,6 +139,8 @@ async def delete_project(project_id: str):
     if project_id not in projects:
         raise HTTPException(status_code=404, detail="项目不存在")
     ctx = projects[project_id]  # 先拿到上下文，获取 agent ID 列表
+    from core.persistence import delete_project_git_config
+    delete_project_git_config(project_id)
     from core.llm_usage import archive_project_llm_usage
     archive_project_llm_usage(
         user_id=str(getattr(ctx, "owner_user_id", "") or ""),

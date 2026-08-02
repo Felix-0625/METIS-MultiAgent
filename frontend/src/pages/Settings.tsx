@@ -1,8 +1,8 @@
 ﻿/**
  * 系统设置页面
  * - 默认 API 配置（支持主流模型快速选择 + 完全自定义）
- * - 本地数据持久化（手动保存 / 快照）
- * - Gitee 仓库绑定与手动推送
+ * - 数据持久化与桌面端能力说明
+ * - GitHub / Gitee 仓库绑定与手动同步
  */
 
 import React, { useEffect, useState } from 'react';
@@ -12,19 +12,15 @@ import {
 } from 'antd';
 import {
   SaveOutlined, CloudUploadOutlined, CloudDownloadOutlined, CodeOutlined,
-  ApiOutlined, GithubOutlined, DatabaseOutlined, HistoryOutlined,
+  ApiOutlined, GithubOutlined, DatabaseOutlined,
   CheckCircleOutlined, WarningOutlined, ThunderboltOutlined, PlayCircleOutlined,
   FolderOpenOutlined,
 } from '@ant-design/icons';
-import axios from 'axios';
-import { API_BASE_URL } from '../services/apiBase';
 import { apiClient } from '../services/api';
 import IdeIntegration from './IdeIntegration';
 
 const { Text } = Typography;
 const { Option, OptGroup } = Select;
-const API = API_BASE_URL;
-const ARCHIVE_DIR_KEY = 'metis_archive_dir';
 
 // ─── 主流模型预设 ─────────────────────────────────────────────────────────────
 interface ModelPreset {
@@ -88,9 +84,15 @@ const MODEL_PRESETS: Record<string, ModelPreset[]> = {
 interface GiteeStatus {
   initialized: boolean;
   has_remote: boolean;
+  provider?: 'github' | 'gitee';
   remote_url?: string;
   pending_changes: number;
   recent_commits: string[];
+}
+
+interface GitProjectOption {
+  id: string;
+  name: string;
 }
 
 const Settings: React.FC = () => {
@@ -102,20 +104,17 @@ const Settings: React.FC = () => {
   const [saving, setSaving] = useState(false);
   const [pushing, setPushing] = useState(false);
   const [pulling, setPulling] = useState(false);
-  const [snapshotting, setSnapshotting] = useState(false);
-  const [lastSaved, setLastSaved] = useState<string>('');
   const [selectedPreset, setSelectedPreset] = useState<string>('');
   const [testing, setTesting] = useState(false);
   const [clearingApiKey, setClearingApiKey] = useState(false);
   const [testResult, setTestResult] = useState<{ success: boolean; latency_ms: number; message: string } | null>(null);
-  const [archiveDir, setArchiveDir] = useState<string>(() => localStorage.getItem(ARCHIVE_DIR_KEY) || '');
+  const [gitProjects, setGitProjects] = useState<GitProjectOption[]>([]);
+  const [selectedGitProject, setSelectedGitProject] = useState<string>('');
+  const [gitStatusLoading, setGitStatusLoading] = useState(false);
 
   const fetchStatus = async () => {
     try {
-      const [defaultRes, giteeRes]: [any, any] = await Promise.all([
-        apiClient.get(`/config/api/default`),
-        apiClient.get(`/gitee/status`),
-      ]);
+      const defaultRes: any = await apiClient.get(`/config/api/default`);
       // apiClient interceptor 已将 response.data 解包，directly 是数据对象
       defaultApiForm.setFieldsValue({
         model: defaultRes.model || '',
@@ -128,8 +127,6 @@ const Settings: React.FC = () => {
         reviewer_model: defaultRes.reviewer?.model || defaultRes.model || '',
         reviewer_temperature: defaultRes.reviewer?.temperature ?? 0,
       });
-      // giteeRes 同样已解包
-      setGiteeStatus(giteeRes);
     } catch {
       defaultApiForm.setFieldsValue({
         model: 'gpt-5.6-sol',
@@ -142,9 +139,45 @@ const Settings: React.FC = () => {
         reviewer_temperature: 0,
       });
     }
+    try {
+      const projectRes: any = await apiClient.get('/projects');
+      const options = (projectRes.projects || []).map((project: any) => ({
+        id: project.id || project.project_id,
+        name: project.name || project.id || project.project_id,
+      })).filter((project: GitProjectOption) => project.id);
+      setGitProjects(options);
+      setSelectedGitProject(current => (
+        current && options.some((project: GitProjectOption) => project.id === current)
+          ? current
+          : options[0]?.id || ''
+      ));
+    } catch {
+      setGitProjects([]);
+      setSelectedGitProject('');
+    }
+  };
+
+  const fetchGitStatus = async (projectId: string) => {
+    if (!projectId) {
+      setGiteeStatus({ initialized: false, has_remote: false, pending_changes: 0, recent_commits: [] });
+      return;
+    }
+    setGitStatusLoading(true);
+    try {
+      const status: any = await apiClient.get(`/projects/${projectId}/git/status`);
+      setGiteeStatus(status);
+    } catch {
+      setGiteeStatus({ initialized: false, has_remote: false, pending_changes: 0, recent_commits: [] });
+    } finally {
+      setGitStatusLoading(false);
+    }
   };
 
   useEffect(() => { fetchStatus(); }, []);
+  useEffect(() => {
+    giteeForm.resetFields(['repo_url', 'token']);
+    fetchGitStatus(selectedGitProject);
+  }, [selectedGitProject]);
 
   const handlePresetSelect = (value: string) => {
     setSelectedPreset(value);
@@ -188,31 +221,6 @@ const Settings: React.FC = () => {
     }
   };
 
-  const handleLocalSave = async () => {
-    setSaving(true);
-    try {
-      const res = await axios.post(`${API}/data/save`);
-      setLastSaved(res.data.saved_at);
-      message.success('数据已保存到本地');
-    } catch {
-      message.error('保存失败');
-    } finally {
-      setSaving(false);
-    }
-  };
-
-  const handleSnapshot = async () => {
-    setSnapshotting(true);
-    try {
-      const res = await axios.post(`${API}/data/snapshot`);
-      message.success(`快照已创建：${res.data.snapshot_path}`);
-    } catch {
-      message.error('快照创建失败');
-    } finally {
-      setSnapshotting(false);
-    }
-  };
-
   const handleClearApiKey = async () => {
     setClearingApiKey(true);
     try {
@@ -226,29 +234,23 @@ const Settings: React.FC = () => {
     }
   };
 
-  const handleSaveArchiveDir = () => {
-    const value = archiveDir.trim();
-    if (!value) {
-      localStorage.removeItem(ARCHIVE_DIR_KEY);
-      message.success('归档目录配置已清空');
+  const handleConfigGitee = async (values: any) => {
+    if (!selectedGitProject) {
+      message.warning('请先选择项目');
       return;
     }
-    localStorage.setItem(ARCHIVE_DIR_KEY, value);
-    message.success('归档目录已保存');
-  };
-
-  const handleConfigGitee = async (values: any) => {
     try {
-      const res = await axios.post(`${API}/gitee/config`, {
+      const res: any = await apiClient.post(`/projects/${selectedGitProject}/git/config`, {
+        provider: values.provider,
         repo_url: values.repo_url,
         token: values.token,
       });
-      if (res.data.success) {
-        message.success('Gitee 仓库配置成功');
+      if (res.success) {
+        message.success(res.message || 'Git 仓库验证并绑定成功');
         giteeForm.setFieldValue('token', '');
-        fetchStatus();
+        fetchGitStatus(selectedGitProject);
       } else {
-        message.error(res.data.error || '配置失败');
+        message.error(res.error || '连接验证失败');
       }
     } catch (e: any) {
       message.error(e.response?.data?.detail || '配置失败');
@@ -256,31 +258,33 @@ const Settings: React.FC = () => {
   };
 
   const handlePush = async () => {
+    if (!selectedGitProject) return;
     setPushing(true);
     try {
-      const res = await axios.post(`${API}/gitee/push`, { commit_message: '' });
-      if (res.data.success) {
-        message.success(res.data.message);
-        fetchStatus();
+      const res: any = await apiClient.post(`/projects/${selectedGitProject}/git/push`, { commit_message: '' });
+      if (res.success) {
+        message.success(res.message);
+        fetchGitStatus(selectedGitProject);
       } else {
-        message.error(res.data.error || '推送失败');
+        message.error(res.error || '推送失败');
       }
     } catch (e: any) {
-      message.error(e.response?.data?.detail || '推送失败，请检查 Gitee 配置');
+      message.error(e.response?.data?.detail || '推送失败，请检查仓库配置');
     } finally {
       setPushing(false);
     }
   };
 
   const handlePull = async () => {
+    if (!selectedGitProject) return;
     setPulling(true);
     try {
-      const res = await axios.post(`${API}/gitee/pull`);
-      if (res.data.success) {
-        message.success(res.data.message);
-        fetchStatus();
+      const res: any = await apiClient.post(`/projects/${selectedGitProject}/git/pull`);
+      if (res.success) {
+        message.success(res.message);
+        fetchGitStatus(selectedGitProject);
       } else {
-        message.error(res.data.error || '拉取失败');
+        message.error(res.error || '拉取失败');
       }
     } catch (e: any) {
       message.error(e.response?.data?.detail || '拉取失败');
@@ -510,82 +514,78 @@ const Settings: React.FC = () => {
           },
           {
             key: 'persistence',
-            label: <span><DatabaseOutlined /> 本地持久化</span>,
+            label: <span><DatabaseOutlined /> 数据持久化</span>,
             children: (
               <div className="space-y-5 max-w-3xl">
-                <Card title={<Space><DatabaseOutlined /> 本地数据持久化</Space>}>
+                <Card title={<Space><DatabaseOutlined /> 网页版数据持久化</Space>}>
                   <Alert
-                    message="数据自动保存机制"
-                    description="每次创建项目、修改 Agent、导入 Skill 后系统会自动保存到 backend/data/ 目录。后端启动时自动加载，关闭时自动保存。"
-                    type="info"
+                    message="服务器自动保存，无需手动操作"
+                    description="创建或修改项目、阶段、Agent、Skill、设置及对话时，系统会在操作成功后自动写入服务器持久化存储。使用同一账号重新登录、刷新网页或服务重启后，已成功保存的数据仍会恢复；页面提示操作失败时，该次变更不视为已保存。"
+                    type="success"
                     showIcon
                     className="mb-4"
                   />
-                  <Space wrap>
-                    <Button icon={<SaveOutlined />} onClick={handleLocalSave} loading={saving}>
-                      立即保存到本地
-                    </Button>
-                    <Button icon={<HistoryOutlined />} onClick={handleSnapshot} loading={snapshotting}>
-                      创建快照（带时间戳）
-                    </Button>
-                  </Space>
-                  {lastSaved && (
-                    <div className="mt-3 text-xs text-gray-400">
-                      <CheckCircleOutlined className="text-green-500 mr-1" />
-                      上次保存：{lastSaved}
-                    </div>
-                  )}
-                  <Divider />
-                  <div className="text-xs text-gray-400">
-                    <div>📁 数据存储位置：<code>multimind/backend/data/</code></div>
-                    <div className="mt-1">📄 包含：projects.json · agents_config.json · skills.json</div>
-                    <div className="mt-1">📸 快照文件：snapshot_YYYYMMDD_HHMMSS.json（不会自动推送到 Gitee）</div>
+                  <div className="text-sm text-gray-500 space-y-2">
+                    <div>• 当前为网页版，数据保存在 METIS 服务器，不会自动写入你的电脑。</div>
+                    <div>• 项目文件可在项目管理中使用“下载”保存为本地压缩包。</div>
+                    <div>• 请勿将浏览器缓存或页面停留状态视为持久化结果，以操作成功提示为准。</div>
                   </div>
                 </Card>
-                <Card title={<Space><FolderOpenOutlined /> 项目归档目录</Space>}>
+                <Card
+                  title={<Space><FolderOpenOutlined /> 桌面端本地存储</Space>}
+                  extra={<Tag color="default">规划中</Tag>}
+                >
                   <Alert
-                    message="Web 版归档会下载 zip；桌面版配置目录后，项目归档会直接写入该本机文件夹。"
+                    message="桌面端尚未发布"
+                    description="本机目录选择、自动归档和桌面端本地存储能力仅作功能预留，当前网页版不提供这些操作。"
                     type="info"
                     showIcon
-                    className="mb-4"
                   />
-                  <Space.Compact style={{ width: '100%' }}>
-                    <Input
-                      value={archiveDir}
-                      onChange={(e) => setArchiveDir(e.target.value)}
-                      placeholder="例如：D:\\MeTis归档"
-                    />
-                    <Button type="primary" icon={<SaveOutlined />} onClick={handleSaveArchiveDir}>
-                      保存
-                    </Button>
-                  </Space.Compact>
                 </Card>
               </div>
             ),
           },
           {
-            key: 'gitee',
-            label: <span><GithubOutlined /> Gitee 同步</span>,
+            key: 'git',
+            label: <span><GithubOutlined /> Git 仓库同步</span>,
             children: (
               <div className="space-y-5 max-w-3xl">
                 <Card
-                  title={<Space><GithubOutlined /> Gitee 仓库绑定</Space>}
+                  title={<Space><GithubOutlined /> GitHub / Gitee 仓库绑定</Space>}
                   extra={
                     giteeStatus.has_remote
                       ? <Tag color="green" icon={<CheckCircleOutlined />}>已绑定</Tag>
                       : <Tag color="default">未绑定</Tag>
                   }
                 >
+                  <Form.Item label="绑定项目" required className="mb-4">
+                    <Select
+                      value={selectedGitProject || undefined}
+                      onChange={setSelectedGitProject}
+                      loading={gitStatusLoading}
+                      placeholder={gitProjects.length ? '选择要绑定仓库的项目' : '暂无可绑定项目'}
+                      options={gitProjects.map(project => ({ value: project.id, label: project.name }))}
+                      disabled={!gitProjects.length}
+                      showSearch
+                      optionFilterProp="label"
+                    />
+                  </Form.Item>
                   <Alert
                     message="手动推送说明"
-                    description="系统不会自动提交到 Gitee。你需要手动点击「推送到 Gitee」按钮。推送前会先保存最新数据。"
+                    description="每个项目独立绑定一个仓库；推送和拉取只处理当前所选项目的工作目录。系统不会自动同步，绑定时会验证仓库与令牌。"
                     type="warning"
                     showIcon
                     className="mb-4"
                   />
 
-                  {giteeStatus.initialized && (
+                  {selectedGitProject && giteeStatus.initialized && (
                     <div className="mb-4 p-3 bg-gray-50 rounded text-xs space-y-1">
+                      <div>
+                        <span className="text-gray-500">平台：</span>
+                        <Tag color={giteeStatus.provider === 'github' ? 'blue' : 'red'}>
+                          {giteeStatus.provider === 'github' ? 'GitHub' : 'Gitee'}
+                        </Tag>
+                      </div>
                       <div>
                         <span className="text-gray-500">仓库地址：</span>
                         <span className="font-mono">{giteeStatus.remote_url || '未配置'}</span>
@@ -607,29 +607,42 @@ const Settings: React.FC = () => {
                     </div>
                   )}
 
-                  <Form form={giteeForm} layout="vertical" onFinish={handleConfigGitee}>
+                  <Form
+                    form={giteeForm}
+                    layout="vertical"
+                    initialValues={{ provider: 'github' }}
+                    onFinish={handleConfigGitee}
+                  >
+                    <Form.Item label="仓库平台" name="provider" rules={[{ required: true }]}>
+                      <Select
+                        options={[
+                          { value: 'github', label: 'GitHub' },
+                          { value: 'gitee', label: 'Gitee' },
+                        ]}
+                      />
+                    </Form.Item>
                     <Form.Item
-                      label="Gitee 仓库地址"
+                      label="HTTPS 仓库地址"
                       name="repo_url"
                       rules={[{ required: true, message: '请输入仓库地址' }]}
                     >
-                      <Input placeholder="https://gitee.com/your-username/your-repo.git" />
+                      <Input placeholder="https://github.com/your-username/your-repo.git" />
                     </Form.Item>
                     <Form.Item
-                      label="Gitee 个人访问令牌（Token）"
+                      label="个人访问令牌（Token）"
                       name="token"
                       rules={[{ required: true, message: '请输入 Token' }]}
                       extra={
                         <span className="text-xs text-gray-400">
-                          在 Gitee → 设置 → 私人令牌 中生成，需要 projects 权限
+                          GitHub 使用具有目标仓库读写权限的 Fine-grained token；Gitee 使用具有仓库权限的私人令牌。令牌会加密保存且不会回显。
                         </span>
                       }
                     >
-                      <Input.Password placeholder="输入 Gitee 个人访问令牌" />
+                      <Input.Password placeholder="输入仓库个人访问令牌" autoComplete="new-password" />
                     </Form.Item>
                     <Form.Item>
-                      <Button type="primary" htmlType="submit" icon={<GithubOutlined />}>
-                        绑定 Gitee 仓库
+                      <Button type="primary" htmlType="submit" icon={<GithubOutlined />} disabled={!selectedGitProject}>
+                        验证并绑定仓库
                       </Button>
                     </Form.Item>
                   </Form>
@@ -644,7 +657,7 @@ const Settings: React.FC = () => {
                       loading={pushing}
                       disabled={!giteeStatus.has_remote}
                     >
-                      手动推送到 Gitee
+                      手动推送
                     </Button>
                     <Button
                       icon={<CloudDownloadOutlined />}
@@ -653,13 +666,19 @@ const Settings: React.FC = () => {
                       disabled={!giteeStatus.has_remote}
                       danger
                     >
-                      从 Gitee 拉取（覆盖本地）
+                      从仓库拉取（覆盖服务器数据）
                     </Button>
                   </Space>
-                  {!giteeStatus.has_remote && (
+                  {selectedGitProject && !giteeStatus.has_remote && (
                     <div className="mt-2 text-xs text-gray-400">
                       <WarningOutlined className="mr-1" />
-                      请先绑定 Gitee 仓库后再推送
+                      请先验证并绑定 GitHub 或 Gitee 仓库
+                    </div>
+                  )}
+                  {!selectedGitProject && (
+                    <div className="mt-2 text-xs text-gray-400">
+                      <WarningOutlined className="mr-1" />
+                      请先创建项目，再为项目绑定独立仓库
                     </div>
                   )}
                 </Card>

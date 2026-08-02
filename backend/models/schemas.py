@@ -78,6 +78,7 @@ class ChangeRequest(BaseModel):
 class GiteeConfigRequest(BaseModel):
     repo_url: str
     token: str
+    provider: str = "gitee"
 
 class GiteePushRequest(BaseModel):
     commit_message: Optional[str] = None

@@ -14,9 +14,9 @@ METIS 将需求、规划、执行、质检、返工和签收组织为可恢复�
 
 架构、接口、部署和安全细节分别见：
 
-- [系统架构](../ARCHITECTURE.md)
-- [接口文档](../API.md)
-- [部署指南](../DEPLOYMENT.md)
+- [系统架构](ARCHITECTURE.md)
+- [接口文档](API.md)
+- [部署指南](DEPLOYMENT.md)
 - [安全策略](../SECURITY.md)
 
 ## 2. 快速开始

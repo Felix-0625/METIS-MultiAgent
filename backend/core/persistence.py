@@ -80,11 +80,25 @@ def load_skills() -> Dict[str, Any]:
 # ─── Gitee 配置持久化 ─────────────────────────────────────────────────────────
 
 def save_gitee_config(config: Dict[str, Any]) -> None:
-    kv_set("gitee_config", config)
+    kv_set("gitee_config", protect_config(config, context="Git repository configuration"))
 
 
 def load_gitee_config() -> Dict[str, Any]:
-    return kv_get("gitee_config", {})
+    restored = restore_config(kv_get("gitee_config", {}), context="Git repository configuration")
+    if restored.replacement is not None:
+        kv_set("gitee_config", restored.replacement)
+    return restored.value if isinstance(restored.value, dict) else {}
+
+
+def delete_project_git_config(project_id: str) -> None:
+    """Remove a repository binding when its project is deleted."""
+    config = load_gitee_config()
+    bindings = config.get("projects") if isinstance(config, dict) else None
+    if not isinstance(bindings, dict) or project_id not in bindings:
+        return
+    updated = dict(bindings)
+    updated.pop(project_id, None)
+    save_gitee_config({"schema_version": 2, "projects": updated})
 
 
 # ─── 默认 API 配置持久化 ──────────────────────────────────────────────────────
