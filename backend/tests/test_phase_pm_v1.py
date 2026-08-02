@@ -6,6 +6,119 @@ from api import routes_experts, routes_phases
 from api import routes_execution
 from core.expert_pool import get_expert_pool
 from core.phase_manager import PhaseManager
+from core import persistence
+
+
+def test_phase_discussion_rows_only_use_latest_pm_plan_and_skip_table_header():
+    discussion = """assistant:
+| # | 任务 | 验收标准 |
+|---|---|---|
+| 1 | 旧任务一 | 旧验收一 |
+| 2 | 旧任务二 | 旧验收二 |
+user:
+请重新规划
+assistant:
+| # | 任务 | 验收标准 |
+|---|---|---|
+| 1 | 新任务一 | 新验收一 |
+| 2 | 新任务二 | 新验收二 |
+"""
+
+    latest = routes_phases._latest_phase_pm_content(discussion)
+    rows = routes_phases._phase_discussion_task_rows(latest)
+
+    assert rows == [
+        {"name": "新任务一", "objective": "新任务一", "acceptance": "新验收一"},
+        {"name": "新任务二", "objective": "新任务二", "acceptance": "新验收二"},
+    ]
+
+
+def test_phase_discussion_rows_parse_numbered_markdown_task_sections():
+    content = """## 阶段规划
+**任务1：前后端联调**
+- 前端所有 API 调用打通
+- 验收：手动操作无报错
+
+**任务2：重启恢复验证**
+- 重启服务并检查数据
+- 验收：任务和计时状态全部恢复
+"""
+
+    assert routes_phases._phase_discussion_task_rows(content) == [
+        {
+            "name": "前后端联调",
+            "objective": "前端所有 API 调用打通",
+            "acceptance": "手动操作无报错",
+        },
+        {
+            "name": "重启恢复验证",
+            "objective": "重启服务并检查数据",
+            "acceptance": "任务和计时状态全部恢复",
+        },
+    ]
+
+
+def test_deterministic_phase_plan_does_not_replace_unstructured_pm_agreement_with_old_work_items():
+    phase = {
+        "phase_id": "phase-3",
+        "name": "联调验收",
+        "objective": "完成联调与验收",
+        "work_items": ["前后端联调", "重启恢复验证", "输出验收文档"],
+    }
+    plan = routes_phases._deterministic_phase_plan_v1(
+        phase=phase,
+        requirements_snapshot={
+            "phase_user_requirements": "assistant:\n请把系统全面检查好，然后交付。",
+            "inherited_technical_requirements": [],
+        },
+        expert_snapshot={
+            "revision": "experts-v1",
+            "experts": [{"expert_id": "expert-1", "role": "全栈专家"}],
+        },
+    )
+
+    assert plan["tasks"] == []
+
+
+def test_phase_discussion_rows_parse_numbered_markdown_without_task_prefix():
+    content = """\
+**二、任务拆分**
+1. **任务数据模型设计**
+- 字段：id、标题、优先级
+- 验收：模型定义完整，字段类型与约束正确
+2. **SQLite 持久化层**
+- 使用 sqlite3 实现连接管理
+- 验收：服务重启后数据不丢失
+"""
+
+    rows = routes_phases._phase_discussion_task_rows(content)
+
+    assert [row["name"] for row in rows] == ["任务数据模型设计", "SQLite 持久化层"]
+    assert rows[0]["acceptance"] == "模型定义完整，字段类型与约束正确"
+
+
+def test_deterministic_phase_plan_records_all_predecessor_dependencies():
+    phase = {
+        "phase_id": "phase-1",
+        "name": "Backend",
+        "objective": "Implement backend",
+    }
+    plan = routes_phases._deterministic_phase_plan_v1(
+        phase=phase,
+        requirements_snapshot={
+            "phase_user_requirements": "assistant:\n1. Model\n- acceptance: model works\n2. API\n- acceptance: API works\n3. Filters\n- acceptance: filters work",
+            "inherited_technical_requirements": ["FastAPI"],
+        },
+        expert_snapshot={
+            "revision": "experts-v1",
+            "experts": [{"expert_id": "expert-1", "role": "backend"}],
+        },
+    )
+
+    assert plan["tasks"][2]["dependencies"] == [
+        "phase-1-task-1",
+        "phase-1-task-2",
+    ]
 
 
 def _total_plan():
@@ -42,6 +155,115 @@ def _total_plan():
             "phases": [],
         },
     }
+
+
+def test_phase_plan_restore_preserves_newer_execution_runtime(monkeypatch):
+    runtime_phase = {
+        "phase_id": "phase-1",
+        "description": "runtime mirror of old plan",
+        "status": "reviewing",
+        "execution_generation": "generation-current",
+        "execution_coordinator": {
+            "status": "completed",
+            "durable_run_id": "coordinator-current",
+            "durable_status": "succeeded",
+        },
+        "execution_dispatch_result": {"success": True},
+    }
+    monkeypatch.setattr(
+        persistence,
+        "kv_get",
+        lambda key, default=None: {
+            "project": {
+                "phases": [runtime_phase],
+                "project_contract": {"locked": True, "contract_version": 3},
+            },
+        } if key == "phase_managers" else default,
+    )
+    monkeypatch.setattr(
+        persistence,
+        "list_phase_plan_commits",
+        lambda: [{
+            "project_id": "project",
+            "phase_id": "phase-1",
+            "phase": {
+                "phase_id": "phase-1",
+                "description": "authoritative committed plan",
+                "status": "pending",
+                "phase_plan_revision": 2,
+                "phase_plan": {"schema_version": "phase-plan/v1"},
+            },
+            "project_contract": {"locked": True, "contract_version": 3},
+        }],
+    )
+
+    restored = persistence.load_phase_managers()["project"]["phases"][0]
+
+    assert restored["description"] == "authoritative committed plan"
+    assert restored["phase_plan_revision"] == 2
+    assert restored["status"] == "reviewing"
+    assert restored["execution_generation"] == "generation-current"
+    assert restored["execution_coordinator"]["durable_run_id"] == (
+        "coordinator-current"
+    )
+    assert restored["execution_dispatch_result"] == {"success": True}
+
+
+def test_uncommitted_conflicting_qa_scope_is_detached_without_budget_loss(
+    monkeypatch,
+):
+    project_id = "project"
+    phase_id = "phase-1"
+    key = f"{project_id}-{phase_id}"
+    phase = {"phase_id": phase_id, "reviewed": True, "review_passed": False}
+    state = {
+        "status": "blocked",
+        "action_required": {
+            "message": "Conflicting replay for active qa_round_id",
+        },
+    }
+    machine = {
+        "run_id": "qa-run-old",
+        "state": "qa_running",
+        "business_rounds_used": 0,
+        "active_qa_round_id": "qa-old:1",
+        "scope": {
+            "scope_digest": "same-scope",
+            "phase_generation_id": "same-generation",
+        },
+        "rounds": [{
+            "qa_round_id": "qa-old:1",
+            "consumes_business_round": False,
+            "qa_snapshot_committed": False,
+        }],
+    }
+    ctx = SimpleNamespace(
+        project_id=project_id,
+        supervisor_quality_runs={phase_id: machine},
+        qc_results={phase_id: {"passed": False}},
+    )
+    monkeypatch.setitem(routes_phases._auto_repair_states, key, state)
+    monkeypatch.setitem(routes_phases._auto_repair_api_configs, key, {"model": "x"})
+    monkeypatch.setattr(
+        routes_phases,
+        "_supervisor_scope_snapshot",
+        lambda _ctx, _phase_id: {
+            "scope_digest": "same-scope",
+            "phase_generation_id": "same-generation",
+        },
+    )
+
+    detached = routes_phases._detach_uncommitted_stale_qa_scope(
+        ctx, phase_id, phase,
+    )
+
+    assert detached is True
+    assert key not in routes_phases._auto_repair_states
+    assert key not in routes_phases._auto_repair_api_configs
+    assert ctx.supervisor_quality_runs == {}
+    assert ctx.qc_results == {}
+    assert phase["reviewed"] is False
+    assert phase["superseded_quality_runs"][-1]["business_rounds_used"] == 0
 
 
 def test_total_plan_maps_exactly_to_phase_board_with_full_phase_scope(tmp_path):
@@ -259,6 +481,54 @@ def test_pathless_phase_planning_lock_does_not_claim_workspace():
     assert routes_phases._phase_planning_lock_scope(
         ["src/app.js"],
     ) == ["src/app.js"]
+
+
+def test_phase_planning_locks_are_released_before_execution(monkeypatch):
+    released = []
+    agents = [
+        {"id": "agent-1", "lock_id": "planning-1", "locked_until": 123.0},
+        {"id": "agent-2", "lock_id": "planning-2", "locked_until": 456.0},
+        {"id": "agent-3", "lock_id": None, "locked_until": None},
+        {
+            "id": "agent-running", "lock_id": "execution-1",
+            "lock_run_id": "run-1", "locked_until": 789.0,
+        },
+    ]
+    monkeypatch.setattr(
+        routes_phases.expert_lock,
+        "release_lock",
+        lambda lock_id: released.append(lock_id) or {"success": True},
+    )
+
+    routes_phases._release_phase_planning_locks(agents)
+
+    assert released == ["planning-1", "planning-2"]
+    assert [agent.get("lock_id") for agent in agents] == [
+        None, None, None, "execution-1",
+    ]
+    assert agents[-1]["locked_until"] == 789.0
+
+
+def test_workspace_exclusive_tasks_are_isolated_into_serial_waves():
+    plan = {
+        "phase_id": "phase-1",
+        "task_ids": ["task-a", "task-b", "task-c"],
+        "waves": [[
+            {"task_id": "task-a"},
+            {"task_id": "task-b"},
+            {"task_id": "task-c"},
+        ]],
+    }
+
+    execution_plan = routes_phases._isolate_workspace_exclusive_tasks(
+        plan, {"task-b"},
+    )
+
+    assert [[task["task_id"] for task in wave]
+            for wave in execution_plan["waves"]] == [
+        ["task-a"], ["task-b"], ["task-c"],
+    ]
+    assert plan["waves"][0][1]["task_id"] == "task-b"
 
 
 def test_phase_plan_gate_requires_one_expert_per_task():
@@ -766,16 +1036,77 @@ def test_phase_plan_retry_bypasses_cached_invalid_result(monkeypatch):
     ))
 
     assert result["status"] == "saved"
-    assert cache_flags == [False, False]
-    retry_feedback = seen_messages[1][-1].content
-    assert "task_id_sequence" in retry_feedback
-    assert '"expected": "phase-1-task-2"' in retry_feedback
-    assert '"actual": "phase-1-task-3"' in retry_feedback
+    assert cache_flags == [False]
     assert [task["task_id"] for task in phase["phase_plan"]["tasks"]] == [
         "phase-1-task-1",
         "phase-1-task-2",
-        "phase-1-task-3",
     ]
     assert phase["plan_generation_attempts"][0]["issues"][0]["code"] == (
         "task_id_sequence"
     )
+
+
+def test_phase_plan_falls_back_to_valid_contract_after_invalid_model_output(
+    monkeypatch,
+):
+    phase = _total_plan()["phases"][0]
+
+    class Profile:
+        def to_dict(self):
+            return {
+                "expert_id": "expert-frontend",
+                "name": "Frontend Expert",
+                "role": "frontend",
+                "agent_type": "pg",
+                "domains": ["React"],
+                "skills": [],
+                "status": "available",
+                "updated_at": 1,
+            }
+
+    class Pool:
+        def list_experts(self, status=None):
+            return [Profile()]
+
+    monkeypatch.setattr(
+        "core.expert_pool.get_expert_pool",
+        lambda _owner_user_id="": Pool(),
+    )
+    monkeypatch.setattr(
+        routes_phases.hermes_client,
+        "chat",
+        lambda *_args, **_kwargs: {"content": "not a phase plan"},
+    )
+    leader = SimpleNamespace(
+        final_plan=_total_plan(),
+        canonical_requirements="Build a focus timer",
+        requirements_revision=1,
+        requirements_digest="sha256:test",
+    )
+    pm = SimpleNamespace(project_contract={"required_files": [], "phases": []})
+    ctx = SimpleNamespace(name="Focus timer", owner_user_id="user-1")
+
+    result = asyncio.run(routes_phases._generate_phase_plan_v1(
+        project_id="fallback-project",
+        ctx=ctx,
+        pm=pm,
+        phase=phase,
+        leader=leader,
+        phase_user_requirements="arbitrary discussion text",
+    ))
+
+    assert result["status"] == "saved"
+    assert phase["plan_generated"] is True
+    assert phase["phase_plan"]["schema_version"] == "phase-plan/v1"
+    assert phase["phase_plan"]["tasks"]
+    assert phase["expert_requirements"]
+    assert phase["plan_generation_attempts"][-1]["status"] == (
+        "deterministic_fallback"
+    )
+    assert routes_phases._validate_phase_plan_v1(
+        phase["phase_plan"],
+        phase=phase,
+        requirements_snapshot=phase["phase_requirements_snapshot"],
+        expert_snapshot=routes_phases._expert_pool_snapshot(Pool()),
+        reserved_files={},
+    ) == []

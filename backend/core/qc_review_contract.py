@@ -324,8 +324,9 @@ def validate_qc_review_result(
             raise QCContractError("blocking QC issue is not bound to a packet file")
         if not str(issue.get("message") or "").strip():
             raise QCContractError("blocking QC issue has no concrete message")
-        if not (issue.get("line") or str(issue.get("symbol") or "").strip()):
-            raise QCContractError("blocking QC issue has no line or symbol")
+        # File-level and configuration defects often have no meaningful line
+        # or symbol.  The packet-bound path plus structured expected/actual
+        # evidence is sufficient to dispatch an actionable repair.
         for field in ("expected", "actual", "evidence", "fix_hint"):
             if not str(issue.get(field) or "").strip():
                 raise QCContractError(

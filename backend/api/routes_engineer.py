@@ -1,5 +1,6 @@
 """工程师工作台路由"""
 import copy
+import asyncio
 import hashlib
 import json
 import os
@@ -12,6 +13,8 @@ from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from typing import Optional, List, Dict, Any
 from pydantic import BaseModel
+from core.database import kv_get, kv_set
+from core.hermes_client import Message, MessageRole
 from core.app_state import (
     app, projects, hermes_client, global_sm_agent, gitee_sync,
     config_loader, agents_api_config, DEFAULT_API_CONFIG,
@@ -41,6 +44,110 @@ from models.schemas import (
     CCBConfirmDeleteRequest, InjectQCRequest, ProjectTeamAssignRequest,
 )
 router = APIRouter(tags=["engineer"])
+
+
+class EngineerConsultationCreateRequest(BaseModel):
+    mode: str = "inquiry"
+    title: str = ""
+    source_issue_id: Optional[str] = None
+
+
+class EngineerConsultationMessageRequest(BaseModel):
+    message: str
+
+
+class EngineerConsultationRenameRequest(BaseModel):
+    title: str
+
+
+class EngineerRectificationPrepareRequest(BaseModel):
+    session_id: str
+
+
+class EngineerRectificationApplyRequest(BaseModel):
+    session_id: str
+    proposal_id: str
+
+
+def _consultation_key(project_id: str) -> str:
+    return f"engineer_consultations:{project_id}"
+
+
+def _consultation_sessions(project_id: str) -> List[Dict[str, Any]]:
+    payload = kv_get(_consultation_key(project_id), {"sessions": []})
+    sessions = payload.get("sessions") if isinstance(payload, dict) else []
+    return sessions if isinstance(sessions, list) else []
+
+
+def _save_consultation_sessions(project_id: str, sessions: List[Dict[str, Any]]) -> None:
+    kv_set(_consultation_key(project_id), {"sessions": sessions, "updated_at": time.time()})
+
+
+def _extract_json_object(text: str) -> Optional[Dict[str, Any]]:
+    """Extract the first balanced JSON object without treating format as quality."""
+    start = text.find("{")
+    while start >= 0:
+        depth = 0
+        in_string = False
+        escaped = False
+        for index in range(start, len(text)):
+            char = text[index]
+            if in_string:
+                if escaped:
+                    escaped = False
+                elif char == "\\":
+                    escaped = True
+                elif char == '"':
+                    in_string = False
+                continue
+            if char == '"':
+                in_string = True
+            elif char == "{":
+                depth += 1
+            elif char == "}":
+                depth -= 1
+                if depth == 0:
+                    try:
+                        value = json.loads(text[start:index + 1])
+                    except json.JSONDecodeError:
+                        break
+                    if isinstance(value, dict):
+                        return value
+                    break
+        start = text.find("{", start + 1)
+    return None
+
+
+def _parse_rectification_response(raw: str) -> Dict[str, Any]:
+    """Normalize strict JSON, fenced JSON, or prose-wrapped JSON."""
+    text = str(raw or "").strip()
+    if text.startswith("```") and text.endswith("```"):
+        lines = text.splitlines()
+        text = "\n".join(lines[1:-1]).strip()
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError:
+        parsed = _extract_json_object(text)
+    if not isinstance(parsed, dict):
+        raise ValueError("response does not contain an executable change object")
+    return parsed
+
+
+def _consultation_roles(ctx: ProjectContext) -> List[str]:
+    roles = ["PM组长", "全栈工程师"]
+    for agent in ctx.agents.values():
+        role = str(agent.get("role") or agent.get("agent_role") or "").strip()
+        if role and role not in roles:
+            roles.append(role)
+    return roles
+
+
+def _mentioned_role(text: str, roles: List[str]) -> Optional[str]:
+    lowered = text.lower()
+    for role in sorted(roles, key=len, reverse=True):
+        if f"@{role}".lower() in lowered:
+            return role
+    return None
 
 _engineer_apply_claim_lock = threading.Lock()
 _active_engineer_apply_projects: set[str] = set()
@@ -325,6 +432,131 @@ def _register_authoritative_reinspection(
     defect["_source_issue"]["repair_artifact_digest"] = expected_artifact
     defect["_source_issue"]["authoritative_reinspection_registration"] = registration
     return registration
+
+
+async def _run_engineer_targeted_verification(
+    ctx: ProjectContext,
+    defect: Dict[str, Any],
+    agent: Any,
+) -> Dict[str, Any]:
+    """Replay only the originating deterministic check after Engineer repair.
+
+    This verifier is deliberately independent from Supervisor/Final QA state.
+    It never changes phase state, consumes QA rounds, or reopens a completed
+    quality cycle.
+    """
+    source = defect.get("_source_issue")
+    source = source if isinstance(source, dict) else defect
+    specification = source.get("verification_spec")
+    specification = specification if isinstance(specification, dict) else {}
+    kind = str(specification.get("kind") or "").strip().lower()
+    layer = str(defect.get("layer") or source.get("layer") or "").strip().lower()
+    if not kind and layer == "runtime_acceptance":
+        kind = "runtime_acceptance"
+        specification = {
+            "kind": kind,
+            "provenance": "derived_from_deterministic_runtime_finding",
+        }
+    elif not kind and layer in {"syntax", "logic", "layer1", "layer2"}:
+        kind = "static_file"
+        specification = {
+            "kind": kind,
+            "provenance": "derived_from_static_finding",
+        }
+
+    path = _canonical_workspace_path(Path(ctx.workspace), defect.get("file_path"))
+    if path:
+        target = (Path(ctx.workspace) / path).resolve()
+        if not target.is_file():
+            return {
+                "status": "failed",
+                "passed": False,
+                "retryable": False,
+                "reason": "target_file_missing_after_repair",
+                "issues": [f"整改目标文件不存在：{path}"],
+                "verification_spec": specification,
+            }
+        content = target.read_text(encoding="utf-8", errors="replace")
+        static_result = agent._quick_static_check(str(target), content)
+        if static_result.get("passed") is not True:
+            return {
+                "status": "failed",
+                "passed": False,
+                "retryable": False,
+                "reason": "engineer_static_self_check_failed",
+                "issues": list(static_result.get("issues") or []),
+                "verification_spec": specification,
+            }
+    else:
+        static_result = {"passed": True, "issues": [], "score": 100}
+
+    if kind == "static_file":
+        return {
+            "status": "verified",
+            "passed": True,
+            "retryable": False,
+            "reason": "originating_static_check_replayed",
+            "issues": [],
+            "self_check": static_result,
+            "verification_spec": specification,
+        }
+
+    if kind == "runtime_acceptance":
+        from core.runtime_acceptance import run_runtime_acceptance
+
+        phase_manager = _phase_managers.get(ctx.project_id)
+        contract = getattr(phase_manager, "project_contract", None) if phase_manager else None
+        try:
+            runtime_result = await asyncio.to_thread(
+                run_runtime_acceptance,
+                Path(ctx.workspace),
+                f"{ctx.project_id}:engineer:{defect.get('defect_id') or defect.get('id')}",
+                None,
+                None,
+                contract,
+                True,
+            )
+        except Exception as exc:
+            return {
+                "status": "deferred",
+                "passed": False,
+                "retryable": True,
+                "reason": "targeted_runtime_verifier_unavailable",
+                "issues": [f"{exc.__class__.__name__}: {exc}"],
+                "verification_spec": specification,
+            }
+        if runtime_result.get("passed") is True:
+            return {
+                "status": "verified",
+                "passed": True,
+                "retryable": False,
+                "reason": "originating_runtime_acceptance_replayed",
+                "issues": [],
+                "runtime_acceptance": runtime_result,
+                "verification_spec": specification,
+            }
+        retryable = bool(runtime_result.get("retryable")) or not bool(
+            runtime_result.get("actionable", True)
+        )
+        return {
+            "status": "deferred" if retryable else "failed",
+            "passed": False,
+            "retryable": retryable,
+            "reason": "originating_runtime_acceptance_still_failing",
+            "issues": [str(runtime_result.get("summary") or "定向运行验收未通过")],
+            "runtime_acceptance": runtime_result,
+            "verification_spec": specification,
+        }
+
+    return {
+        "status": "deferred",
+        "passed": False,
+        "retryable": True,
+        "reason": "originating_verification_spec_unavailable",
+        "issues": ["原缺陷没有可安全重放的 verification_spec"],
+        "self_check": static_result,
+        "verification_spec": specification,
+    }
 
 
 def _apply_fix_transaction(
@@ -897,16 +1129,13 @@ async def engineer_apply_fix(project_id: str, request: EngineerApplyFixRequest):
     if not request.run_qa:
         raise HTTPException(
             status_code=409,
-            detail="apply-fix 必须进入 authoritative Supervisor/Final QA 强制复检",
+            detail="apply-fix 必须执行工程师自检与原问题定向复验",
         )
     try:
-        # Validation, bytes, ledger, authoritative ownership, and task startup
-        # are one project-writer transaction.  In particular, whole-project
-        # Final QA receives its canonical artifact registration before this
-        # guard can release.
-        with project_write_guard(
-            project_id, Path(ctx.workspace)
-        ) as writer_capability:
+        with (
+            _engineer_apply_claim(project_id),
+            project_write_guard(project_id, Path(ctx.workspace)),
+        ):
             transaction = _apply_fix_transaction(project_id, ctx, agent, request)
             result = transaction["result"]
             if not result.get("success"):
@@ -915,75 +1144,51 @@ async def engineer_apply_fix(project_id: str, request: EngineerApplyFixRequest):
             defect = transaction["defect"]
             source_issue = transaction["source_issue"]
             target_path = transaction["target_path"]
-            try:
-                registration = _register_authoritative_reinspection(
-                    ctx,
-                    defect,
-                    writer_capability=writer_capability,
-                )
-                transaction["authoritative_registration"] = registration
-                result["authoritative_registration"] = registration
-                inspection = await _start_authoritative_reinspection(
-                    project_id, ctx, defect
-                )
-            except Exception as schedule_error:
-                registration = transaction.get("authoritative_registration")
-                if (
-                    str(defect.get("subproject_id") or "") == "__whole_project__"
-                    and isinstance(registration, dict)
-                ):
-                    from api.routes_adjustments import cancel_registered_final_qa
-                    cancel_registered_final_qa(
-                        ctx,
-                        str(registration.get("registration_id") or ""),
-                        str(registration.get("artifact_digest") or ""),
-                    )
+            verification = await _run_engineer_targeted_verification(
+                ctx, defect, agent
+            )
+            verification["checked_at"] = time.time()
+            verification["artifact_sha256"] = str(
+                compute_delivery_manifest(Path(ctx.workspace)).get(
+                    "artifact_sha256"
+                ) or ""
+            )
 
-                # Refuse compensation if any non-participating writer changed
-                # the repaired generation despite the project guard.
-                expected_artifact = str(
-                    result.get("repair_delivery_artifact_digest") or ""
-                )
-                current_artifact = str(
-                    compute_delivery_manifest(Path(ctx.workspace)).get(
-                        "artifact_sha256"
-                    ) or ""
-                )
-                expected_target = str(result.get("repair_target_sha256") or "")
-                current_target = (
-                    hashlib.sha256(target_path.read_bytes()).hexdigest()
-                    if target_path.is_file()
-                    else ""
-                )
-                if (
-                    not expected_artifact
-                    or current_artifact != expected_artifact
-                    or not expected_target
-                    or current_target != expected_target
-                ):
-                    manual_issue = mark_needs_manual(
-                        source_issue,
-                        (
-                            "Authoritative QA scheduling failed after the repair "
-                            "generation changed; automatic rollback was refused"
-                        ),
-                    )
-                    source_issue.clear()
-                    source_issue.update(manual_issue)
-                    source_issue["rollback_refused_artifact_digest"] = current_artifact
-                    source_issue["rollback_refused_target_sha256"] = current_target
-                    await _persist_all_async()
-                    raise HTTPException(
-                        status_code=409,
-                        detail=(
-                            "整改后的 workspace 已被再次修改；为避免覆盖并发写入，"
-                            "自动回滚已拒绝，需要人工恢复"
-                        ),
-                    ) from schedule_error
-
+            if verification.get("status") == "failed":
                 _restore_fix_transaction(transaction)
+                source_issue = transaction["source_issue"]
+                source_issue["engineer_targeted_verification"] = verification
+                source_issue["last_engineer_repair_failed_at"] = time.time()
+                result = {
+                    **result,
+                    "success": False,
+                    "status": str(source_issue.get("status") or "needs_manual"),
+                    "rolled_back": True,
+                    "requires_final_qa": False,
+                    "targeted_verification": verification,
+                    "message": "原问题定向复验未通过，本次整改已原子回滚",
+                }
                 await _persist_all_async()
-                raise
+                return result
+
+            source_issue["engineer_targeted_verification"] = verification
+            source_issue.pop("authoritative_reinspection_registration", None)
+            if verification.get("passed") is True:
+                source_issue["status"] = "verified"
+                source_issue["verified_at"] = time.time()
+                source_issue["verified_by"] = "engineer_targeted_verifier"
+                result["status"] = "verified"
+                result["message"] = "整改已写入，并通过工程师自检与原问题定向复验"
+            else:
+                source_issue["status"] = "pending_verification"
+                source_issue["verification_deferred_at"] = time.time()
+                result["status"] = "pending_verification"
+                result["message"] = (
+                    "整改已写入并通过本地自检；原问题暂不可安全重放，"
+                    "已标记待复检，不进入阶段 QA/QC"
+                )
+            result["requires_final_qa"] = False
+            result["targeted_verification"] = verification
     except ProjectWriteFenceConflict as exc:
         raise HTTPException(status_code=409, detail=str(exc)) from exc
 
@@ -993,11 +1198,6 @@ async def engineer_apply_fix(project_id: str, request: EngineerApplyFixRequest):
             f"{target_path.name} — {str(defect.get('message') or '')[:60]}",
             memory_type="issue",
         )
-    result["authoritative_reinspection"] = inspection
-    result["message"] = (
-        f"{result.get('message', '整改已写入')}；已进入 authoritative 复检，"
-        "当前结果不是 Final QA 通过证明"
-    )
     await _persist_all_async()
     return result
 
@@ -1060,6 +1260,367 @@ async def engineer_get_archived_files(project_id: str):
     if not cached:
         return {"files": [], "stats": {}, "total": 0, "message": "尚未执行归档，请先点击「扫描归档」"}
     return cached
+
+
+@router.get("/engineer/{project_id}/consultations")
+async def engineer_list_consultations(project_id: str):
+    ctx = _get_project(project_id)
+    return {
+        "sessions": _consultation_sessions(project_id),
+        "participants": _consultation_roles(ctx),
+    }
+
+
+@router.post("/engineer/{project_id}/consultations")
+async def engineer_create_consultation(
+    project_id: str, request: EngineerConsultationCreateRequest
+):
+    ctx = _get_project(project_id)
+    mode = str(request.mode or "inquiry").strip().lower()
+    if mode not in {"inquiry", "change", "rectification"}:
+        raise HTTPException(status_code=422, detail="不支持的会话类型")
+    source_issue_binding = None
+    source_issue_id = str(request.source_issue_id or "").strip()
+    if source_issue_id:
+        if mode != "rectification":
+            raise HTTPException(status_code=422, detail="source_issue_id only applies to rectification sessions")
+        defect = _find_canonical_defect(ctx, source_issue_id)
+        source_issue_binding = {
+            "defect_id": str(defect.get("defect_id") or defect.get("id") or source_issue_id),
+            "observation_id": str(defect.get("observation_id") or ""),
+            "verification_spec": copy.deepcopy(
+                (defect.get("_source_issue") or {}).get("verification_spec") or {}
+            ),
+            "bound_at": time.time(),
+        }
+    sessions = _consultation_sessions(project_id)
+    now = time.time()
+    session = {
+        "id": f"consult-{uuid.uuid4().hex[:10]}",
+        "mode": mode,
+        "title": str(request.title or "").strip() or ({
+            "inquiry": "项目问答", "change": "功能变更讨论", "rectification": "项目整改",
+        }[mode]),
+        "messages": [],
+        "created_at": now,
+        "updated_at": now,
+    }
+    if source_issue_binding:
+        session["source_issue_binding"] = source_issue_binding
+    sessions.insert(0, session)
+    _save_consultation_sessions(project_id, sessions)
+    return {"session": session}
+
+
+@router.patch("/engineer/{project_id}/consultations/{session_id}")
+async def engineer_rename_consultation(
+    project_id: str,
+    session_id: str,
+    request: EngineerConsultationRenameRequest,
+):
+    _get_project(project_id)
+    title = str(request.title or "").strip()
+    if not title or len(title) > 80:
+        raise HTTPException(status_code=422, detail="对话名称长度必须为 1-80 个字符")
+    sessions = _consultation_sessions(project_id)
+    session = next((item for item in sessions if item.get("id") == session_id), None)
+    if not session:
+        raise HTTPException(status_code=404, detail="咨询会话不存在")
+    session["title"] = title
+    session["updated_at"] = time.time()
+    _save_consultation_sessions(project_id, sessions)
+    return {"session": session}
+
+
+@router.post("/engineer/{project_id}/consultations/{session_id}/messages")
+async def engineer_send_consultation_message(
+    project_id: str,
+    session_id: str,
+    request: EngineerConsultationMessageRequest,
+):
+    ctx = _get_project(project_id)
+    text = str(request.message or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="消息不能为空")
+    sessions = _consultation_sessions(project_id)
+    session = next((item for item in sessions if item.get("id") == session_id), None)
+    if not session:
+        raise HTTPException(status_code=404, detail="咨询会话不存在")
+
+    roles = _consultation_roles(ctx)
+    agent = _get_engineer(project_id)
+    _build_engineer_context(project_id, agent)
+    project_background = str(getattr(agent, "project_background", "") or "")
+    responder = _mentioned_role(text, roles) or ("全栈工程师" if session.get("mode") == "rectification" else "PM组长")
+    mode = str(session.get("mode") or "inquiry")
+    mode_instruction = {
+        "inquiry": "只回答现有项目的功能、实现、文件与技术细节，不提出或执行文件修改。",
+        "change": "与用户讨论现有项目的新增、删除或修改需求，形成可交给全栈工程师的明确方案；本会话只讨论，不写文件。",
+        "rectification": "分析用户提交的最终整改方案，澄清影响文件和实现细节；此对话阶段不写文件，确认后由系统生成可审核的文件变更提案。",
+    }.get(mode, "只进行项目咨询，不写文件。")
+    participants = "、".join(roles)
+    system_prompt = (
+        f"你正在 METIS 项目咨询工作群中，以【{responder}】身份回答。\n"
+        f"{mode_instruction}\n"
+        f"可用成员：{participants}。如果问题超出职责，可在回答末尾用 @角色 明确转交。\n"
+        "必须基于项目背景，不编造；回答简洁，必要时引用具体文件。\n\n"
+        f"项目名称：{ctx.name}\n项目描述：{ctx.description}\n"
+        f"项目背景与已确认规划：{project_background[:12000]}"
+    )
+    history = list(session.get("messages") or [])[-20:]
+    messages = [Message(role=MessageRole.SYSTEM, content=system_prompt)]
+    for item in history:
+        role = MessageRole.USER if item.get("role") == "user" else MessageRole.ASSISTANT
+        messages.append(Message(role=role, content=str(item.get("content") or "")))
+    messages.append(Message(role=MessageRole.USER, content=text))
+    try:
+        reply = str(_get_hermes(project_id).chat(messages).get("content") or "").strip()
+    except Exception as exc:
+        logger.exception("Engineer consultation failed project=%s session=%s", project_id, session_id)
+        raise HTTPException(status_code=503, detail="项目咨询暂时不可用") from exc
+
+    now = time.time()
+    appended = [
+        {"role": "user", "speaker": "用户", "content": text, "ts": now},
+        {"role": "assistant", "speaker": responder, "content": reply, "ts": time.time()},
+    ]
+    delegated_to = _mentioned_role(reply, roles)
+    if delegated_to and delegated_to != responder:
+        transfer_prompt = (
+            f"你是【{delegated_to}】，前一位成员【{responder}】把用户问题转交给你。"
+            "请基于项目背景直接回答用户原问题，不重复转述。\n\n"
+            f"用户问题：{text}\n前一位成员说明：{reply}\n项目：{ctx.name}\n"
+            f"项目背景与规划：{project_background[:10000]}"
+        )
+        try:
+            delegated_reply = str(_get_hermes(project_id).chat([
+                Message(role=MessageRole.SYSTEM, content=transfer_prompt),
+                Message(role=MessageRole.USER, content=text),
+            ]).get("content") or "").strip()
+            appended.append({
+                "role": "assistant", "speaker": delegated_to,
+                "content": delegated_reply, "ts": time.time(),
+            })
+        except Exception:
+            logger.exception("Engineer consultation delegation failed project=%s session=%s", project_id, session_id)
+    session.setdefault("messages", []).extend(appended)
+    session["updated_at"] = time.time()
+    if not str(session.get("title") or "").strip() or session.get("title") in {"项目问答", "功能变更讨论", "项目整改"}:
+        session["title"] = text[:28]
+    _save_consultation_sessions(project_id, sessions)
+    return {"session": session, "responder": responder, "participants": roles}
+
+
+@router.post("/engineer/{project_id}/rectifications/prepare")
+async def engineer_prepare_rectification(
+    project_id: str, request: EngineerRectificationPrepareRequest
+):
+    ctx = _get_project(project_id)
+    sessions = _consultation_sessions(project_id)
+    session = next((item for item in sessions if item.get("id") == request.session_id), None)
+    if not session or session.get("mode") != "rectification":
+        raise HTTPException(status_code=404, detail="项目整改会话不存在")
+    history = list(session.get("messages") or [])
+    if not any(item.get("role") == "user" for item in history):
+        raise HTTPException(status_code=409, detail="请先提交并讨论整改方案")
+
+    workspace = Path(ctx.workspace).resolve()
+    allowed_suffixes = {".py", ".ts", ".tsx", ".js", ".jsx", ".json", ".md", ".yml", ".yaml", ".html", ".css"}
+    snapshots: List[str] = []
+    used = 0
+    for path in sorted(workspace.rglob("*")):
+        if not path.is_file() or path.suffix.lower() not in allowed_suffixes:
+            continue
+        if any(part in {".git", "node_modules", "dist", "build", ".project", "__pycache__"} for part in path.parts):
+            continue
+        content = path.read_text(encoding="utf-8", errors="replace")
+        excerpt = content[:8000]
+        if used + len(excerpt) > 80000 or len(snapshots) >= 40:
+            break
+        rel = path.relative_to(workspace).as_posix()
+        snapshots.append(f"\n--- FILE {rel} ---\n{excerpt}")
+        used += len(excerpt)
+
+    conversation = "\n".join(
+        f"{item.get('speaker') or item.get('role')}: {item.get('content') or ''}"
+        for item in history[-20:]
+    )
+    prompt = (
+        "你是全栈工程师。根据已确认的整改对话与项目文件，生成最小必要变更。"
+        "只返回严格 JSON：{\"summary\":\"...\",\"changes\":[{\"path\":\"相对路径\",\"content\":\"完整文件内容\",\"reason\":\"...\"}]}。"
+        "不得修改未涉及文件，不得使用绝对路径，不得省略完整文件内容，最多 10 个文件。\n\n"
+        f"整改对话：\n{conversation}\n\n项目文件：{''.join(snapshots)}"
+    )
+    try:
+        raw = str(_get_hermes(project_id).chat([
+            Message(role=MessageRole.SYSTEM, content="输出必须是可解析的严格 JSON，不要 Markdown。"),
+            Message(role=MessageRole.USER, content=prompt),
+        ]).get("content") or "").strip()
+        parsed = _parse_rectification_response(raw)
+    except Exception as exc:
+        raise HTTPException(status_code=422, detail="整改方案未生成有效的结构化文件变更") from exc
+    raw_changes = parsed.get("changes") if isinstance(parsed, dict) else None
+    if not isinstance(raw_changes, list) or not raw_changes or len(raw_changes) > 10:
+        raise HTTPException(status_code=422, detail="整改方案必须包含 1-10 个文件变更")
+
+    agent = _get_engineer(project_id)
+    changes = []
+    total_size = 0
+    for item in raw_changes:
+        rel = str((item or {}).get("path") or "").replace("\\", "/").strip()
+        content = str((item or {}).get("content") or "")
+        try:
+            target = agent._resolve_within_workspace(rel)
+        except ValueError as exc:
+            raise HTTPException(status_code=422, detail=f"非法整改路径：{rel}") from exc
+        total_size += len(content.encode("utf-8"))
+        if not rel or not content or total_size > 250000:
+            raise HTTPException(status_code=422, detail="整改内容为空或总大小超过限制")
+        check = agent._quick_static_check(str(target), content)
+        if not check.get("passed"):
+            raise HTTPException(status_code=422, detail=f"{rel} 自检失败：{check.get('issues')}")
+        changes.append({"path": rel, "content": content, "reason": str((item or {}).get("reason") or ""), "self_check": check})
+
+    proposal_id = f"rect-{uuid.uuid4().hex[:12]}"
+    proposal = {
+        "id": proposal_id,
+        "summary": str(parsed.get("summary") or "项目整改"),
+        "changes": changes,
+        "baseline_artifact_sha256": compute_delivery_manifest(workspace).get("artifact_sha256"),
+        "status": "pending_confirm",
+        "created_at": time.time(),
+    }
+    if isinstance(session.get("source_issue_binding"), dict):
+        proposal["source_issue_binding"] = copy.deepcopy(session["source_issue_binding"])
+    session["proposal"] = proposal
+    session["updated_at"] = time.time()
+    _save_consultation_sessions(project_id, sessions)
+    return {"proposal": proposal}
+
+
+@router.post("/engineer/{project_id}/rectifications/apply")
+async def engineer_apply_rectification(
+    project_id: str, request: EngineerRectificationApplyRequest
+):
+    ctx = _get_project(project_id)
+    sessions = _consultation_sessions(project_id)
+    session = next((item for item in sessions if item.get("id") == request.session_id), None)
+    proposal = session.get("proposal") if isinstance(session, dict) else None
+    if not isinstance(proposal, dict) or proposal.get("id") != request.proposal_id:
+        raise HTTPException(status_code=404, detail="整改提案不存在")
+    if proposal.get("status") != "pending_confirm":
+        raise HTTPException(status_code=409, detail="整改提案已执行或已失效")
+    workspace = Path(ctx.workspace).resolve()
+    current_digest = compute_delivery_manifest(workspace).get("artifact_sha256")
+    if current_digest != proposal.get("baseline_artifact_sha256"):
+        raise HTTPException(status_code=409, detail="项目文件已变化，请重新生成整改提案")
+
+    agent = _get_engineer(project_id)
+    originals: Dict[str, Optional[bytes]] = {}
+    tracked_agent_state = {
+        name: copy.deepcopy(getattr(agent, name))
+        for name in ("file_edit_counter", "file_last_score", "pending_fixes")
+        if hasattr(agent, name)
+    }
+    results = []
+    verification: Optional[Dict[str, Any]] = None
+    bound_defect: Optional[Dict[str, Any]] = None
+    source_issue: Optional[Dict[str, Any]] = None
+    source_issue_before: Optional[Dict[str, Any]] = None
+    binding = proposal.get("source_issue_binding")
+    if isinstance(binding, dict):
+        bound_defect = _find_canonical_defect(ctx, str(binding.get("defect_id") or ""))
+        if str(bound_defect.get("observation_id") or "") != str(binding.get("observation_id") or ""):
+            raise HTTPException(status_code=409, detail="The bound issue changed; regenerate the proposal")
+        source_issue = bound_defect.get("_source_issue")
+        if not isinstance(source_issue, dict):
+            raise HTTPException(status_code=409, detail="The bound source issue is unavailable")
+        source_issue_before = copy.deepcopy(source_issue)
+
+    def rollback_changes() -> None:
+        for rel, original in originals.items():
+            target = agent._resolve_within_workspace(rel)
+            if original is None:
+                target.unlink(missing_ok=True)
+            else:
+                _atomic_restore_bytes(target, original)
+        for name, value in tracked_agent_state.items():
+            setattr(agent, name, copy.deepcopy(value))
+        if source_issue is not None and source_issue_before is not None:
+            source_issue.clear()
+            source_issue.update(copy.deepcopy(source_issue_before))
+    try:
+        with _engineer_apply_claim(project_id), project_write_guard(project_id, workspace):
+            for change in proposal.get("changes") or []:
+                target = agent._resolve_within_workspace(change["path"])
+                originals[change["path"]] = target.read_bytes() if target.exists() else None
+                result = agent.apply_fix(
+                    defect_id=f"rectification:{proposal['id']}:{change['path']}",
+                    file_path=change["path"],
+                    new_content=change["content"],
+                    run_qa=False,
+                    record_memory=True,
+                    fix_authorization={"diff_budget": 100000},
+                )
+                if not result.get("success"):
+                    raise RuntimeError(result.get("message") or result.get("error") or "文件自检失败")
+                results.append(result)
+            if bound_defect is not None:
+                verification = await _run_engineer_targeted_verification(ctx, bound_defect, agent)
+                verification["checked_at"] = time.time()
+                verification["artifact_sha256"] = str(
+                    compute_delivery_manifest(workspace).get("artifact_sha256") or ""
+                )
+                if verification.get("status") == "failed":
+                    rollback_changes()
+                    if source_issue is not None:
+                        source_issue["engineer_targeted_verification"] = verification
+                        source_issue["last_engineer_repair_failed_at"] = time.time()
+                    proposal.update({"status": "verification_failed", "verification": verification, "rolled_back": True})
+                    session["updated_at"] = time.time()
+                    _save_consultation_sessions(project_id, sessions)
+                    await _persist_all_async()
+                    return {"success": False, "rolled_back": True, "requires_final_qa": False,
+                            "proposal": proposal, "targeted_verification": verification}
+                if source_issue is not None:
+                    source_issue["engineer_targeted_verification"] = verification
+                    source_issue.pop("authoritative_reinspection_registration", None)
+                    if verification.get("passed") is True:
+                        source_issue.update({"status": "verified", "verified_at": time.time(),
+                                             "verified_by": "engineer_targeted_verifier"})
+                    else:
+                        source_issue.update({"status": "pending_verification",
+                                             "verification_deferred_at": time.time()})
+            await _persist_all_async()
+    except Exception as exc:
+        rollback_changes()
+        raise HTTPException(status_code=409, detail=f"项目整改已回滚：{exc}") from exc
+
+    proposal["status"] = (
+        "applied_verified" if verification and verification.get("passed") is True
+        else "applied_pending_verification" if verification
+        else "applied"
+    )
+    proposal["applied_at"] = time.time()
+    proposal["results"] = results
+    proposal["verification"] = verification or {
+        "status": "self_checked",
+        "passed": True,
+        "reason": "generic_rectification_has_no_bound_originating_check",
+    }
+    session.setdefault("messages", []).append({
+        "role": "assistant", "speaker": "全栈工程师",
+        "content": f"整改完成：已修改 {len(results)} 个文件，全部通过工程师自检。",
+        "ts": time.time(),
+    })
+    _save_consultation_sessions(project_id, sessions)
+    return {
+        "success": True,
+        "proposal": proposal,
+        "results": results,
+        "requires_final_qa": False,
+        "targeted_verification": verification,
+    }
 
 @router.post("/engineer/{project_id}/chat/qa")
 async def engineer_chat_qa(project_id: str, request: EngineerQAChatRequest):

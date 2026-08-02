@@ -277,3 +277,4 @@ tmp_*.py
 
 # Local acceptance workspaces
 work/acceptance/
+/.tmp/

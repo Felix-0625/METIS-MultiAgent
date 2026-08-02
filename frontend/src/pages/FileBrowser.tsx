@@ -313,13 +313,13 @@ const FileBrowser: React.FC = () => {
     open: boolean;
     status: string;
     round: number;
-    totalRounds: number;
+    totalRounds: number | null;
     logs: string[];
     allPassed: boolean;
     needsManual: any[];
     qcSummary: Record<string, any>;
   }>({
-    open: false, status: 'not_started', round: 0, totalRounds: 3,
+    open: false, status: 'not_started', round: 0, totalRounds: null,
     logs: [], allPassed: false, needsManual: [], qcSummary: {},
   });
   const [finalQARunning, setFinalQARunning] = useState(false);
@@ -336,7 +336,7 @@ const FileBrowser: React.FC = () => {
       ...prev,
       status,
       round: d.round || 0,
-      totalRounds: d.total_rounds || 5,
+      totalRounds: d.total_rounds ?? null,
       logs: d.logs || [],
       allPassed: d.all_passed || false,
       needsManual: d.needs_manual || [],
@@ -384,8 +384,23 @@ const FileBrowser: React.FC = () => {
       await axios.post(`${API}/projects/${projectId}/final-qa`);
       startFinalQAPolling();
     } catch (e: any) {
-      message.error(e.response?.data?.detail || '触发失败');
+      const detail = e.response?.data?.detail;
+      if (detail?.code === 'FINAL_QA_PREREQUISITES_NOT_MET') {
+        Modal.warning({
+          title: detail.message || '最终验收前置条件未满足',
+          content: (
+            <List
+              size="small"
+              dataSource={detail.blockers || []}
+              renderItem={(item) => <List.Item>{String(item)}</List.Item>}
+            />
+          ),
+        });
+      } else {
+        message.error(typeof detail === 'string' ? detail : '触发最终验收失败');
+      }
       setFinalQARunning(false);
+      await pollFinalQAStatus().catch(() => false);
     }
   };
 
@@ -754,7 +769,7 @@ const FileBrowser: React.FC = () => {
             <span>最终整体质检</span>
             {finalQA.status === 'passed' && <Tag color="success">✅ 全部通过</Tag>}
             {finalQA.status === 'needs_manual' && <Tag color="orange">⚠ 需人工整改</Tag>}
-            {finalQARunning && <Tag color="processing">第 {finalQA.round}/{finalQA.totalRounds} 轮...</Tag>}
+            {finalQARunning && <Tag color="processing">第 {finalQA.round} 轮...</Tag>}
           </Space>
         }
         open={finalQA.open}
@@ -789,7 +804,7 @@ const FileBrowser: React.FC = () => {
           message={
             <span className="text-xs">
               最终整体质检会扫描所有文件，检测：跨文件接口冲突、模块整合问题、整体代码落地缺陷。
-              发现问题后自动返工（最多 {finalQA.totalRounds} 轮），{finalQA.totalRounds} 轮未解决则标记为需人工整改。
+              发现问题后自动返工；同一问题连续三次未修复时移交全站工程师，不限制全局轮数。
             </span>
           }
         />

@@ -11,6 +11,7 @@ interface ChatMsg { role: 'user' | 'assistant'; content: string }
 interface Defect {
   id: string; message: string; file_path: string; severity: string
   status: string; fix_hint: string; subproject_name: string; subproject_id: string
+  detected_phase?: string; phase_id?: string
   observation_id: string; fix_rounds?: number; needs_manual_reason?: string
   action_allowed?: boolean; blocked_reason?: string
   authoritative_run_identity?: Record<string, string> | null
@@ -19,6 +20,7 @@ interface Defect {
 
 const canRepairDefect = (defect?: Defect | null) => !!defect
   && defect.action_allowed === true
+  && !!defect.file_path?.trim()
   && ['needs_manual', 'open'].includes(defect.status)
   && defect.identity_confidence === 'high'
   && defect.requires_identity_review !== true
@@ -99,7 +101,13 @@ function lsSet(key: string, val: unknown) {
   try { localStorage.setItem(key, JSON.stringify(val)) } catch {}
 }
 
-function RepairPanel({ projectId }: { projectId: string }) {
+function RepairPanel({
+  projectId,
+  onOpenProjectIssue,
+}: {
+  projectId: string
+  onOpenProjectIssue: (defect: Defect) => void
+}) {
   // ── 状态 ────────────────────────────────────────────────────────────────
   const [fileTree, setFileTree]   = useState<any[]>([])
   const [defects, setDefects]     = useState<Defect[]>([])
@@ -119,11 +127,16 @@ function RepairPanel({ projectId }: { projectId: string }) {
   const [qaRunning, setQaRunning]         = useState(false)
   const [subprojectId, setSubprojectId]   = useState('')
   const [subprojectList, setSubprojectList] = useState<{ id: string; name: string }[]>([])
+  const [phaseFilePaths, setPhaseFilePaths] = useState<Record<string, Set<string>>>({})
   const [qaLog, setQaLog]                 = useState<string[]>([])
   const qaPollRef = useRef<ReturnType<typeof setInterval> | null>(null)
-  const [defectFilter, setDefectFilter]   = useState<string>('needs_manual')
-  // 展开/折叠 src 子目录
-  const [expanded, setExpanded] = useState<Set<string>>(new Set(['src']))
+  const [defectFilter, setDefectFilter]   = useState<string>('all')
+  const [phaseFilter, setPhaseFilter]     = useState<string>('all')
+  const [issueScopeFilter, setIssueScopeFilter] = useState<'all' | 'file' | 'project'>('all')
+  const [pendingPhaseFilter, setPendingPhaseFilter] = useState('all')
+  const [pendingIssueScopeFilter, setPendingIssueScopeFilter] = useState<'all' | 'file' | 'project'>('all')
+  // 展开/折叠完整交付文件树
+  const [expanded, setExpanded] = useState<Set<string>>(new Set())
   const bottomRef = useRef<HTMLDivElement>(null)
 
   useEffect(() => { loadAll() }, [projectId])
@@ -138,16 +151,31 @@ function RepairPanel({ projectId }: { projectId: string }) {
       // 不传 status 参数，获取所有缺陷，由前端本地过滤，确保拿到最新状态
       apiFetch(`/engineer/${projectId}/all-defects`).then(x => x.json()),
       apiFetch(`/projects/${projectId}/files`).then(x => x.json()),
-      apiFetch(`/projects/${projectId}/subprojects/list`).then(x => x.json()).catch(() => ({ subprojects: [] })),
+      apiFetch(`/projects/${projectId}/phases`).then(x => x.json()).catch(() => ({ phases: [] })),
     ])
     // 后端按最新 observation 去重；已验证缺陷后续复现时仍会重新打开。
     setDefects(dRes.defects || [])
-    setFileTree(fRes.tree || [])
-    const spList: { id: string; name: string }[] = (spRes.subprojects || []).map((s: any) => ({
-      id: s.id,
-      name: s.name || s.id,
+    const nextTree = fRes.tree || []
+    setFileTree(nextTree)
+    setExpanded(current => {
+      if (current.size > 0) return current
+      return new Set(nextTree.filter((node: any) => node.type !== 'file').map((node: any) => node.key))
+    })
+    const spList: { id: string; name: string }[] = (spRes.phases || []).map((s: any) => ({
+      id: s.phase_id,
+      name: s.name || s.phase_name || s.phase_id,
     }))
     setSubprojectList(spList)
+    const phaseFiles = await Promise.all(spList.map(async phase => {
+      const payload = await apiFetch(`/projects/${projectId}/phases/${phase.id}/files`)
+        .then(response => response.ok ? response.json() : { files: [] })
+        .catch(() => ({ files: [] }))
+      const paths = (payload.files || [])
+        .map((file: any) => String(file.path || file.file_path || file.key || ''))
+        .filter(Boolean)
+      return [phase.id, new Set<string>(paths)] as const
+    }))
+    setPhaseFilePaths(Object.fromEntries(phaseFiles))
     // 默认选中第一个子项目
     if (spList.length > 0 && !subprojectId) setSubprojectId(spList[0].id)
   }
@@ -161,14 +189,57 @@ function RepairPanel({ projectId }: { projectId: string }) {
     acc[d.file_path].push(d)
     return acc
   }, {})
+  const allDefectsByFile = defects.reduce<Record<string, Defect[]>>((acc, defect) => {
+    if (!defect.file_path) return acc
+    if (!acc[defect.file_path]) acc[defect.file_path] = []
+    acc[defect.file_path].push(defect)
+    return acc
+  }, {})
+
+  const FILE_STATUS: Record<string, { label: string; className: string }> = {
+    needs_manual: { label: '待整改', className: 'bg-orange-100 text-orange-700' },
+    open: { label: '待修复', className: 'bg-red-100 text-red-700' },
+    fixing: { label: '修复中', className: 'bg-blue-100 text-blue-700' },
+    pending_verification: { label: '待复检', className: 'bg-amber-100 text-amber-700' },
+    fixed: { label: '已修复', className: 'bg-green-100 text-green-700' },
+    verified: { label: '已验证', className: 'bg-teal-100 text-teal-700' },
+    escalated: { label: '已升级', className: 'bg-purple-100 text-purple-700' },
+  }
+  const FILE_STATUS_PRIORITY = [
+    'needs_manual', 'open', 'fixing', 'pending_verification', 'escalated', 'fixed', 'verified',
+  ]
 
   // 扁平化文件树节点
   const flattenNodes = (nodes: any[]): any[] =>
     nodes.flatMap(n => n.type === 'file' ? [n] : flattenNodes(n.children || []))
 
-  // 只取 src/ 目录
-  const srcNode = fileTree.find(n => n.title === 'src')
-  const srcFiles: any[] = srcNode ? flattenNodes(srcNode.children || []) : []
+  const allFiles = flattenNodes(fileTree)
+
+  const fileMatchesFilters = (path: string) => {
+    if (issueScopeFilter === 'project') return false
+    const fileDefects = defects.filter(defect => defect.file_path === path)
+    const phaseMatches = phaseFilter === 'all'
+      || phaseFilePaths[phaseFilter]?.has(path)
+      || fileDefects.some(defect => defect.detected_phase === phaseFilter || defect.phase_id === phaseFilter)
+    return phaseMatches
+  }
+
+  const filterFileNodes = (nodes: any[]): any[] => nodes.flatMap((node: any) => {
+    if (node.type === 'file') return fileMatchesFilters(String(node.key)) ? [node] : []
+    const children = filterFileNodes(node.children || [])
+    return children.length > 0 ? [{ ...node, children }] : []
+  })
+  const filteredFileTree = filterFileNodes(fileTree)
+  const visibleFiles = flattenNodes(filteredFileTree)
+
+  const toggleDirectory = (path: string) => {
+    setExpanded(current => {
+      const next = new Set(current)
+      if (next.has(path)) next.delete(path)
+      else next.add(path)
+      return next
+    })
+  }
 
   const getFileIcon = (name: string) => {
     const ext = name.split('.').pop()?.toLowerCase() || ''
@@ -388,111 +459,130 @@ function RepairPanel({ projectId }: { projectId: string }) {
 
   const problemCount = Object.keys(defectsByFile).length
 
+  const renderFileNodes = (nodes: any[], depth = 0): React.ReactNode => nodes.map((node: any) => {
+    const path = String(node.key || node.title || '')
+    if (node.type !== 'file') {
+      const isExpanded = expanded.has(path)
+      const descendantFiles = flattenNodes(node.children || [])
+      const descendantProblems = descendantFiles.reduce(
+        (count, file) => count + (defectsByFile[String(file.key)]?.length || 0),
+        0,
+      )
+      return (
+        <React.Fragment key={path}>
+          <button
+            type="button"
+            onClick={() => toggleDirectory(path)}
+            className="w-full flex items-center gap-1.5 py-1.5 pr-2 text-xs text-gray-700 hover:bg-gray-50"
+            style={{ paddingLeft: `${8 + depth * 14}px` }}
+            title={path}
+          >
+            <span className="w-3 text-gray-400">{isExpanded ? '▾' : '▸'}</span>
+            <span>{isExpanded ? '📂' : '📁'}</span>
+            <span className="font-medium truncate">{node.title}</span>
+            <span className="ml-auto text-gray-400">{descendantFiles.length}</span>
+            {descendantProblems > 0 && <span className="text-orange-500">⚠ {descendantProblems}</span>}
+          </button>
+          {isExpanded && renderFileNodes(node.children || [], depth + 1)}
+        </React.Fragment>
+      )
+    }
+
+    const ds = defectsByFile[path]
+    const fileDefects = allDefectsByFile[path] || []
+    const primaryStatus = FILE_STATUS_PRIORITY.find(status =>
+      fileDefects.some(defect => defect.status === status)
+    )
+    const statusTag = primaryStatus ? FILE_STATUS[primaryStatus] : undefined
+    const hasDefect = !!ds?.length
+    const isSelected = selFile === path
+    return (
+      <button
+        type="button"
+        key={path}
+        onClick={() => handleFileClick(path)}
+        className={`w-full text-left flex items-center gap-1.5 py-1.5 pr-2 text-xs transition border-l-2
+          ${isSelected
+            ? hasDefect ? 'bg-orange-50 border-orange-400' : 'bg-blue-50 border-blue-400'
+            : 'border-transparent hover:bg-gray-50'}`}
+        style={{ paddingLeft: `${22 + depth * 14}px` }}
+        title={path}
+      >
+        <span className="flex-shrink-0">{getFileIcon(node.title)}</span>
+        <span className={`truncate font-mono ${hasDefect ? 'text-orange-700' : 'text-gray-700'}`}>
+          {node.title}
+        </span>
+        {statusTag ? (
+          <span className={`ml-auto flex-shrink-0 rounded px-1.5 py-0.5 text-[10px] font-medium ${statusTag.className}`}>
+            {statusTag.label}{fileDefects.length > 1 ? ` ${fileDefects.length}` : ''}
+          </span>
+        ) : (
+          <span className="ml-auto flex-shrink-0 text-green-400">✓</span>
+        )}
+      </button>
+    )
+  })
+
   return (
     <div className="flex h-full gap-3">
-      {/* ── 左侧：文件看板（仅 src/） ───────────────────────────────────── */}
-      <div className="w-64 flex-shrink-0 flex flex-col gap-2">
+      {/* ── 左侧：完整交付文件树 ────────────────────────────────────────── */}
+      <div className="w-72 flex-shrink-0 flex flex-col gap-2">
         {/* 文件看板卡片 */}
         <div className="flex-1 bg-white rounded-xl border border-gray-200 flex flex-col overflow-hidden">
           {/* 卡片头 */}
           <div className="flex items-center justify-between px-3 py-2 border-b border-gray-100 flex-shrink-0">
             <div className="flex items-center gap-1.5">
               <span className="text-yellow-500">📁</span>
-              <span className="text-xs font-semibold text-gray-700">src/</span>
-              <span className="text-xs text-gray-400 bg-gray-100 rounded-full px-1.5">{srcFiles.length}</span>
+              <span className="text-xs font-semibold text-gray-700">项目文件</span>
+              <span className="text-xs text-gray-400 bg-gray-100 rounded-full px-1.5">{allFiles.length}</span>
               {problemCount > 0 && (
                 <span className="text-xs text-orange-500 bg-orange-50 rounded-full px-1.5">⚠ {problemCount}</span>
               )}
             </div>
             <button onClick={loadAll} className="text-xs text-blue-400 hover:text-blue-600">↻</button>
           </div>
+          <div className="grid grid-cols-1 gap-1.5 px-2 py-2 border-b border-gray-100 flex-shrink-0">
+            <select aria-label="筛选文件阶段" value={pendingPhaseFilter}
+              onChange={event => setPendingPhaseFilter(event.target.value)}
+              className="w-full border rounded px-2 py-1 text-xs bg-white text-gray-700">
+              <option value="all">全部阶段</option>
+              {subprojectList.map(phase => <option key={phase.id} value={phase.id}>{phase.name}</option>)}
+            </select>
+            <select aria-label="筛选文件范围" value={pendingIssueScopeFilter}
+              onChange={event => setPendingIssueScopeFilter(event.target.value as 'all' | 'file' | 'project')}
+              className="w-full border rounded px-2 py-1 text-xs bg-white text-gray-700">
+              <option value="all">全部问题范围</option>
+              <option value="file">文件级问题</option>
+              <option value="project">项目级问题</option>
+            </select>
+            <button
+              type="button"
+              onClick={() => {
+                setPhaseFilter(pendingPhaseFilter)
+                setIssueScopeFilter(pendingIssueScopeFilter)
+                void loadAll()
+              }}
+              className="w-full rounded bg-blue-500 py-1.5 text-xs text-white hover:bg-blue-600"
+            >
+              查询
+            </button>
+          </div>
           {/* 文件列表 */}
           <div className="flex-1 overflow-y-auto">
-            {srcFiles.length === 0 ? (
+            {visibleFiles.length === 0 ? (
               <div className="text-xs text-gray-400 text-center py-8 px-3">
-                src/ 目录暂无源码文件
+                {issueScopeFilter === 'project'
+                  ? '项目级问题不绑定单一文件，请查看右侧状态列表'
+                  : allFiles.length === 0 ? '当前项目暂无可交付文件' : '当前筛选条件下没有文件'}
               </div>
             ) : (
-              srcFiles.map((file: any) => {
-                const fp: string = file.key
-                const ds = defectsByFile[fp]
-                const hasDefect = ds && ds.length > 0
-                const isSelFile = selFile === fp
-                return (
-                  <button
-                    key={fp}
-                    onClick={() => handleFileClick(fp)}
-                    className={`w-full text-left flex items-center gap-2 px-3 py-2 text-xs transition border-l-2
-                      ${isSelFile
-                        ? hasDefect
-                          ? 'bg-orange-50 border-orange-400'
-                          : 'bg-blue-50 border-blue-400'
-                        : 'border-transparent hover:bg-gray-50'
-                      }`}
-                  >
-                    <span className="flex-shrink-0">{getFileIcon(file.title)}</span>
-                    <div className="flex-1 min-w-0">
-                      <div className={`truncate font-mono ${hasDefect ? 'text-orange-700' : 'text-gray-700'}`}>
-                        {file.title}
-                      </div>
-                      <div className="text-gray-400 truncate">{fp.replace(/^src\//, '')}</div>
-                    </div>
-                    {hasDefect ? (
-                      <span
-                        className="flex-shrink-0 text-orange-500 font-semibold"
-                        title={ds.map(d => d.needs_manual_reason || d.message).join('\n')}
-                      >⚠ {ds.length}</span>
-                    ) : (
-                      <span className="flex-shrink-0 text-green-400">✓</span>
-                    )}
-                  </button>
-                )
-              })
+              renderFileNodes(filteredFileTree)
             )}
           </div>
         </div>
 
-        {/* 质检触发卡片 */}
-        <div className="bg-white rounded-xl border border-gray-200 p-2 flex-shrink-0 space-y-1.5">
-          <div className="text-xs font-semibold text-gray-600 flex items-center gap-1">
-            <span>🔍</span> 质检 & 返工
-          </div>
-          {/* 子项目下拉选择（有列表时优先用下拉，否则手动输入） */}
-          {subprojectList.length > 0 ? (
-            <select
-              className="w-full border rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-purple-300 bg-white"
-              value={subprojectId}
-              onChange={e => setSubprojectId(e.target.value)}
-            >
-              {subprojectList.map(sp => (
-                <option key={sp.id} value={sp.id}>{sp.name}</option>
-              ))}
-            </select>
-          ) : (
-            <input
-              className="w-full border rounded px-2 py-1 text-xs focus:outline-none focus:ring-1 focus:ring-purple-300"
-              placeholder="子项目ID（如 sp_xxx）"
-              value={subprojectId}
-              onChange={e => setSubprojectId(e.target.value)}
-            />
-          )}
-          {subprojectId && (
-            <div className="text-xs text-gray-400 truncate px-0.5">
-              ID: <span className="font-mono text-gray-500">{subprojectId}</span>
-            </div>
-          )}
-          <button
-            onClick={runQA}
-            disabled={qaRunning || !subprojectId.trim()}
-            className="w-full py-1 bg-purple-500 text-white text-xs rounded disabled:opacity-40 hover:bg-purple-600 transition"
-          >
-            {qaRunning ? '质检中...' : '触发质检'}
-          </button>
-          {qaLog.length > 0 && (
-            <div className="max-h-16 overflow-y-auto text-xs text-gray-500 space-y-0.5 pt-1 border-t border-gray-100">
-              {qaLog.slice(-5).map((l, i) => <div key={i}>{l}</div>)}
-            </div>
-          )}
+        <div className="bg-blue-50 border border-blue-100 rounded-xl p-3 text-xs text-blue-700">
+          整改完成后由全栈工程师执行语法、构建和相关测试自检，不进入阶段 QA/QC 循环。
         </div>
       </div>
 
@@ -501,16 +591,6 @@ function RepairPanel({ projectId }: { projectId: string }) {
         {!sel && !preview ? (
           /* 未选中文件时：显示缺陷汇总列表，点击直接进入整改对话 */
           (() => {
-            // 状态筛选配置
-            const STATUS_TABS = [
-              { key: 'all',          label: '全部',     color: 'bg-gray-100 text-gray-600',     activeColor: 'bg-gray-600 text-white' },
-              { key: 'needs_manual', label: '需人工',   color: 'bg-orange-100 text-orange-600', activeColor: 'bg-orange-500 text-white' },
-              { key: 'open',         label: '待修复',   color: 'bg-red-100 text-red-600',       activeColor: 'bg-red-500 text-white' },
-              { key: 'fixing',       label: '修复中',   color: 'bg-blue-100 text-blue-600',     activeColor: 'bg-blue-500 text-white' },
-              { key: 'fixed',        label: '已修复',   color: 'bg-green-100 text-green-600',   activeColor: 'bg-green-500 text-white' },
-              { key: 'verified',     label: '已验证',   color: 'bg-teal-100 text-teal-600',     activeColor: 'bg-teal-500 text-white' },
-              { key: 'escalated',    label: '已升级',   color: 'bg-purple-100 text-purple-600', activeColor: 'bg-purple-500 text-white' },
-            ]
             const STATUS_CARD_STYLE: Record<string, string> = {
               needs_manual: 'border-orange-100 bg-orange-50 hover:bg-orange-100',
               open:         'border-red-100 bg-red-50 hover:bg-red-100',
@@ -519,8 +599,9 @@ function RepairPanel({ projectId }: { projectId: string }) {
               verified:     'border-teal-100 bg-teal-50 hover:bg-teal-100',
               escalated:    'border-purple-100 bg-purple-50 hover:bg-purple-100',
             }
-            const countByStatus = (s: string) => defects.filter(d => d.status === s).length
-            const filtered = defectFilter === 'all' ? defects : defects.filter(d => d.status === defectFilter)
+            const filtered = defects.filter(d =>
+              (defectFilter === 'all' || d.status === defectFilter)
+            )
             return (
               <div className="flex-1 flex flex-col min-h-0">
                 {/* 顶栏 */}
@@ -531,23 +612,19 @@ function RepairPanel({ projectId }: { projectId: string }) {
                       <span className="ml-2 text-xs font-normal text-gray-400">共 {defects.length} 条</span>
                     )}
                   </div>
-                  <div className="flex items-center gap-2 ml-auto">
-                    {/* 状态筛选下拉框 */}
-                    <select
-                      className="border rounded px-2 py-0.5 text-xs focus:outline-none focus:ring-1 focus:ring-blue-300 bg-white text-gray-700"
-                      value={defectFilter}
-                      onChange={e => setDefectFilter(e.target.value)}
-                    >
-                      {STATUS_TABS.map(tab => {
-                        const cnt = tab.key === 'all' ? defects.length : countByStatus(tab.key)
-                        return (
-                          <option key={tab.key} value={tab.key}>
-                            {tab.label}{cnt > 0 ? ` (${cnt})` : ''}
-                          </option>
-                        )
-                      })}
+                  <div className="flex items-center gap-1.5 ml-auto">
+                    <select aria-label="筛选状态列表" value={defectFilter}
+                      onChange={event => setDefectFilter(event.target.value)}
+                      className="border rounded px-2 py-1 text-xs bg-white text-gray-700">
+                      <option value="all">全部状态</option>
+                      <option value="needs_manual">需人工</option>
+                      <option value="open">待修复</option>
+                      <option value="fixing">修复中</option>
+                      <option value="pending_verification">等待复检</option>
+                      <option value="fixed">已修复</option>
+                      <option value="verified">已验证</option>
+                      <option value="escalated">已升级</option>
                     </select>
-                    <button onClick={loadAll} className="text-xs text-blue-400 hover:text-blue-600 flex-shrink-0">↻ 刷新</button>
                   </div>
                 </div>
                 {/* 缺陷列表 */}
@@ -567,15 +644,30 @@ function RepairPanel({ projectId }: { projectId: string }) {
                       return (
                         <button
                           key={d.id}
-                          onClick={() => canRepair ? (setSel(d), setSelFile(d.file_path), setPreview(null)) : undefined}
-                          className={`w-full text-left p-3 rounded-lg border transition ${cardStyle} ${!canRepair ? 'cursor-default opacity-80' : ''}`}
+                          onClick={() => canRepair
+                            ? (setSel(d), setSelFile(d.file_path), setPreview(null))
+                            : (!d.file_path && ['needs_manual', 'open'].includes(d.status)
+                              ? onOpenProjectIssue(d)
+                              : undefined)}
+                          className={`w-full text-left p-3 rounded-lg border transition ${cardStyle} ${
+                            !canRepair && !!d.file_path ? 'cursor-default opacity-80' : ''
+                          }`}
                         >
                           <div className="flex items-start justify-between gap-2">
                             <div className="flex-1 min-w-0">
                               <div className={`text-xs font-semibold mb-0.5 ${SEV_COLOR[d.severity] || 'text-gray-700'}`}>
                                 [{d.severity.toUpperCase()}] {d.message}
                               </div>
-                              <div className="text-xs text-gray-500 font-mono truncate">{d.file_path}</div>
+                              <span className={`inline-flex mb-1 rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                                d.file_path ? 'bg-blue-100 text-blue-700' : 'bg-purple-100 text-purple-700'
+                              }`}>
+                                {d.file_path ? '文件级' : '项目级'}
+                              </span>
+                              {d.file_path ? (
+                                <div className="text-xs text-gray-500 font-mono truncate">{d.file_path}</div>
+                              ) : (
+                                <div className="text-xs text-purple-600 font-medium">项目级问题 · 未绑定单一文件</div>
+                              )}
                               {d.needs_manual_reason && (
                                 <div className="text-xs text-orange-500 mt-0.5 truncate">⚠ {d.needs_manual_reason}</div>
                               )}
@@ -591,6 +683,9 @@ function RepairPanel({ projectId }: { projectId: string }) {
                                 <span className="text-xs text-red-400">已尝试 {d.fix_rounds} 次</span>
                               )}
                               {canRepair && <span className="text-xs text-purple-500">点击整改 →</span>}
+                              {!d.file_path && ['needs_manual', 'open'].includes(d.status) && (
+                                <span className="text-xs text-purple-500">进入项目整改 →</span>
+                              )}
                               {d.status === 'fixed' && <span className="text-xs text-green-500">✓ 已修复</span>}
                               {d.status === 'verified' && <span className="text-xs text-teal-500">✓ 已验证</span>}
                               {d.status === 'fixing' && <span className="text-xs text-blue-500">⟳ 修复中</span>}
@@ -616,10 +711,15 @@ function RepairPanel({ projectId }: { projectId: string }) {
               <div className="text-xs font-semibold text-gray-600 font-mono">{preview.path}</div>
               <span className="text-xs text-green-500">✓ 无缺陷</span>
             </div>
-            <div className="flex-1 overflow-auto bg-gray-900 rounded-lg p-3">
-              <pre className="text-xs text-green-300 font-mono whitespace-pre-wrap break-all leading-relaxed">
-                {preview.content}
-              </pre>
+            <div className="flex-1 overflow-auto bg-gray-900 rounded-lg py-3">
+              <div className="min-w-max text-xs font-mono leading-relaxed">
+                {preview.content.split('\n').map((line, index) => (
+                  <div key={index} className="flex hover:bg-white/5">
+                    <span className="w-12 px-3 text-right text-gray-500 select-none flex-shrink-0">{index + 1}</span>
+                    <pre className="pr-4 text-green-300 whitespace-pre">{line || ' '}</pre>
+                  </div>
+                ))}
+              </div>
             </div>
           </div>
         ) : sel ? (
@@ -847,49 +947,207 @@ function ArchivePanel({ projectId }: { projectId: string }) {
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
-// 面板四：项目问答（独立上下文）
+// 面板：项目咨询（项目问答 / 功能变更讨论，多会话隔离）
 // ══════════════════════════════════════════════════════════════════════════════
-function QAPanel({ projectId }: { projectId: string }) {
-  const [msgs, setMsgs] = useState<ChatMsg[]>(() =>
-    lsGet(`eng_qa_history_${projectId}`, [])
-  )
+interface ConsultationMessage extends ChatMsg { speaker?: string; ts?: number }
+interface ConsultationSession {
+  id: string; mode: 'inquiry' | 'change' | 'rectification'; title: string
+  messages: ConsultationMessage[]; updated_at: number
+  source_issue_binding?: { defect_id?: string; observation_id?: string }
+}
+
+function ConsultationPanel({ projectId }: { projectId: string }) {
+  const [sessions, setSessions] = useState<ConsultationSession[]>([])
+  const [participants, setParticipants] = useState<string[]>([])
+  const [activeId, setActiveId] = useState('')
+  const [mode, setMode] = useState<'inquiry' | 'change'>('inquiry')
+  const [newTitle, setNewTitle] = useState('')
   const [loading, setLoading] = useState(false)
   const bottomRef = useRef<HTMLDivElement>(null)
+  const active = sessions.find(s => s.id === activeId)
+  const visibleSessions = sessions.filter(s => s.mode === mode)
 
-  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [msgs])
-  useEffect(() => { lsSet(`eng_qa_history_${projectId}`, msgs) }, [msgs, projectId])
+  const loadSessions = async () => {
+    const response = await apiFetch(`/engineer/${projectId}/consultations`)
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.detail || '咨询记录加载失败')
+    setSessions(result.sessions || [])
+    setParticipants(result.participants || [])
+    if (!activeId) {
+      const first = (result.sessions || []).find((s: ConsultationSession) => s.mode === mode)
+      if (first) setActiveId(first.id)
+    }
+  }
+  useEffect(() => { void loadSessions() }, [projectId])
+  useEffect(() => { bottomRef.current?.scrollIntoView({ behavior: 'smooth' }) }, [active?.messages])
 
-  const sendQA = async (text: string) => {
-    const newMsgs = [...msgs, { role: 'user' as const, content: text }]
-    setMsgs(newMsgs); setLoading(true)
+  const switchMode = (next: 'inquiry' | 'change') => {
+    setMode(next)
+    const first = sessions.find(s => s.mode === next)
+    setActiveId(first?.id || '')
+  }
+
+  const createSession = async () => {
+    const response = await apiFetch(`/engineer/${projectId}/consultations`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode, title: newTitle.trim() }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.detail || '创建会话失败')
+    setSessions(current => [result.session, ...current])
+    setActiveId(result.session.id)
+    setNewTitle('')
+  }
+
+  const renameSession = async (session: ConsultationSession) => {
+    const title = window.prompt('输入新的对话名称', session.title)?.trim()
+    if (!title || title === session.title) return
+    const response = await apiFetch(`/engineer/${projectId}/consultations/${session.id}`, {
+      method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ title }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.detail || '重命名失败')
+    setSessions(current => current.map(s => s.id === session.id ? result.session : s))
+  }
+
+  const sendMessage = async (text: string) => {
+    if (!active) return
+    const optimistic = { role: 'user' as const, speaker: '用户', content: text, ts: Date.now() / 1000 }
+    setSessions(current => current.map(s => s.id === active.id ? { ...s, messages: [...(s.messages || []), optimistic] } : s))
+    setLoading(true)
     try {
-      const r = await apiFetch(`/engineer/${projectId}/chat/qa`, {
+      const response = await apiFetch(`/engineer/${projectId}/consultations/${active.id}/messages`, {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({ message: text }),
-      }).then(x => x.json())
-      setMsgs([...newMsgs, { role: 'assistant', content: r.reply || '（无回复）' }])
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail || '发送失败')
+      setSessions(current => current.map(s => s.id === active.id ? result.session : s))
+    } catch (e: any) {
+      setSessions(current => current.map(s => s.id === active.id ? {
+        ...s, messages: [...(s.messages || []), { role: 'assistant', speaker: '系统', content: `发送失败：${e.message}`, ts: Date.now() / 1000 }],
+      } : s))
     } finally { setLoading(false) }
   }
 
   return (
-    <div className="h-full flex flex-col bg-white rounded-xl border border-gray-200 p-4">
-      <div className="border-b pb-2 mb-3 flex items-center justify-between">
-        <div className="font-semibold text-sm text-gray-700">项目问答</div>
-        <button onClick={() => setMsgs([])} className="text-xs text-gray-400 hover:text-gray-600">清空</button>
+    <div className="h-full flex gap-3">
+      <aside className="w-72 bg-white rounded-xl border border-gray-200 p-3 flex flex-col">
+        <div className="grid grid-cols-2 gap-1 mb-3">
+          <button onClick={() => switchMode('inquiry')} className={`rounded px-2 py-2 text-xs ${mode === 'inquiry' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600'}`}>项目问答</button>
+          <button onClick={() => switchMode('change')} className={`rounded px-2 py-2 text-xs ${mode === 'change' ? 'bg-blue-500 text-white' : 'bg-gray-100 text-gray-600'}`}>功能变更讨论</button>
+        </div>
+        <input value={newTitle} onChange={e => setNewTitle(e.target.value)} placeholder="输入新对话名称" maxLength={80} className="mb-1 border rounded px-2 py-1.5 text-xs" />
+        <button onClick={createSession} disabled={!newTitle.trim()} className="mb-2 rounded border border-blue-300 text-blue-600 py-1.5 text-xs hover:bg-blue-50 disabled:opacity-40">＋ 新建独立对话</button>
+        <div className="flex-1 overflow-y-auto space-y-1">
+          {visibleSessions.map(session => <div key={session.id} className={`flex items-center rounded ${activeId === session.id ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50 text-gray-600'}`}><button onClick={() => setActiveId(session.id)} className="flex-1 min-w-0 text-left px-3 py-2 text-xs truncate">{session.title}</button><button onClick={() => void renameSession(session)} title="重命名" className="px-2 text-gray-400 hover:text-blue-600">✎</button></div>)}
+          {!visibleSessions.length && <div className="text-xs text-gray-400 text-center py-8">暂无对话</div>}
+        </div>
+      </aside>
+      <div className="flex-1 flex flex-col bg-white rounded-xl border border-gray-200 p-4 min-w-0">
+        <div className="border-b pb-2 mb-3">
+          <div className="font-semibold text-sm text-gray-700">{mode === 'inquiry' ? '项目问答' : '功能变更讨论'}</div>
+          <div className="text-xs text-gray-400 mt-1">默认由 PM组长回答；输入 {participants.slice(0, 4).map(p => `@${p}`).join('、')} 可指定专家</div>
+        </div>
+        <div className="flex-1 overflow-y-auto">
+          {!active && <p className="text-xs text-gray-400 text-center py-8">新建或选择一个独立对话</p>}
+          {active?.messages.map((m, i) => <div key={i}>
+            {m.role === 'assistant' && <div className="text-[11px] text-gray-400 mb-1">{m.speaker || 'PM组长'}</div>}
+            <ChatBubble msg={m} />
+          </div>)}
+          <div ref={bottomRef} />
+        </div>
+        {active && <ChatInput onSend={sendMessage} loading={loading} placeholder={mode === 'inquiry' ? '询问项目功能、实现或文件...' : '讨论新增、删除或修改功能...'} />}
       </div>
-      <div className="flex-1 overflow-y-auto">
-        {msgs.length === 0 && (
-          <p className="text-xs text-gray-400 text-center py-8">
-            可以问关于项目的任何问题：技术方案、功能模块、文件位置、阶段规划...
-          </p>
-        )}
-        {msgs.map((m, i) => <ChatBubble key={i} msg={m} />)}
-        <div ref={bottomRef} />
-      </div>
-      <ChatInput onSend={sendQA} loading={loading} placeholder="问任何关于项目的问题..." />
     </div>
   )
+}
+
+function RectificationPanel({
+  projectId,
+  preferredSessionId,
+}: {
+  projectId: string
+  preferredSessionId?: string
+}) {
+  const [sessions, setSessions] = useState<ConsultationSession[]>([])
+  const [activeId, setActiveId] = useState('')
+  const [loading, setLoading] = useState(false)
+  const [proposal, setProposal] = useState<any>(null)
+  const active = sessions.find(s => s.id === activeId)
+
+  const load = async () => {
+    const response = await apiFetch(`/engineer/${projectId}/consultations`)
+    const result = await response.json()
+    const rectifications = (result.sessions || []).filter((s: ConsultationSession) => s.mode === 'rectification')
+    setSessions(rectifications)
+    const preferred = rectifications.find((session: ConsultationSession) => session.id === preferredSessionId)
+    if (preferred) setActiveId(preferred.id)
+    else if (!activeId && rectifications[0]) setActiveId(rectifications[0].id)
+  }
+  useEffect(() => { void load() }, [projectId, preferredSessionId])
+  useEffect(() => { setProposal((sessions.find(s => s.id === activeId) as any)?.proposal || null) }, [activeId, sessions])
+
+  const createSession = async () => {
+    const response = await apiFetch(`/engineer/${projectId}/consultations`, {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ mode: 'rectification' }),
+    })
+    const result = await response.json()
+    if (!response.ok) throw new Error(result.detail || '创建整改会话失败')
+    setSessions(current => [result.session, ...current]); setActiveId(result.session.id); setProposal(null)
+  }
+  const send = async (text: string) => {
+    if (!active) return
+    setLoading(true)
+    try {
+      const response = await apiFetch(`/engineer/${projectId}/consultations/${active.id}/messages`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ message: text }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail || '发送失败')
+      setSessions(current => current.map(s => s.id === active.id ? result.session : s))
+    } finally { setLoading(false) }
+  }
+  const prepare = async () => {
+    if (!active) return
+    setLoading(true)
+    try {
+      const response = await apiFetch(`/engineer/${projectId}/rectifications/prepare`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ session_id: active.id }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail || '提案生成失败')
+      setProposal(result.proposal)
+    } catch (e: any) { alert(e.message) } finally { setLoading(false) }
+  }
+  const apply = async () => {
+    if (!active || !proposal || !window.confirm(`确认修改 ${proposal.changes?.length || 0} 个文件？`)) return
+    setLoading(true)
+    try {
+      const response = await apiFetch(`/engineer/${projectId}/rectifications/apply`, {
+        method: 'POST', headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ session_id: active.id, proposal_id: proposal.id }),
+      })
+      const result = await response.json()
+      if (!response.ok) throw new Error(result.detail || '整改执行失败')
+      setProposal(result.proposal); await load()
+    } catch (e: any) { alert(e.message) } finally { setLoading(false) }
+  }
+
+  return <div className="h-full flex gap-3">
+    <aside className="w-72 bg-white rounded-xl border p-3 flex flex-col">
+      <button onClick={createSession} className="rounded border border-blue-300 text-blue-600 py-1.5 text-xs mb-2">＋ 新建整改对话</button>
+      <div className="flex-1 overflow-y-auto space-y-1">{sessions.map(s => <button key={s.id} onClick={() => setActiveId(s.id)} className={`w-full text-left rounded px-3 py-2 text-xs truncate ${activeId === s.id ? 'bg-blue-50 text-blue-700' : 'hover:bg-gray-50'}`}>{s.title}</button>)}</div>
+    </aside>
+    <section className="flex-1 bg-white rounded-xl border p-4 flex flex-col min-w-0">
+      <div className="border-b pb-2 mb-2"><div className="font-semibold text-sm">项目整改</div><div className="text-xs text-gray-400">每项整改独立对话；确认提案后才写文件，并由全栈工程师自行检查。</div></div>
+      <div className="flex-1 overflow-y-auto">{!active && <div className="text-xs text-gray-400 text-center py-8">新建或选择整改对话</div>}{active?.messages.map((m, i) => <div key={i}>{m.role === 'assistant' && <div className="text-[11px] text-gray-400">{m.speaker || '全栈工程师'}</div>}<ChatBubble msg={m}/></div>)}</div>
+      {proposal && <div className="border rounded-lg p-3 mb-2 bg-gray-50 text-xs"><div className="font-semibold mb-1">{proposal.summary}</div>{proposal.changes?.map((c:any) => <div key={c.path} className="font-mono text-gray-600">{c.path} — {c.reason || '修改'}</div>)}<div className="mt-2 text-gray-500">状态：{proposal.status === 'applied' ? '已执行并通过自检' : '等待确认'}</div></div>}
+      {active && <div className="space-y-2"><ChatInput onSend={send} loading={loading} placeholder="粘贴最终整改方案，或继续讨论实现细节..."/><div className="flex justify-end gap-2"><button onClick={prepare} disabled={loading} className="px-3 py-1.5 border rounded text-xs">生成文件变更提案</button><button onClick={apply} disabled={loading || !proposal || proposal.status !== 'pending_confirm'} className="px-3 py-1.5 bg-blue-500 text-white rounded text-xs disabled:opacity-40">确认执行并自检</button></div></div>}
+    </section>
+  </div>
 }
 
 // ══════════════════════════════════════════════════════════════════════════════
@@ -901,16 +1159,72 @@ export default function EngineerWorkspace() {
   const [searchParams] = useSearchParams()
   const pid = projectId || ''
   // ?tab=repair 参数支持从阶段看板直接跳转到整改面板
-  const [tab, setTab] = useState<'repair' | 'docs' | 'archive' | 'qa'>(
+  const [tab, setTab] = useState<'repair' | 'consultation' | 'adjustment' | 'archive'>(
     (searchParams.get('tab') as any) || 'repair'
   )
   const [status, setStatus] = useState<Record<string, any>>({})
   const [ctxLoading, setCtxLoading] = useState(false)
+  const [rectificationSessionId, setRectificationSessionId] = useState('')
 
   useEffect(() => {
     if (!pid) return
     apiFetch(`/engineer/${pid}/status`).then(x => x.json()).then(setStatus).catch(() => {})
   }, [pid])
+
+  const openProjectIssue = async (defect: Defect) => {
+    setTab('adjustment')
+    const storageKey = `engineer_project_issue_session_${pid}_${defect.id}`
+    const existingSessionId = sessionStorage.getItem(storageKey)
+    if (existingSessionId) {
+      const sessionsResponse = await apiFetch(`/engineer/${pid}/consultations`).catch(() => null)
+      const sessionsResult = sessionsResponse?.ok ? await sessionsResponse.json() : { sessions: [] }
+      const existing = (sessionsResult.sessions || []).find(
+        (session: ConsultationSession) => session.id === existingSessionId
+      )
+      if (existing?.source_issue_binding?.defect_id === defect.id) {
+        setRectificationSessionId(existingSessionId)
+        return
+      }
+      sessionStorage.removeItem(storageKey)
+    }
+    try {
+      const createResponse = await apiFetch(`/engineer/${pid}/consultations`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          mode: 'rectification',
+          title: `项目级整改：${defect.message.slice(0, 40)}`,
+          source_issue_id: defect.id,
+        }),
+      })
+      const created = await createResponse.json()
+      if (!createResponse.ok) throw new Error(created.detail || '项目整改会话创建失败')
+      const sessionId = String(created.session?.id || '')
+      if (!sessionId) throw new Error('项目整改会话缺少 ID')
+      const transferMessage = [
+        '【系统自动转交的项目级问题】',
+        `问题ID：${defect.id}`,
+        `观察ID：${defect.observation_id || '无'}`,
+        `严重级别：${defect.severity || 'unknown'}`,
+        `来源阶段：${defect.detected_phase || defect.phase_id || defect.subproject_name || '全项目'}`,
+        `问题描述：${defect.message}`,
+        `待整改原因：${defect.needs_manual_reason || '未提供'}`,
+        `修复建议：${defect.fix_hint || '未提供'}`,
+        '要求：先定位根因和受影响文件，输出 affected_files、修改方案、验证命令及回滚边界；未经确认不要写入。',
+      ].join('\n')
+      const messageResponse = await apiFetch(`/engineer/${pid}/consultations/${sessionId}/messages`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: transferMessage }),
+      })
+      const messageResult = await messageResponse.json()
+      if (!messageResponse.ok) throw new Error(messageResult.detail || '项目级问题转交失败')
+      sessionStorage.setItem(storageKey, sessionId)
+      setRectificationSessionId(sessionId)
+    } catch (error: any) {
+      alert(error.message || '项目级问题转交失败')
+    }
+  }
 
   const loadCtx = async () => {
     setCtxLoading(true)
@@ -922,22 +1236,22 @@ export default function EngineerWorkspace() {
 
   const TABS = [
     { k: 'repair', label: '🔧 代码整改' },
-    { k: 'docs',   label: '📄 文档生成' },
-    { k: 'archive', label: '🗂 文件归档' },
-    { k: 'qa',     label: '💬 项目问答' },
+    { k: 'consultation', label: '💬 项目咨询' },
+    { k: 'adjustment', label: '🛠️ 项目整改' },
+    { k: 'archive', label: '🗂 文件盘点' },
   ] as const
 
   if (!pid) return <div className="p-8 text-gray-400">请先选择项目</div>
 
   return (
-    <div className="h-screen flex flex-col bg-gray-50">
+    <div className="h-screen flex flex-col bg-gray-50 metis-engineer-workspace">
       {/* 顶栏 */}
-      <div className="flex items-center justify-between px-6 py-3 bg-white border-b border-gray-200 flex-shrink-0">
+      <div className="flex items-center justify-between px-6 py-3 bg-white border-b border-gray-200 flex-shrink-0 metis-engineer-header">
         <div className="flex items-center gap-3">
           {/* 返回项目 */}
           <button
             onClick={() => navigate(`/projects/${pid}/pm-team`)}
-            className="text-gray-400 hover:text-gray-700 text-lg leading-none"
+            className="text-gray-400 hover:text-gray-700 text-lg leading-none metis-engineer-back"
             title="返回项目"
           >←</button>
           <span className="text-xl">🛠</span>
@@ -963,7 +1277,7 @@ export default function EngineerWorkspace() {
       </div>
 
       {/* 标签栏 */}
-      <div className="flex gap-1 px-6 pt-3 flex-shrink-0">
+      <div className="flex gap-1 px-6 pt-3 flex-shrink-0 metis-engineer-tabs">
         {TABS.map(t => (
           <button key={t.k} onClick={() => setTab(t.k)}
             className={`px-4 py-2 rounded-t-lg text-sm font-medium transition
@@ -974,12 +1288,12 @@ export default function EngineerWorkspace() {
       </div>
 
       {/* 内容区 */}
-      <div className="flex-1 overflow-hidden px-6 pb-4 pt-0">
+      <div className="flex-1 overflow-hidden px-6 pb-4 pt-0 metis-engineer-content">
         <div className="h-full border-t-0 rounded-b-xl">
-          {tab === 'repair'  && <RepairPanel  projectId={pid} />}
-          {tab === 'docs'    && <DocsPanel    projectId={pid} />}
+          {tab === 'repair'  && <RepairPanel projectId={pid} onOpenProjectIssue={openProjectIssue} />}
+          {tab === 'consultation' && <ConsultationPanel projectId={pid} />}
+          {tab === 'adjustment' && <RectificationPanel projectId={pid} preferredSessionId={rectificationSessionId} />}
           {tab === 'archive' && <ArchivePanel projectId={pid} />}
-          {tab === 'qa'      && <QAPanel      projectId={pid} />}
         </div>
       </div>
     </div>

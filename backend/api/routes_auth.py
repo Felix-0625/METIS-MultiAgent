@@ -283,7 +283,7 @@ def forgot_password(req: ForgotPasswordRequest, request: Request):
     user = get_user_by_email(req.email)
     if user and email_enabled:
         code = str(secrets.randbelow(1_000_000)).zfill(6)
-        save_verification_code(req.email, code)
+        save_verification_code(req.email, code, purpose="reset_password")
         try:
             send_verification_email(req.email, user.username, code)
         except Exception as e:
@@ -304,7 +304,7 @@ def reset_password_route(req: ResetPasswordRequest, request: Request):
     """通过验证码验证身份后设置新密码。"""
     ip = extract_client_ip(request)
 
-    ok, err = verify_email_code(req.email, req.code)
+    ok, err = verify_email_code(req.email, req.code, purpose="reset_password")
     if not ok:
         raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail=err)
 

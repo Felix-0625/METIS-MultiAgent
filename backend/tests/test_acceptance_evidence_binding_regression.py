@@ -544,6 +544,105 @@ def test_exact_supervisor_observations_bind_current_task_and_phase_criteria():
     assert phase_binding["record"]["status"] == "passed"
 
 
+def _completed_supervisor_context(criteria):
+    phase_id = "phase-criteria-compat"
+    generation = "generation-criteria-compat"
+    artifact_digest = "e" * 64
+    supervisor_run = {
+        "run_id": "run-criteria-compat",
+        "status": "completed",
+        "completion_gate": {"passed": True},
+        "scope": {
+            "artifact_digest": artifact_digest,
+            "files": ["artifact.txt"],
+        },
+        "rounds": [],
+    }
+    phase = {
+        "phase_id": phase_id,
+        "execution_generation": generation,
+        "reviewed": True,
+        "review_passed": True,
+        "acceptance_criteria": criteria,
+    }
+    ctx = SimpleNamespace(
+        project_id="project-criteria-compat",
+        agents={},
+        supervisor_quality_runs={phase_id: supervisor_run},
+    )
+    return ctx, phase, supervisor_run
+
+
+@pytest.mark.parametrize(
+    ("criteria", "expected"),
+    [
+        (["workflow is usable"], [
+            ("phase-criteria-compat:acceptance:1", "workflow is usable"),
+        ]),
+        ([{
+            "criterion_id": "phase-explicit",
+            "criterion": "explicit condition",
+        }], [("phase-explicit", "explicit condition")]),
+        ([
+            "first condition",
+            {"id": "legacy-condition", "text": "second condition"},
+        ], [
+            ("phase-criteria-compat:acceptance:1", "first condition"),
+            ("legacy-condition", "second condition"),
+        ]),
+        ([], []),
+    ],
+)
+def test_supervisor_acceptance_supports_compatible_criterion_shapes(
+    criteria, expected,
+):
+    ctx, phase, supervisor_run = _completed_supervisor_context(criteria)
+
+    routes_phases._record_supervisor_acceptance_evidence(ctx, phase)
+    first = [
+        (
+            item["criterion_id"],
+            item["record"]["payload"]["criterion"],
+            item["record"]["payload"]["scope_digest"],
+            item["record"]["evidence_id"],
+        )
+        for item in supervisor_run.get("phase_evidence") or []
+    ]
+    routes_phases._record_supervisor_acceptance_evidence(ctx, phase)
+    second = [
+        (
+            item["criterion_id"],
+            item["record"]["payload"]["criterion"],
+            item["record"]["payload"]["scope_digest"],
+            item["record"]["evidence_id"],
+        )
+        for item in supervisor_run.get("phase_evidence") or []
+    ]
+
+    assert [item[0] for item in first] == [item[0] for item in expected]
+    assert [item[1] for item in first] == [item[1] for item in expected]
+    assert all(item[2].startswith("sha256:") for item in first)
+    assert first == second
+
+
+@pytest.mark.parametrize("criteria", [
+    "not-a-list",
+    [""],
+    [{}],
+    [42],
+    [{"criterion_id": "one", "id": "two", "criterion": "conflict"}],
+    [{"criterion": "valid", "evidence_spec": "not-an-object"}],
+])
+def test_supervisor_acceptance_rejects_invalid_criterion_shapes(criteria):
+    ctx, phase, _supervisor_run = _completed_supervisor_context(criteria)
+
+    with pytest.raises(
+        routes_phases.IllegalQualityTransition,
+        match="acceptance_criteria",
+    ):
+        routes_phases._record_supervisor_acceptance_evidence(ctx, phase)
+
+
 def test_functionality_reviewer_emits_exact_per_criterion_observation(
     monkeypatch,
 ):

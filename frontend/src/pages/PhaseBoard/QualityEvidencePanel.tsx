@@ -331,6 +331,9 @@ export const PhaseQualityRunPanel: React.FC<{ state?: AutoRepairStatus | null }>
   const meta = statusMeta(state.status);
   const history = state.round_history || [];
   const trend = history.map(item => item.blocking_count);
+  const nonBlockingWarnings = state.status === 'passed'
+    ? (state.review_result?.issues || []).filter(issue => issue.severity === 'warning')
+    : [];
   const terminalMessage = state.action_required?.message
     || (state.status === 'passed' ? '本阶段质检与返修闭环已经通过。' : undefined);
   return (
@@ -354,6 +357,15 @@ export const PhaseQualityRunPanel: React.FC<{ state?: AutoRepairStatus | null }>
         )}
       </div>
       {terminalMessage && <Alert type={meta.alert} showIcon message={terminalMessage} style={{ marginBottom: 10 }} />}
+      {nonBlockingWarnings.length > 0 && (
+        <Alert
+          type="info"
+          showIcon
+          message={`已通过；另有 ${nonBlockingWarnings.length} 条非阻塞优化建议`}
+          description="这些建议不消耗返修次数，也不会阻止确认阶段完成。可在后续优化时处理。"
+          style={{ marginBottom: 10 }}
+        />
+      )}
       {history.length > 0 && (
         <Timeline
           items={history.map(item => {

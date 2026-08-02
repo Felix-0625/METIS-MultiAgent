@@ -28,6 +28,7 @@ from .routes_idea import router as routes_idea_router
 from .routes_auth import router as routes_auth_router
 from .websocket import router as websocket_router
 from .routes_reliability import router as routes_reliability_router
+from .routes_dashboard import router as routes_dashboard_router
 
 def register_routers(app):
     app.include_router(routes_auth_router)      # 认证路由（无需鉴权）
@@ -57,3 +58,4 @@ def register_routers(app):
     app.include_router(routes_idea_router)
     app.include_router(websocket_router)
     app.include_router(routes_reliability_router)
+    app.include_router(routes_dashboard_router)

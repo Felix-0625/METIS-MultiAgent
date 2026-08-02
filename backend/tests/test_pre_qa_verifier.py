@@ -84,6 +84,19 @@ def test_contract_artifact_gate_accepts_complete_owned_manifest(tmp_path):
     assert verify_contract_artifacts(tmp_path, contract, registry, agents) == ()
 
 
+def test_contract_artifact_gate_accepts_empty_package_marker(tmp_path):
+    contract, registry, agents = _snapshot(tmp_path)
+    _write(tmp_path / "backend" / "pkg" / "__init__.py", "")
+    contract["required_files"].append({
+        "path": "backend/pkg/__init__.py",
+        "required": True,
+        "owner_type": "backend",
+    })
+    registry["backend/pkg/__init__.py"] = {"agent_id": "backend"}
+
+    assert verify_contract_artifacts(tmp_path, contract, registry, agents) == ()
+
+
 def test_contract_artifact_gate_does_not_treat_todo_domain_text_as_placeholder(
     tmp_path,
 ):

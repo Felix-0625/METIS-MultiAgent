@@ -5,6 +5,8 @@ import time
 import json
 import logging
 import re
+import hashlib
+import uuid
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form
 from fastapi.responses import JSONResponse
@@ -88,6 +90,8 @@ _DETERMINISTIC_QC_LAYERS = {
     "syntax", "security", "collaboration", "runtime_contract",
     "api_contract", "system",
 }
+QC_DISCOVERY_PASS_LIMIT = 2
+QC_ISSUE_REPAIR_ATTEMPT_LIMIT = 3
 
 SIGNOFF_BLOCKER_FIELDS = (
     "code", "scope", "target", "message", "action", "owner",
@@ -108,6 +112,7 @@ class SignoffResponse(BaseModel):
     status: str
     artifact_sha256: Optional[str] = None
     blockers: List[SignoffBlockerResponse]
+    receipt: Optional[Dict[str, Any]] = None
 
 
 def _normalize_signoff_blocker(blocker: Dict[str, Any]) -> Dict[str, Any]:
@@ -271,6 +276,7 @@ def _signoff_payload(
     status: str,
     manifest: Optional[Dict[str, Any]],
     blockers: List[Dict[str, Any]],
+    receipt: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     return {
         "passed": passed,
@@ -280,7 +286,70 @@ def _signoff_payload(
             if manifest else None
         ) or None,
         "blockers": blockers,
+        "receipt": copy.deepcopy(receipt) if receipt is not None else None,
     }
+
+
+def _signoff_binding(
+    ctx: ProjectContext,
+    manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    qa = ((ctx.qc_results.get("__whole_project__") or {}).get("qa") or {})
+    runtime = qa.get("runtime_acceptance") or {}
+    final_run = qa.get("final_qa_run") or {}
+    final_identity = {
+        "run_id": str(final_run.get("run_id") or qa.get("final_qa_run_id") or ""),
+        "generation": str(
+            final_run.get("qc_generation")
+            or final_run.get("generation")
+            or qa.get("final_qa_generation")
+            or ""
+        ),
+        "passed": qa.get("passed") is True,
+        "status": str(qa.get("status") or ""),
+        "artifact_sha256": str(manifest.get("artifact_sha256") or ""),
+    }
+
+    def digest(value: Dict[str, Any]) -> str:
+        payload = json.dumps(
+            value, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+        return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+    return {
+        "project_id": ctx.project_id,
+        "artifact_sha256": str(manifest.get("artifact_sha256") or ""),
+        "artifact_manifest_rule_version": str(manifest.get("rule_version") or ""),
+        "final_qa_run_id": final_identity["run_id"],
+        "final_qa_generation": final_identity["generation"],
+        "final_qa_digest": digest(final_identity),
+        "runtime_evidence_digest": digest(runtime),
+    }
+
+
+def _new_signoff_receipt(
+    ctx: ProjectContext,
+    manifest: Dict[str, Any],
+) -> Dict[str, Any]:
+    return {
+        "schema_version": "metis/signoff-receipt/v1",
+        "receipt_id": f"signoff-{uuid.uuid4().hex}",
+        **_signoff_binding(ctx, manifest),
+        "receipt_revision": 1,
+        "terminal_status": "completed",
+        "signed_off_at": time.time(),
+    }
+
+
+def _signoff_receipt_matches(
+    receipt: Dict[str, Any],
+    binding: Dict[str, Any],
+) -> bool:
+    return (
+        receipt.get("schema_version") == "metis/signoff-receipt/v1"
+        and all(str(receipt.get(key) or "") == str(value or "")
+                for key, value in binding.items())
+    )
 
 
 def _signoff_state_gate_error(ctx: ProjectContext, phases: List[Dict[str, Any]]) -> str | None:
@@ -487,11 +556,19 @@ def _defer_non_actionable_final_findings_to_runtime(
     return True
 
 
-def _should_append_qc_issue(issue: Dict[str, Any], is_first_qc: bool) -> bool:
-    """Keep the baseline stable without hiding newly introduced hard failures."""
-    return is_first_qc or str(issue.get("severity", "")).strip().lower() in {
-        "error", "critical"
-    }
+def _should_append_qc_issue(
+    issue: Dict[str, Any],
+    allow_discovery: Optional[bool] = None,
+    *,
+    is_first_qc: Optional[bool] = None,
+) -> bool:
+    """Bound model discovery while retaining deterministic hard gates."""
+    if allow_discovery is None:
+        allow_discovery = bool(is_first_qc)
+    layer = str(issue.get("layer") or "").strip().lower()
+    return bool(allow_discovery) or layer in (
+        _DETERMINISTIC_QC_LAYERS | {"io", "runtime_acceptance"}
+    )
 
 
 def _append_qc_observation_history(
@@ -539,13 +616,15 @@ def _should_reopen_fixed_issue(issue: Optional[Dict[str, Any]]) -> bool:
     return bool(
         issue
         and not canonical.get("requires_identity_review")
-        and _should_append_qc_issue(issue, is_first_qc=False)
+        and _should_append_qc_issue(issue, allow_discovery=False)
     )
 
 
 def _has_blocking_qc_issues(issues: List[Dict[str, Any]]) -> bool:
     """Warnings remain visible, but active error/critical findings block progress."""
-    active_statuses = {"open", "fixing", "needs_manual"}
+    # ``needs_manual`` is a durable full-stack-engineer handoff, not an
+    # automatic-loop blocker. It remains visible and still gates final release.
+    active_statuses = {"open", "fixing"}
     return any(
         issue.get("status") in active_statuses
         and str(issue.get("severity", "")).strip().lower() in {"error", "critical"}
@@ -815,6 +894,26 @@ def _run_qc_for_subproject(
             sp_description += "\n\n本阶段子任务：\n" + "\n".join(descriptions)
     else:
         sp_description = sp_info.get("description", sp_name)
+
+    external_findings = [
+        item for item in ((qa_context or {}).get("external_findings") or [])
+        if isinstance(item, dict) and str(item.get("message") or "").strip()
+    ]
+    if external_findings:
+        sp_description += (
+            "\n\n[Deterministic Final QA findings for independent Final QC review]\n"
+            "These are evidence, not a terminal verdict. Classify each finding, "
+            "identify the smallest responsible existing delivery file and return "
+            "a structured repair issue for its original owner. Do not dismiss a "
+            "project_defect as infrastructure merely because the evidence came "
+            "from a machine check.\n"
+            + "\n".join(
+                f"- rule={item.get('rule_id') or item.get('status') or 'runtime'}; "
+                f"severity={item.get('severity') or 'error'}; "
+                f"message={item.get('message')}"
+                for item in external_findings
+            )
+        )
 
     # 只质检本子项目/本阶段的产出文件，避免把整个 workspace 的历史代码都扫进去
     related_files = []
@@ -1278,6 +1377,10 @@ def _run_qc_for_subproject(
                     "severity": "error",
                     "fix_hint": runtime_issue.get("fix_hint", ""),
                     "layer": "runtime_acceptance",
+                    "verification_spec": {
+                        "kind": "runtime_acceptance",
+                        "provenance": "deterministic_runtime_acceptance",
+                    },
                     "needs_manual": bool(runtime_issue.get("needs_manual")),
                 }
                 result["passed"] = False
@@ -1293,7 +1396,8 @@ def _run_qc_for_subproject(
 
     prev_entry = ctx.qc_results.get(sp_id, {}).get("qa", {}) if isinstance(ctx.qc_results.get(sp_id, {}), dict) and "qa" in ctx.qc_results.get(sp_id, {}) else ctx.qc_results.get(sp_id, {})
     prev_issues_raw = prev_entry.get("issues_detail", []) if isinstance(prev_entry, dict) else []  # 上次的结构化问题列表
-    is_first_qc = len(prev_issues_raw) == 0  # 是否是第一次质检
+    discovery_passes_used = int(prev_entry.get("discovery_passes_used", 0) or 0)
+    allow_discovery = discovery_passes_used < QC_DISCOVERY_PASS_LIMIT
 
     # 新一轮发现的结构化问题（从 layer_results 中提取）
     # 获取当前阶段 ID，用于 detected_phase 埋点
@@ -1315,8 +1419,11 @@ def _run_qc_for_subproject(
                 find_owner_for_path(pm.file_registry, issue_path)
                 if pm and issue_path else {}
             )
-            issue_agent_id = agent_id or owner.get("agent_id", "")
-            issue_agent_role = agent_role if agent_id else owner.get("agent_role", agent_role)
+            # The reviewed Agent is not necessarily the file owner.  Route the
+            # Issue to the durable file-responsibility owner first and use the
+            # reviewed Agent only when the finding has no registered owner.
+            issue_agent_id = owner.get("agent_id", "") or agent_id
+            issue_agent_role = owner.get("agent_role", "") or agent_role
             issue_payload = {
                 "message": iss.get("message", ""),
                 "file_path": issue_path,
@@ -1334,6 +1441,7 @@ def _run_qc_for_subproject(
                 "severity": iss.get("severity", "warning"),
                 "fix_hint": iss.get("fix_hint", ""),
                 "layer": iss.get("layer") or lr.get("layer", ""),
+                "verification_spec": iss.get("verification_spec"),
                 "status": "needs_manual" if iss.get("needs_manual") else "open",
                 "needs_manual_reason": (
                     "Runtime failure could not be mapped to one source owner"
@@ -1394,7 +1502,7 @@ def _run_qc_for_subproject(
     }
     merged_issues: List[Dict] = []
 
-    MAX_FIX_ROUNDS = 5  # 与 repair_loop 保持一致：单个问题最多5轮，超过标记 needs_manual
+    MAX_FIX_ROUNDS = QC_ISSUE_REPAIR_ATTEMPT_LIMIT
 
     for old_iss in prev_issues_raw:
         old_fingerprint = _qc_issue_fingerprint(old_iss)
@@ -1409,15 +1517,10 @@ def _run_qc_for_subproject(
             canonicalize_issue(old_iss).get("requires_identity_review")
             and old_status not in {"needs_manual", "pending_verification"}
         ):
-            old_message = str(old_iss.get("message") or "").lower()
             old_layer = str(old_iss.get("layer") or "").strip().lower()
             if (
                 not found_again
                 and old_layer in recovered_layers
-                and (
-                    "could not produce valid acceptance evidence" in old_message
-                    or "reviewer is unavailable" in old_message
-                )
             ):
                 merged_issues.append({
                     **old_iss,
@@ -1517,8 +1620,13 @@ def _run_qc_for_subproject(
     old_fingerprint_set = {_qc_issue_fingerprint(i) for i in prev_issues_raw}
     for new_iss in new_issues_detail:
         if _qc_issue_fingerprint(new_iss) not in old_fingerprint_set:
-            if _should_append_qc_issue(new_iss, is_first_qc):
+            if _should_append_qc_issue(new_iss, allow_discovery):
                 merged_issues.append(new_iss)
+            elif str(new_iss.get("severity") or "warning").lower() in {"error", "critical"}:
+                merged_issues.append(mark_needs_manual(
+                    new_iss,
+                    "Two full QC discovery passes completed; transferred to the full-stack engineer",
+                ))
 
     merged_issues = _deduplicate_routed_issues(merged_issues)
 
@@ -1538,13 +1646,7 @@ def _run_qc_for_subproject(
     blocking_issues = [
         issue for issue in active_issues if _severity(issue) in {"error", "critical"}
     ]
-    current_round_has_blocker = any(
-        _severity(issue) in {"error", "critical"} for issue in new_issues_detail
-    )
-    merged_passed = (
-        not _has_blocking_qc_issues(active_issues)
-        and not current_round_has_blocker
-    )
+    merged_passed = not _has_blocking_qc_issues(active_issues)
 
     # 计算合并后的综合分数（基于活跃问题数量）
     merged_score = max(
@@ -1560,6 +1662,21 @@ def _run_qc_for_subproject(
         qa_context=qa_context,
         qc_round=observation_round_number,
     )
+    manual_fingerprints = {
+        _qc_issue_fingerprint(issue)
+        for issue in manual_issues
+    }
+    convergence_observations = [
+        {
+            **copy.deepcopy(issue),
+            **(
+                {"status": "needs_manual"}
+                if _qc_issue_fingerprint(issue) in manual_fingerprints
+                else {}
+            ),
+        }
+        for issue in new_issues_detail
+    ]
     
     entry = {
         "schema_version": RESULT_SCHEMA_VERSION,
@@ -1578,7 +1695,7 @@ def _run_qc_for_subproject(
         # Immutable raw observation for the Supervisor convergence machine.
         # The merged ledger is a UI/history projection and may intentionally
         # suppress later wording changes; it must never define convergence.
-        "observed_issues_detail": copy.deepcopy(new_issues_detail),
+        "observed_issues_detail": convergence_observations,
         "observation_history": observation_history,
         "observations_detail": observations_detail,
         "user_report": result.get("user_report", ""),
@@ -1590,6 +1707,10 @@ def _run_qc_for_subproject(
         "fixed_count": len(fixed_issues),
         "checked_at": time.time(),
         "qc_round": observation_round_number,
+        "discovery_passes_used": min(
+            QC_DISCOVERY_PASS_LIMIT, discovery_passes_used + 1,
+        ),
+        "discovery_pass_limit": QC_DISCOVERY_PASS_LIMIT,
         "status": "passed" if merged_passed else "failed",
         "runtime_acceptance": runtime_acceptance_result,
         "acceptance_observations": copy.deepcopy(
@@ -1832,6 +1953,7 @@ async def get_signoff_status(project_id: str):
         status="completed" if ctx.status == "completed" else "ready",
         manifest=manifest,
         blockers=[],
+        receipt=getattr(ctx, "signoff_receipt", None),
     )
 
 
@@ -1843,6 +1965,7 @@ async def get_signoff_status(project_id: str):
 async def sign_off(project_id: str):
     ctx = _get_project(project_id)
     previous_status = ctx.status
+    previous_receipt = copy.deepcopy(getattr(ctx, "signoff_receipt", None))
     decision_store = getattr(
         getattr(ctx.supervisor, "dispatcher", None),
         "context",
@@ -1851,6 +1974,8 @@ async def sign_off(project_id: str):
     previous_decisions = copy.deepcopy(
         getattr(decision_store, "decisions", None)
     )
+    committed_receipt = None
+    replayed = False
     try:
         with project_write_guard(project_id, Path(ctx.workspace)):
             phase_manager = _phase_managers.get(project_id)
@@ -1868,14 +1993,42 @@ async def sign_off(project_id: str):
                         blockers=blockers,
                     ),
                 )
+            binding = _signoff_binding(ctx, manifest)
+            existing_receipt = getattr(ctx, "signoff_receipt", None)
+            if isinstance(existing_receipt, dict):
+                if not _signoff_receipt_matches(existing_receipt, binding):
+                    return JSONResponse(
+                        status_code=409,
+                        content=_signoff_payload(
+                            passed=False,
+                            status="blocked",
+                            manifest=None,
+                            blockers=[_normalize_signoff_blocker({
+                                "code": "SIGNOFF_RECEIPT_STALE",
+                                "scope": "project",
+                                "message": "Persisted signoff receipt does not match current release evidence",
+                                "action": "Restore the signed artifact or perform a new audited release",
+                            })],
+                            receipt=existing_receipt,
+                        ),
+                    )
+                committed_receipt = copy.deepcopy(existing_receipt)
+                replayed = True
+                return _signoff_payload(
+                    passed=True,
+                    status="completed",
+                    manifest=manifest,
+                    blockers=[],
+                    receipt=committed_receipt,
+                )
+            committed_receipt = _new_signoff_receipt(ctx, manifest)
             result = _signoff_payload(
                 passed=True,
                 status="completed",
                 manifest=manifest,
                 blockers=[],
+                receipt=committed_receipt,
             )
-            if ctx.status == "completed":
-                return result
             add_decision = getattr(decision_store, "add_decision", None)
             if callable(add_decision):
                 add_decision(
@@ -1883,10 +2036,12 @@ async def sign_off(project_id: str):
                     f"项目 {project_id} 全部完成，签核通过",
                 )
             ctx.status = "completed"
+            ctx.signoff_receipt = copy.deepcopy(committed_receipt)
             try:
                 await _persist_all_async()
             except Exception:
                 ctx.status = previous_status
+                ctx.signoff_receipt = copy.deepcopy(previous_receipt)
                 if (
                     decision_store is not None
                     and previous_decisions is not None
@@ -1908,6 +2063,20 @@ async def sign_off(project_id: str):
                 })],
             ),
         )
+    if committed_receipt is not None and not replayed:
+        try:
+            from api import websocket
+            await websocket.manager.broadcast(
+                project_id,
+                "project.signoff.completed",
+                copy.deepcopy(committed_receipt),
+            )
+        except Exception:
+            logger.exception(
+                "Signoff committed but advisory broadcast failed project=%s receipt=%s",
+                project_id,
+                committed_receipt.get("receipt_id"),
+            )
     return result
 
 @router.post("/projects/{project_id}/supervisor/sync-pm-plan")

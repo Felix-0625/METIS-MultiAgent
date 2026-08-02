@@ -32,6 +32,20 @@ import { wsService } from '../../services/websocket';
 const { TextArea } = Input;
 const FILE_BATCH_LIMIT = 5;
 
+const apiErrorText = (error: any, fallback: string): string => {
+  const detail = error?.response?.data?.detail;
+  if (typeof detail === 'string' && detail.trim()) return detail;
+  if (detail && typeof detail === 'object') {
+    if (typeof detail.message === 'string' && detail.message.trim()) {
+      return detail.message;
+    }
+    try { return JSON.stringify(detail); } catch { /* fall through */ }
+  }
+  return typeof error?.message === 'string' && error.message.trim()
+    ? error.message
+    : fallback;
+};
+
 // ─── 通用对话面板（终端风格，支持文件上传）────────────────────────────────────
 const ChatPanel: React.FC<{
   title: string;
@@ -461,7 +475,9 @@ const PhaseBoard: React.FC = () => {
   const allowedAutoRepairDecisions = new Set<AutoRepairDecision>(
     autoRepairAction?.options || [],
   );
-  const autoRepairDecisionTitle = autoRepairAction?.status === 'quality_regressed'
+  const autoRepairDecisionTitle = autoRepairAction?.status === 'passed_with_handoff'
+    ? '质检完成，存在待修问题'
+    : autoRepairAction?.status === 'quality_regressed'
     ? '返修导致质量回退'
     : autoRepairAction?.status === 'no_progress'
       ? '返修未产生有效进展'
@@ -473,7 +489,11 @@ const PhaseBoard: React.FC = () => {
             ? '等待人工修复'
           : '质检循环达到自动返修上限';
   const autoRepairDecisionDescription = [
-    allowedAutoRepairDecisions.has('manual_fix') ? '自行修改会暂停循环并进入全栈工程师工作台' : '',
+    allowedAutoRepairDecisions.has('manual_fix')
+      ? (autoRepairAction?.status === 'passed_with_handoff'
+        ? '待修问题已按文件聚合，可进入全栈工程师工作台继续处理'
+        : '自行修改会暂停循环并进入全栈工程师工作台')
+      : '',
     allowedAutoRepairDecisions.has('retry_cycle') ? '继续质检循环会基于当前文件再检查和修复' : '',
     allowedAutoRepairDecisions.has('rebuild_phase') ? '阶段重构会保留快照、重置本阶段 Agent 并携带问题清单重新生成任务' : '',
   ].filter(Boolean).join('；') || '后端未提供可执行操作，请刷新状态或查看问题证据。';
@@ -554,7 +574,7 @@ const PhaseBoard: React.FC = () => {
         startAutoRepairPolling(phaseId);
       }
     } catch (e: any) {
-      message.error(e.response?.data?.detail || e.message || '自动修复启动失败');
+      message.error(apiErrorText(e, '自动修复启动失败'));
       setAutoRepairPhase(null);
       if (decision) setShowDecisionModal(true);
     } finally {
@@ -563,6 +583,18 @@ const PhaseBoard: React.FC = () => {
   };
 
   const applyAutoRepairStatus = async (phaseId: string, state: AutoRepairStatus, notify: boolean) => {
+    if (
+      !state.running
+      && state.review_result?.passed === true
+      && state.status !== 'passed_with_handoff'
+    ) {
+      state = {
+        ...state,
+        status: 'passed',
+        action_required: undefined,
+        needs_manual: false,
+      };
+    }
     setAutoRepairStates(current => ({ ...current, [phaseId]: state }));
     const actionMessage = state.action_required?.message;
     const hasActionMessage = !!actionMessage && (state.messages || []).some(
@@ -617,10 +649,22 @@ const PhaseBoard: React.FC = () => {
     await Promise.all([loadPhases(), loadPhaseFiles(phaseId)]);
 
     if (state.status === 'passed') {
+      // A terminal pass invalidates a dialog opened from an earlier state.
+      setAutoRepairAction(current => current?.phaseId === phaseId ? null : current);
+      setShowDecisionModal(false);
       if (notify) message.success('✅ 自动修复完成，质检通过！');
       // The auto-repair loop has already run and persisted the authoritative
       // QA result. Starting another inspection here would create a second result against
       // the same revision and can turn a just-passed cycle back into failure.
+    } else if (state.status === 'passed_with_handoff' && state.action_required) {
+      setAutoRepairAction({
+        phaseId,
+        status: state.status,
+        ...(state.action_required || {}),
+        issueReport: state.issue_report || {},
+      });
+      setShowDecisionModal(true);
+      if (notify) message.warning(state.action_required.message);
     } else if (state.action_required) {
       setAutoRepairAction({
         phaseId,
@@ -679,7 +723,7 @@ const PhaseBoard: React.FC = () => {
     } catch (e: any) {
       autoRepairPollFailuresRef.current += 1;
       if (autoRepairPollFailuresRef.current === 3) {
-        message.warning(e.response?.data?.detail || '质检状态暂时无法获取，正在自动重试');
+        message.warning(apiErrorText(e, '质检状态暂时无法获取，正在自动重试'));
       }
       if (autoRepairPollFailuresRef.current >= 10) {
         stopAutoRepairPolling();
@@ -696,12 +740,14 @@ const PhaseBoard: React.FC = () => {
     setDecisionSubmitting('manual_fix');
     setAutoRepairPhase(autoRepairAction.phaseId);
     try {
-      const decisionRes: any = await axios.post(
-        `${API}/projects/${projectId}/phases/${autoRepairAction.phaseId}/auto-repair`,
-        null,
-        { params: { user_decision: 'manual_fix' }, timeout: 30000 },
-      );
-      if (!decisionRes.data.success) throw new Error(decisionRes.data.message || '暂停质检循环失败');
+      if (autoRepairAction.status !== 'passed_with_handoff') {
+        const decisionRes: any = await axios.post(
+          `${API}/projects/${projectId}/phases/${autoRepairAction.phaseId}/auto-repair`,
+          null,
+          { params: { user_decision: 'manual_fix' }, timeout: 30000 },
+        );
+        if (!decisionRes.data.success) throw new Error(decisionRes.data.message || '暂停质检循环失败');
+      }
       await axios.post(
         `${API}/projects/${projectId}/phases/${autoRepairAction.phaseId}/transfer-to-engineer`,
         null,
@@ -747,13 +793,44 @@ const PhaseBoard: React.FC = () => {
           return { phaseId: p.phase_id, state: res.data as AutoRepairStatus };
         } catch { return null; }
       }));
-      const loadedStates = states.filter((item): item is { phaseId: string; state: AutoRepairStatus } => !!item);
+      const loadedStates = states
+        .filter((item): item is { phaseId: string; state: AutoRepairStatus } => !!item)
+        .map(item => ({
+          ...item,
+          state: !item.state.running && item.state.review_result?.passed === true
+            ? {
+                ...item.state,
+                status: 'passed' as const,
+                action_required: undefined,
+                needs_manual: false,
+              }
+            : item.state,
+        }));
       setAutoRepairStates(current => ({
         ...current,
         ...Object.fromEntries(loadedStates.map(item => [item.phaseId, item.state])),
       }));
-      const resumable = loadedStates.find(item => item.state.running)
-        || loadedStates.find(item => !!item.state.action_required);
+      const restoredReviews = Object.fromEntries(
+        loadedStates
+          .filter(item => !!item.state.review_result)
+          .map(item => [item.phaseId, item.state.review_result!]),
+      );
+      if (Object.keys(restoredReviews).length > 0) {
+        setAndSaveReview(current => ({ ...current, ...restoredReviews }));
+      }
+      const completedPhaseIds = new Set(
+        phases
+          .filter(phase => phase.status === 'completed')
+          .map(phase => phase.phase_id),
+      );
+      const actionableStates = loadedStates.filter(item =>
+        !completedPhaseIds.has(item.phaseId)
+        && item.state.review_result?.passed !== true,
+      );
+      // Prefer the latest unfinished phase. Every restored action remains bound
+      // to its own phaseId, so an older phase cannot populate a newer phase UI.
+      const resumable = [...actionableStates].reverse().find(item => item.state.running)
+        || [...actionableStates].reverse().find(item => !!item.state.action_required);
       if (!resumable) return;
       setOpenSupChat(resumable.phaseId);
       await applyAutoRepairStatus(resumable.phaseId, resumable.state, false);
@@ -1325,7 +1402,7 @@ const PhaseBoard: React.FC = () => {
             disabled={!!decisionSubmitting && decisionSubmitting !== 'manual_fix'}
             onClick={() => void openManualRepair()}
           >
-            自行修改
+            {autoRepairAction?.status === 'passed_with_handoff' ? '进入全栈工程师' : '自行修改'}
           </Button>,
           allowedAutoRepairDecisions.has('retry_cycle') &&
           <Button

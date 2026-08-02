@@ -58,6 +58,14 @@ def transition_agent(
     if status != current and allowed and status not in allowed:
         raise ValueError(f"Invalid agent status transition: {current} -> {status}")
 
+    # Polling/recovery projections may observe the same terminal state many
+    # times. A terminal transition is immutable: replaying it must not restart
+    # its clock or evict the original lifecycle evidence.
+    if status == current and status in TERMINAL_STATUSES:
+        if progress is not None:
+            agent["progress"] = max(0, min(100, int(progress)))
+        return agent
+
     now = time.time()
     agent["status"] = status
     agent["updated_at"] = now

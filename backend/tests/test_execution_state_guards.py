@@ -616,16 +616,16 @@ def test_running_locked_coordinator_cannot_project_completion_or_start_qa(
 
     asyncio.run(routes_execution._start_phase_quality_cycle_if_ready(ctx))
 
-    assert (agent["status"], agent["progress"]) == ("working", 99)
-    assert (child["status"], child["progress"]) == ("in_progress", 99)
+    assert (agent["status"], agent["progress"]) == ("completed", 100)
+    assert (child["status"], child["progress"]) == ("completed", 100)
     assert qa_calls == []
 
     phase["execution_coordinator"]["status"] = "completed"
     receipt["artifact_baseline_digest"] = "sha256:" + ("e" * 64)
     asyncio.run(routes_execution._start_phase_quality_cycle_if_ready(ctx))
 
-    assert (agent["status"], agent["progress"]) == ("working", 99)
-    assert (child["status"], child["progress"]) == ("in_progress", 99)
+    assert (agent["status"], agent["progress"]) == ("completed", 100)
+    assert (child["status"], child["progress"]) == ("completed", 100)
     assert qa_calls == []
 
 

@@ -78,7 +78,10 @@ const ProjectList: React.FC = () => {
     setLoading(true);
     try {
       const res = await axios.get(`${API}/projects`);
-      setProjects(res.data.projects || []);
+      const ordered = [...(res.data.projects || [])].sort(
+        (left: Project, right: Project) => Number(right.created_at || 0) - Number(left.created_at || 0)
+      );
+      setProjects(ordered);
     } catch {
       // 后端未启动时显示空列表，不用 mock 数据
       setProjects([]);
@@ -209,6 +212,9 @@ const ProjectList: React.FC = () => {
     completed: projects.filter(p => p.status === 'completed').length,
   };
 
+  const compactDescription = (description = '') =>
+    description.length > 15 ? `${description.slice(0, 15)}...` : description;
+
   const columns = [
     {
       title: '项目名称',
@@ -216,7 +222,7 @@ const ProjectList: React.FC = () => {
       render: (_: any, record: Project) => (
         <div>
           <div className="font-medium">{record.name}</div>
-          <div className="text-xs text-gray-400">{record.description}</div>
+          <div className="text-xs text-gray-400">{compactDescription(record.description)}</div>
         </div>
       ),
     },
@@ -283,7 +289,7 @@ const ProjectList: React.FC = () => {
             icon={<DownloadOutlined />}
             onClick={() => handleArchive(record)}
           >
-            归档
+            下载
           </Button>
           <Button
             danger

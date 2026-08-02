@@ -56,11 +56,17 @@ def test_project_and_phase_records_gain_versions_without_changing_business_field
 def test_project_creation_idempotency_replays_one_created_resource(reliability_db, monkeypatch):
     calls = []
 
-    async def fake_create(request, current_user):
+    def fake_create(request, current_user):
         calls.append(request.name)
-        return {"project_id": "proj-once", "name": request.name}
+        context = SimpleNamespace(to_persist=lambda: {
+            "project_id": "proj-once", "name": request.name,
+            "owner_user_id": current_user.user_id,
+        })
+        return "proj-once", context, {
+            "project_id": "proj-once", "name": request.name,
+        }
 
-    monkeypatch.setattr(routes_projects, "_create_project_once", fake_create)
+    monkeypatch.setattr(routes_projects, "_new_project_response", fake_create)
     user = SimpleNamespace(user_id="user-1")
     request = ProjectRequest(name="Reliable", description="same request")
 
@@ -74,6 +80,7 @@ def test_project_creation_idempotency_replays_one_created_resource(reliability_d
         "idempotent_replay": True,
     }
     assert calls == ["Reliable"]
+    routes_projects.projects.pop("proj-once", None)
 
 
 def test_project_idempotency_key_rejects_different_payload(reliability_db, monkeypatch):

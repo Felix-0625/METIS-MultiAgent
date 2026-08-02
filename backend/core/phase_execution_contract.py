@@ -1107,27 +1107,56 @@ def _artifact_evidence_for_assignment(
         delivery_digest = str(delivery.get("sha256") or "")
         if delivery_digest and not delivery_digest.startswith("sha256:"):
             delivery_digest = "sha256:" + delivery_digest
+        registry_phase = str(registry.get("phase_id") or "")
+        registry_agent = str(registry.get("agent_id") or "")
+        delivery_size = delivery.get("size")
+        current_owner_matches = registry_agent == agent_id
+        # A later task in the same phase may legitimately modify a file first
+        # delivered by this task.  The task receipt is historical evidence, so
+        # do not compare that old digest with the successor's current bytes.
+        # The durable runner receipt still has to contain a valid digest/size,
+        # and the live registry must prove an in-phase successor owns the file.
+        superseded_in_phase = bool(
+            registry_phase == str(phase_id)
+            and registry_agent
+            and registry_agent != agent_id
+        )
+        current_delivery_matches = bool(
+            current_owner_matches
+            and delivery_digest.lower() == byte_digest.lower()
+            and isinstance(delivery_size, int)
+            and delivery_size == len(payload)
+        )
+        historical_delivery_is_valid = bool(
+            superseded_in_phase
+            and re.fullmatch(r"sha256:[0-9a-fA-F]{64}", delivery_digest)
+            and isinstance(delivery_size, int)
+            and delivery_size >= 0
+        )
         passed = bool(
             payload is not None
-            and str(registry.get("phase_id") or "") == str(phase_id)
-            and str(registry.get("agent_id") or "") == agent_id
-            and delivery_digest.lower() == byte_digest.lower()
-            and isinstance(delivery.get("size"), int)
-            and delivery.get("size") == len(payload)
+            and registry_phase == str(phase_id)
+            and (current_delivery_matches or historical_delivery_is_valid)
         )
         checks.append({
             "name": f"registry owner and byte digest for {path}",
             "passed": passed,
             "path": path,
-            "registry_agent_id": str(registry.get("agent_id") or ""),
+            "registry_agent_id": registry_agent,
             "byte_digest": byte_digest,
             "delivery_digest": delivery_digest,
             "size": len(payload) if payload is not None else None,
+            "historical_delivery": historical_delivery_is_valid,
         })
         digest_rows.append({
             "path": path,
-            "byte_digest": byte_digest,
-            "size": len(payload) if payload is not None else None,
+            "byte_digest": (
+                delivery_digest if historical_delivery_is_valid else byte_digest
+            ),
+            "size": (
+                delivery_size if historical_delivery_is_valid
+                else (len(payload) if payload is not None else None)
+            ),
         })
     artifact_digest = (
         _sha256(json.dumps(

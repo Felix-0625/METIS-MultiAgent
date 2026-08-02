@@ -9,6 +9,7 @@ import pytest
 
 from api import routes_execution, routes_phases
 from core.phase_execution_contract import acceptance_criterion_contracts
+from core.phase_manager import PhaseManager
 
 
 def test_locked_phase_manual_execution_routes_are_gone(monkeypatch) -> None:
@@ -300,6 +301,61 @@ def test_persisted_phase_coordinator_keeps_success_when_quality_start_fails(
     assert asyncio.run(
         routes_phases._resume_locked_phase_coordinator(project_id, phase_id)
     ) is False
+
+
+def test_late_quality_start_failure_does_not_reopen_confirmed_phase(
+    monkeypatch,
+) -> None:
+    phase = {
+        "phase_id": "phase-1",
+        "status": "completed",
+        "progress": 100,
+        "user_confirmed": True,
+        "completed_at": 123.0,
+    }
+    ctx = SimpleNamespace(project_id="confirmed-project")
+
+    async def fail_quality(_ctx):
+        raise RuntimeError("late bootstrap failure")
+
+    monkeypatch.setattr(
+        routes_execution,
+        "_start_phase_quality_cycle_if_ready",
+        fail_quality,
+    )
+
+    started = asyncio.run(
+        routes_phases._start_phase_quality_after_execution(
+            ctx,
+            phase,
+            "phase-1",
+        )
+    )
+
+    assert started is False
+    assert phase["status"] == "completed"
+    assert phase["progress"] == 100
+    assert phase["completed_at"] == 123.0
+    assert phase["user_confirmed"] is True
+    assert phase["quality_start_error"]["error_code"] == "RuntimeError"
+
+
+def test_phase_manager_restore_heals_confirmed_phase_status(tmp_path) -> None:
+    manager = PhaseManager("restore-confirmed", tmp_path)
+    manager.from_dict({
+        "phases": [{
+            "phase_id": "phase-1",
+            "status": "qa_pending",
+            "progress": 99,
+            "user_confirmed": True,
+            "completed_at": 123.0,
+        }],
+        "current_phase_index": 0,
+    })
+
+    assert manager.phases[0]["status"] == "completed"
+    assert manager.phases[0]["progress"] == 100
+    assert manager.phases[0]["completed_at"] == 123.0
 
 
 def test_current_coordinator_falls_back_only_to_unanimous_current_receipts(
@@ -620,6 +676,7 @@ def test_phase_coordinator_preserves_successful_peer_when_same_wave_task_fails(
                 "execution_generation": generation,
             },
             "result": {"error_code": "agent_execution_failed"},
+            "last_error": "provider rejected the request",
         },
     }
     runs_by_id = {
@@ -676,6 +733,7 @@ def test_phase_coordinator_preserves_successful_peer_when_same_wave_task_fails(
     assert receipt_b["status"] == "failed"
     assert receipt_b["completion_run_id"] == "run-task-b"
     assert receipt_b["status"] != "succeeded"
+    assert receipt_b["error"] == "provider rejected the request"
     assert "task-c" not in scheduled
     assert phase["status"] == "failed"
     assert phase["execution_coordinator"]["status"] == "failed"
@@ -5620,7 +5678,7 @@ def test_manual_retry_uses_issue_paths_frozen_at_pause(monkeypatch, tmp_path):
     assert "manual_fix_session_active" not in state
 
 
-def test_manual_retry_rejects_zero_change_legacy_adoption(monkeypatch, tmp_path):
+def test_manual_retry_adopts_issue_scoped_pre_pause_fix(monkeypatch, tmp_path):
     project_id, phase_id, ctx, _pm = _install_phase(monkeypatch, tmp_path)
     state = routes_phases._auto_repair_states[f"{project_id}-{phase_id}"]
     state["review_result"] = {
@@ -5636,14 +5694,13 @@ def test_manual_retry_rejects_zero_change_legacy_adoption(monkeypatch, tmp_path)
     )
     asyncio.run(routes_phases.start_auto_repair(project_id, phase_id, "manual_fix"))
 
-    with pytest.raises(Exception) as blocked:
-        asyncio.run(
-            routes_phases.start_auto_repair(project_id, phase_id, "retry_cycle")
-        )
+    result = asyncio.run(
+        routes_phases.start_auto_repair(project_id, phase_id, "retry_cycle")
+    )
 
-    assert blocked.value.status_code == 409
-    assert machine.bind_calls == []
-    assert state["status"] == "awaiting_manual_fix"
+    assert result["success"] is True
+    assert len(machine.bind_calls) == 1
+    assert machine.bind_calls[0]["transition_reason"] == "manual_fix"
 
 
 def test_manual_retry_allows_zero_file_change_after_reviewer_recovers(
@@ -6009,7 +6066,7 @@ def test_auto_repair_rolls_back_when_blockers_increase(monkeypatch, tmp_path):
     assert len(ctx.qc_results[phase_id]["qa"]["issues_detail"]) == 1
 
 
-def test_auto_repair_splits_same_owner_work_by_file(monkeypatch, tmp_path):
+def test_auto_repair_groups_same_owner_issues_in_one_transport_batch(monkeypatch, tmp_path):
     project_id, phase_id, ctx, _pm = _install_phase(monkeypatch, tmp_path)
     calls = []
     released = []
@@ -6070,24 +6127,44 @@ def test_auto_repair_splits_same_owner_work_by_file(monkeypatch, tmp_path):
         project_id, phase_id, 1, entry, {"messages": []}, False, {"api_key": "test"}
     ))
 
-    assert len(calls) == 2
+    assert len(calls) == 1
     assert [issue["status"] for issue in entry["issues_detail"]] == [
         "fixing", "fixing", "needs_manual",
     ]
     assert "backend/src/api.py" in calls[0]["description"]
-    assert "backend/src/extra.py" not in calls[0]["description"]
-    assert "backend/src/extra.py" in calls[1]["description"]
-    assert "backend/src/api.py" not in calls[1]["description"]
+    assert "backend/src/extra.py" in calls[0]["description"]
     assert {call["agent_id"] for call in calls} == {"old-api"}
     assert all(call["tech_stack"] == ["Python", "FastAPI"] for call in calls)
     assert [
         call["artifact_policy"]["required_files"] for call in calls
-    ] == [["backend/src/api.py"], ["backend/src/extra.py"]]
+    ] == [[]]
     assert [
         call["artifact_policy"]["allowed_path_prefixes"] for call in calls
-    ] == [["backend/src/api.py"], ["backend/src/extra.py"]]
+    ] == [["backend/src/api.py", "backend/src/extra.py"]]
     assert len(released) == 2
     assert ctx.agents["old-api"].get("required_rebuild_files", []) == []
+
+
+def test_repair_transport_chunks_do_not_change_qa_round_identity():
+    issues = [{"id": f"q{i}", "message": "broken"} for i in range(6)]
+
+    batches = routes_phases._chunk_repair_issues(issues)
+
+    assert [len(batch) for batch in batches] == [5, 1]
+    assert [item["id"] for batch in batches for item in batch] == [
+        "q0", "q1", "q2", "q3", "q4", "q5",
+    ]
+
+
+def test_repair_transport_chunks_by_utf8_payload_size():
+    issues = [
+        {"id": "q1", "message": "错" * 20},
+        {"id": "q2", "message": "错" * 20},
+    ]
+
+    batches = routes_phases._chunk_repair_issues(issues, max_bytes=100)
+
+    assert [len(batch) for batch in batches] == [1, 1]
 
 
 def test_rebuild_recreates_and_executes_agents_with_per_task_file_ownership(

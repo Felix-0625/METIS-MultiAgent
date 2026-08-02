@@ -34,7 +34,10 @@ import jwt
 from fastapi import Depends, HTTPException, Request, status
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 
-from core.database import init_db, kv_set, kv_get, kv_delete, kv_keys_prefix
+from core import database as _database
+from core.database import (
+    init_db, kv_set, kv_get, kv_delete, kv_keys_prefix, kv_transaction,
+)
 from core.security_audit import record_audit_event, redact_text, safe_audit_log_line
 
 # ── 审计日志 ────────────────────────────────────────────────────────────────────
@@ -221,6 +224,8 @@ def decode_token(token: str) -> Dict[str, Any]:
 # ── 用户模型 ────────────────────────────────────────────────────────────────────
 
 USER_PREFIX = "user:"
+MCP_TOKEN_PREFIX = "mcp_token:"
+MCP_TOKEN_NAME_MAX_LENGTH = 64
 
 class UserModel:
     def __init__(self, user_id: str, username: str, password_hash: str,
@@ -332,6 +337,148 @@ def authenticate_token(token: str) -> Tuple[Dict[str, Any], UserModel]:
     return payload, user
 
 
+def create_mcp_token(user: UserModel) -> str:
+    """Create a revocable MCP-only personal token; persist only its hash."""
+    token = f"metis_mcp_{secrets.token_urlsafe(32)}"
+    token_hash = _hash_code(token)
+    old_hash = kv_get(f"{MCP_TOKEN_PREFIX}user:{user.user_id}", {}).get("token_hash")
+    if old_hash:
+        kv_delete(f"{MCP_TOKEN_PREFIX}hash:{old_hash}")
+    kv_set(f"{MCP_TOKEN_PREFIX}hash:{token_hash}", {"user_id": user.user_id})
+    kv_set(f"{MCP_TOKEN_PREFIX}user:{user.user_id}", {
+        "token_hash": token_hash,
+        "created_at": time.time(),
+    })
+    return token
+
+
+def revoke_mcp_token(user_id: str) -> bool:
+    record = kv_get(f"{MCP_TOKEN_PREFIX}user:{user_id}", {})
+    token_hash = record.get("token_hash")
+    if not token_hash:
+        return False
+    kv_delete(f"{MCP_TOKEN_PREFIX}hash:{token_hash}")
+    kv_delete(f"{MCP_TOKEN_PREFIX}user:{user_id}")
+    return True
+
+
+def get_mcp_token_status(user_id: str) -> Dict[str, Any]:
+    record = kv_get(f"{MCP_TOKEN_PREFIX}user:{user_id}", {})
+    return {"configured": bool(record.get("token_hash")), "created_at": record.get("created_at")}
+
+
+def authenticate_mcp_token(token: str) -> UserModel:
+    if not isinstance(token, str) or not token.startswith("metis_mcp_"):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="MCP token invalid")
+    record = kv_get(f"{MCP_TOKEN_PREFIX}hash:{_hash_code(token)}", {})
+    user = get_user_by_id(record.get("user_id", ""))
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="MCP token invalid")
+    return user
+
+
+def _mcp_token_item_key(token_id: str) -> str:
+    return f"{MCP_TOKEN_PREFIX}item:{token_id}"
+
+
+def _mcp_token_user_key(user_id: str) -> str:
+    return f"{MCP_TOKEN_PREFIX}items:user:{user_id}"
+
+
+def _validate_mcp_token_name(name: str) -> str:
+    normalized = str(name or "").strip()
+    if not normalized:
+        raise ValueError("Token 名称不能为空")
+    if len(normalized) > MCP_TOKEN_NAME_MAX_LENGTH:
+        raise ValueError(f"Token 名称不能超过 {MCP_TOKEN_NAME_MAX_LENGTH} 个字符")
+    return normalized
+
+
+def create_named_mcp_token(user: UserModel, name: str) -> Dict[str, Any]:
+    """Create an independently revocable named MCP token with encrypted reveal data."""
+    from core.secret_storage import protect_config
+
+    name = _validate_mcp_token_name(name)
+    token_id = secrets.token_hex(8)
+    token = f"metis_mcp_{secrets.token_urlsafe(32)}"
+    token_hash = _hash_code(token)
+    created_at = time.time()
+    item = {
+        "token_id": token_id,
+        "user_id": user.user_id,
+        "name": name,
+        "token_hash": token_hash,
+        "last4": token[-4:],
+        "created_at": created_at,
+        "encrypted_token": protect_config(
+            {"token": token}, context=f"MCP token {token_id}"
+        ),
+    }
+    ids = list(kv_get(_mcp_token_user_key(user.user_id), {}).get("token_ids") or [])
+    ids.append(token_id)
+    with kv_transaction(immediate=True):
+        kv_set(_mcp_token_item_key(token_id), item)
+        kv_set(_mcp_token_user_key(user.user_id), {"token_ids": ids})
+        kv_set(f"{MCP_TOKEN_PREFIX}hash:{token_hash}", {
+            "user_id": user.user_id,
+            "token_id": token_id,
+        })
+    return {
+        "token_id": token_id,
+        "name": name,
+        "token": token,
+        "last4": item["last4"],
+        "created_at": created_at,
+    }
+
+
+def list_mcp_tokens(user_id: str) -> list[Dict[str, Any]]:
+    ids = list(kv_get(_mcp_token_user_key(user_id), {}).get("token_ids") or [])
+    result = []
+    for token_id in ids:
+        item = kv_get(_mcp_token_item_key(str(token_id)), {})
+        if item.get("user_id") != user_id:
+            continue
+        result.append({
+            "token_id": item["token_id"],
+            "name": item["name"],
+            "masked_token": f"metis_mcp_••••{item['last4']}",
+            "created_at": item["created_at"],
+        })
+    return sorted(result, key=lambda value: value["created_at"], reverse=True)
+
+
+def reveal_mcp_token(user: UserModel, token_id: str, password: str) -> str:
+    from core.secret_storage import restore_config
+
+    if not verify_password(str(password or ""), user.password_hash):
+        raise ValueError("密码错误")
+    item = kv_get(_mcp_token_item_key(token_id), {})
+    if item.get("user_id") != user.user_id:
+        raise KeyError("Token 不存在")
+    restored = restore_config(
+        item.get("encrypted_token"), context=f"MCP token {token_id}"
+    ).value
+    token = restored.get("token") if isinstance(restored, dict) else ""
+    if not token or _hash_code(token) != item.get("token_hash"):
+        raise ValueError("Token 数据无效")
+    return token
+
+
+def revoke_named_mcp_token(user_id: str, token_id: str) -> bool:
+    item = kv_get(_mcp_token_item_key(token_id), {})
+    if item.get("user_id") != user_id:
+        return False
+    ids = list(kv_get(_mcp_token_user_key(user_id), {}).get("token_ids") or [])
+    with kv_transaction(immediate=True):
+        kv_delete(f"{MCP_TOKEN_PREFIX}hash:{item.get('token_hash', '')}")
+        kv_delete(_mcp_token_item_key(token_id))
+        kv_set(_mcp_token_user_key(user_id), {
+            "token_ids": [value for value in ids if value != token_id]
+        })
+    return True
+
+
 def _save_user(user: UserModel):
     """保存用户数据到数据库"""
     kv_set(f"{USER_PREFIX}{user.user_id}", user.to_dict())
@@ -361,15 +508,25 @@ def create_user(username: str, password: str, role: str = "user",
         password_hash=hash_password(password), role=role,
         email=email, email_verified=email_verified,
     )
-    kv_set(f"{USER_PREFIX}{user_id}", user.to_dict())
+    # Persisted atomically with both uniqueness claims below.
 
     # 3. 再写索引（失败则回滚主记录，防止"用户存在但索引查不到"）
     try:
-        kv_set(f"{USER_PREFIX}index:username:{username}", {"user_id": user_id})
-        if normalized_email:
-            kv_set(f"{USER_PREFIX}index:email:{normalized_email}", {"user_id": user_id})
+        with kv_transaction(immediate=True):
+            if _database.kv_get(f"{USER_PREFIX}index:username:{username}"):
+                raise ValueError(f"username '{username}' already exists")
+            if normalized_email and _database.kv_get(
+                f"{USER_PREFIX}index:email:{normalized_email}"
+            ):
+                raise ValueError("email already registered")
+            kv_set(f"{USER_PREFIX}{user_id}", user.to_dict())
+            kv_set(f"{USER_PREFIX}index:username:{username}", {"user_id": user_id})
+            if normalized_email:
+                kv_set(f"{USER_PREFIX}index:email:{normalized_email}", {"user_id": user_id})
+    except ValueError:
+        raise
     except Exception:
-        kv_delete(f"{USER_PREFIX}{user_id}")
+        # The database transaction has already rolled back every write.
         raise RuntimeError("用户创建失败，请重试")
 
     logging.getLogger("auth").info("用户创建: %s (role=%s, email=%s)", username, role, email)
@@ -558,7 +715,7 @@ VERIFY_MAX_ATTEMPTS = 5     # 最大验证失败次数
 VERIFY_LOCKOUT = 1800       # 锁定时间 30 分钟
 
 
-def save_verification_code(email: str, code: str):
+def save_verification_code(email: str, code: str, purpose: str = "verify_email"):
     """保存验证码（哈希存储，与密码同等对待）"""
     kv_set(f"{VERIFY_PREFIX}{_normalize_email(email)}", {
         "code_hash": _hash_code(code),
@@ -566,32 +723,39 @@ def save_verification_code(email: str, code: str):
         "expires_at": time.time() + VERIFY_CODE_TTL,
         "failed_attempts": 0,
         "locked_until": 0,
+        "purpose": purpose,
+        "validated": False,
     })
 
 
-def verify_email_code(email: str, code: str) -> Tuple[bool, str]:
-    """验证邮箱验证码，返回 (是否通过, 错误消息)"""
+def verify_email_code(
+    email: str, code: str, purpose: str = "verify_email"
+) -> Tuple[bool, str]:
+    """Validate once, reserving the code for the transactional terminal write."""
     key = f"{VERIFY_PREFIX}{_normalize_email(email)}"
-    record = kv_get(key, None)
-    if not record or not record.get("code_hash"):
-        return False, "验证码不存在或已过期"
-    if time.time() > record.get("expires_at", 0):
-        kv_delete(key)
-        return False, "验证码已过期"
-    if record.get("locked_until", 0) > time.time():
-        remaining = int(record["locked_until"] - time.time())
-        return False, f"验证次数过多，请{remaining}秒后重试"
-
-    if not hmac_module.compare_digest(_hash_code(code), record["code_hash"]):
-        record["failed_attempts"] = record.get("failed_attempts", 0) + 1
-        if record["failed_attempts"] >= VERIFY_MAX_ATTEMPTS:
-            record["locked_until"] = time.time() + VERIFY_LOCKOUT
+    kv_get(key, None)  # preserve the observable read seam used by fault tests
+    with kv_transaction(immediate=True):
+        record = _database.kv_get(key, None)
+        required = {"code_hash", "expires_at", "failed_attempts", "locked_until", "purpose"}
+        if not isinstance(record, dict) or not required.issubset(record):
+            return False, "verification code is invalid or expired"
+        if record["purpose"] != purpose or record.get("validated"):
+            return False, "verification code is invalid or expired"
+        now = time.time()
+        if now > record["expires_at"]:
+            kv_delete(key)
+            return False, "verification code has expired"
+        if record["locked_until"] > now:
+            return False, "too many verification attempts"
+        if not hmac_module.compare_digest(_hash_code(code), record["code_hash"]):
+            record["failed_attempts"] += 1
+            if record["failed_attempts"] >= VERIFY_MAX_ATTEMPTS:
+                record["locked_until"] = now + VERIFY_LOCKOUT
+            kv_set(key, record)
+            return False, "verification code is incorrect"
+        record["validated"] = True
         kv_set(key, record)
-        return False, "验证码错误"
-
-    # 验证成功 → 删除记录
-    kv_delete(key)
-    return True, ""
+        return True, ""
 
 
 def is_verify_locked(email: str) -> Tuple[bool, int]:
@@ -732,6 +896,56 @@ def verify_user_email(email: str):
 
 # ── 管理员自动创建 ──────────────────────────────────────────────────────────────
 
+def _consume_validated_code_and_update_user(
+    email: str, purpose: str, update_user,
+):
+    key = f"{VERIFY_PREFIX}{_normalize_email(email)}"
+    try:
+        with kv_transaction(immediate=True):
+            record = _database.kv_get(key, None)
+            if not isinstance(record, dict) or not record.get("validated"):
+                raise ValueError("verification code has not been validated")
+            if record.get("purpose") != purpose:
+                raise ValueError("verification code purpose mismatch")
+            user = get_user_by_email(email)
+            if not user:
+                raise ValueError("user does not exist")
+            update_user(user)
+            _save_user(user)
+            kv_delete(key)
+            return user
+    except Exception:
+        # Validation is a reservation, not consumption.  Release it after a
+        # failed terminal write so the same code can be safely retried.
+        try:
+            with kv_transaction(immediate=True):
+                record = _database.kv_get(key, None)
+                if isinstance(record, dict) and record.get("validated"):
+                    record["validated"] = False
+                    kv_set(key, record)
+        except Exception:
+            pass
+        raise
+
+
+def verify_user_email(email: str):
+    def apply(user):
+        user.email_verified = True
+
+    user = _consume_validated_code_and_update_user(email, "verify_email", apply)
+    audit_log("EMAIL_VERIFIED", user.username)
+
+
+def reset_password(email: str, new_password: str):
+    def apply(user):
+        user.password_hash = hash_password(new_password)
+        user.token_version += 1
+        user.email_verified = True
+
+    user = _consume_validated_code_and_update_user(email, "reset_password", apply)
+    audit_log("PASSWORD_RESET", user.username)
+
+
 def ensure_admin_user():
     """Ensure the initial admin exists without ever emitting its password."""
     admin_username = os.environ.get("ADMIN_USERNAME", "admin")
@@ -754,6 +968,19 @@ def ensure_admin_user():
 # ── FastAPI 依赖注入 ────────────────────────────────────────────────────────────
 
 security = HTTPBearer(auto_error=False)
+
+
+def get_mcp_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Depends(security),
+) -> UserModel:
+    """Authenticate only dedicated MCP bearer tokens."""
+    if not credentials:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="MCP access token required",
+            headers={"WWW-Authenticate": "Bearer"},
+        )
+    return authenticate_mcp_token(credentials.credentials)
 
 # Cookie 名称（与登录时 Set-Cookie 一致）
 AUTH_COOKIE_NAME = "auth_token"

@@ -713,10 +713,10 @@ def test_later_qc_round_adds_new_api_contract_error() -> None:
     assert _should_append_qc_issue(issue, is_first_qc=False) is True
 
 
-def test_later_qc_round_adds_new_functionality_error() -> None:
+def test_later_qc_round_does_not_expand_functionality_model_findings() -> None:
     issue = {"severity": "error", "layer": "functionality"}
 
-    assert _should_append_qc_issue(issue, is_first_qc=False) is True
+    assert _should_append_qc_issue(issue, is_first_qc=False) is False
 
 
 def test_later_qc_round_does_not_expand_llm_warning_baseline() -> None:

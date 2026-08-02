@@ -1,405 +1,345 @@
-/**
- * IDE 集成页面
- * 说明如何在 Trae / VSCode / Cursor / Claude Code 中调用本系统
- * 提供 MCP Server 配置、REST API 文档、使用流程
- */
+import React, { useEffect, useState } from 'react';
+import { Alert, Button, Card, Col, Input, List, message, Modal, Popconfirm, Row, Space, Tabs, Tag, Typography } from 'antd';
+import { ApiOutlined, CheckCircleOutlined, CopyOutlined, DeleteOutlined, EyeOutlined, KeyOutlined, PlusOutlined, SafetyOutlined } from '@ant-design/icons';
+import axios from 'axios';
 
-import React, { useState } from 'react';
-import {
-  Card, Tabs, Tag, Button, Alert,
-  Typography, Row, Col, message,
-} from 'antd';
-import {
-  CopyOutlined, CheckCircleOutlined, ApiOutlined,
-} from '@ant-design/icons';
+const { Paragraph, Text, Title } = Typography;
+const MCP_URL = 'https://metis-multiagent.up.railway.app/api/mcp';
+const API = '/api';
 
-const { Title, Text, Paragraph } = Typography;
+const brands = {
+  trae: { name: 'Trae', icon: 'https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/trae.svg', color: '#5b6cff' },
+  vscode: { name: 'VS Code', icon: 'https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/visualstudiocode.svg', color: '#007acc' },
+  cursor: { name: 'Cursor', icon: 'https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/cursor.svg', color: '#111827' },
+  claude: { name: 'Claude Code', icon: 'https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/anthropic.svg', color: '#d97757' },
+  codex: { name: 'Codex', icon: 'https://cdn.jsdelivr.net/npm/simple-icons@latest/icons/openai.svg', color: '#10a37f' },
+} as const;
 
-const API_BASE = 'http://localhost:8000';
+type BrandKey = keyof typeof brands;
 
-// 代码块组件
-const CodeBlock: React.FC<{ code: string; lang?: string }> = ({ code, lang = 'json' }) => {
-  const handleCopy = () => {
-    navigator.clipboard.writeText(code);
-    message.success('已复制到剪贴板');
-  };
+interface MCPTokenItem {
+  token_id: string;
+  name: string;
+  masked_token: string;
+  created_at: number;
+}
+
+const Brand: React.FC<{ type: BrandKey; compact?: boolean }> = ({ type, compact }) => {
+  const brand = brands[type];
   return (
-    <div className="relative bg-gray-900 rounded-lg p-4 my-2">
-      <Button
-        size="small"
-        icon={<CopyOutlined />}
-        className="absolute top-2 right-2 text-gray-400 border-gray-600"
-        onClick={handleCopy}
-        style={{ backgroundColor: 'transparent', color: '#9ca3af', borderColor: '#4b5563' }}
-      >
-        复制
-      </Button>
-      <pre className="text-green-400 text-xs overflow-x-auto whitespace-pre-wrap m-0 pr-16">
-        {code}
-      </pre>
-    </div>
+    <Space size={8}>
+      <span style={{ width: compact ? 22 : 30, height: compact ? 22 : 30, borderRadius: 7, background: '#fff', border: '1px solid #e5e7eb', display: 'grid', placeItems: 'center', overflow: 'hidden' }}>
+        <img src={brand.icon} alt={`${brand.name} logo`} style={{ width: '72%', height: '72%', objectFit: 'contain' }} />
+      </span>
+      <Text strong style={{ color: compact ? undefined : brand.color }}>{brand.name}</Text>
+    </Space>
   );
 };
 
+const CodeBlock: React.FC<{ code: string }> = ({ code }) => (
+  <div style={{ position: 'relative', marginTop: 10, padding: '18px 16px', borderRadius: 12, background: '#111827' }}>
+    <Button
+      size="small"
+      icon={<CopyOutlined />}
+      onClick={() => navigator.clipboard.writeText(code).then(() => message.success('配置已复制'))}
+      style={{ position: 'absolute', top: 10, right: 10, color: '#cbd5e1', borderColor: '#475569', background: '#1f2937' }}
+    >
+      复制
+    </Button>
+    <pre style={{ margin: 0, paddingRight: 70, overflowX: 'auto', whiteSpace: 'pre-wrap', color: '#86efac', fontSize: 12, lineHeight: 1.7 }}>{code}</pre>
+  </div>
+);
+
+const httpConfig = JSON.stringify({
+  mcpServers: {
+    metis: {
+      url: MCP_URL,
+      headers: { Authorization: 'Bearer <METIS_ACCESS_TOKEN>' },
+    },
+  },
+}, null, 2);
+
+const vscodeConfig = JSON.stringify({
+  servers: {
+    metis: {
+      type: 'http',
+      url: MCP_URL,
+      headers: { Authorization: 'Bearer ${input:metisToken}' },
+    },
+  },
+  inputs: [{
+    type: 'promptString',
+    id: 'metisToken',
+    description: 'METIS access token',
+    password: true,
+  }],
+}, null, 2);
+
+const codexConfig = `[mcp_servers.metis]
+url = "${MCP_URL}"
+bearer_token_env_var = "METIS_ACCESS_TOKEN"`;
+
+const configPanel = (type: BrandKey, path: string, config = httpConfig) => (
+  <div style={{ display: 'grid', gap: 16 }}>
+    <Alert
+      type="info"
+      showIcon
+      message={<Brand type={type} compact />}
+      description={<>在 <code>{path}</code> 中加入以下远程 MCP 配置，然后重启客户端。</>}
+    />
+    <Card size="small" title="远程 MCP 配置"><CodeBlock code={config} /></Card>
+    <Alert type="warning" showIcon message="令牌不是大模型 API Key" description="请使用你的 METIS 登录访问令牌替换占位符；不要把令牌提交到 Git。" />
+  </div>
+);
+
 const IdeIntegration: React.FC = () => {
   const [activeTab, setActiveTab] = useState('overview');
+  const [tokens, setTokens] = useState<MCPTokenItem[]>([]);
+  const [createdToken, setCreatedToken] = useState('');
+  const [revealedToken, setRevealedToken] = useState('');
+  const [createOpen, setCreateOpen] = useState(false);
+  const [createName, setCreateName] = useState('');
+  const [revealTarget, setRevealTarget] = useState<MCPTokenItem | null>(null);
+  const [password, setPassword] = useState('');
+  const [tokenLoading, setTokenLoading] = useState(false);
 
-  // MCP Server 配置
-  const mcpConfig = JSON.stringify({
-    "mcpServers": {
-      "multimind": {
-        "url": "http://localhost:8000/mcp",
-        "description": "MultiMind - Multi-AI Agent Project Management System",
-        "tools": [
-          "create_project", "analyze_requirements", "get_progress",
-          "list_agents", "import_skill", "push_to_gitee"
-        ]
-      }
-    }
-  }, null, 2);
-
-  // Trae 配置
-  const traeConfig = JSON.stringify({
-    "ai.agent.endpoint": "http://localhost:8000",
-    "ai.agent.systemName": "MultiMind",
-    "ai.agent.autoConnect": true
-  }, null, 2);
-
-  // VSCode settings.json
-  const vscodeConfig = JSON.stringify({
-    "aiAgentSystem.endpoint": "http://localhost:8000",
-    "aiAgentSystem.autoSave": true,
-    "aiAgentSystem.defaultModel": "gpt-4o"
-  }, null, 2);
-
-  // REST API 示例
-  const apiExamples = {
-    createProject: `# 创建项目
-curl -X POST ${API_BASE}/projects \\
-  -H "Content-Type: application/json" \\
-  -d '{"name": "我的项目", "description": "项目描述"}'`,
-
-    analyzeReq: `# PM Agent 分析需求
-curl -X POST ${API_BASE}/projects/{project_id}/analyze \\
-  -H "Content-Type: application/json" \\
-  -d '{"requirements": "开发一个电商平台，需要用户管理、商品管理、订单系统"}'`,
-
-    getProgress: `# 查询项目进度
-curl ${API_BASE}/projects/{project_id}/progress`,
-
-    listAgents: `# 查看员工池（所有项目的 Agent）
-curl ${API_BASE}/agents`,
-
-    pushGitee: `# 手动推送到 Gitee
-curl -X POST ${API_BASE}/gitee/push \\
-  -H "Content-Type: application/json" \\
-  -d '{"commit_message": "项目数据备份"}'`,
+  const clearSensitiveToken = () => {
+    setCreatedToken('');
+    setRevealedToken('');
+    setPassword('');
+    setRevealTarget(null);
   };
 
-  // 使用流程步骤
-  const workflowSteps = [
-    {
-      title: '启动系统',
-      description: '在终端运行后端服务',
-      code: 'cd ai-agent-system/backend\npython main.py',
-    },
-    {
-      title: '在 IDE 中打开项目',
-      description: '用 Trae/VSCode/Cursor 打开你的开发项目',
-      code: 'code /path/to/your/project\n# 或在 Trae 中直接打开',
-    },
-    {
-      title: '通过 REST API 创建项目',
-      description: '在 IDE 终端中调用 API，或通过 Web UI 操作',
-      code: apiExamples.createProject,
-    },
-    {
-      title: '与 PM Agent 对话',
-      description: '描述需求，PM Agent 自动生成规划书和子项目',
-      code: apiExamples.analyzeReq,
-    },
-    {
-      title: '查看进度 / 与 Supervisor 对话',
-      description: '监控执行进度，处理阻塞，触发质检',
-      code: apiExamples.getProgress,
-    },
-    {
-      title: '保存 / 推送到 Gitee',
-      description: '手动触发数据备份，不会自动提交',
-      code: apiExamples.pushGitee,
-    },
-  ];
+  const loadTokens = async () => {
+    const { data } = await axios.get(`${API}/mcp/tokens`);
+    setTokens(Array.isArray(data.tokens) ? data.tokens : []);
+  };
 
-  const tabItems = [
+  useEffect(() => {
+    loadTokens().catch(() => message.error('MCP Token 列表加载失败'));
+    const hideSensitiveToken = () => {
+      if (document.hidden) clearSensitiveToken();
+    };
+    document.addEventListener('visibilitychange', hideSensitiveToken);
+    window.addEventListener('blur', clearSensitiveToken);
+    return () => {
+      document.removeEventListener('visibilitychange', hideSensitiveToken);
+      window.removeEventListener('blur', clearSensitiveToken);
+    };
+  }, []);
+
+  useEffect(() => clearSensitiveToken(), [activeTab]);
+
+  const generateToken = async () => {
+    const name = createName.trim();
+    if (!name) {
+      message.warning('请输入 Token 名称');
+      return;
+    }
+    setTokenLoading(true);
+    try {
+      const { data } = await axios.post(`${API}/mcp/tokens`, { name });
+      setCreatedToken(data.token);
+      setCreateOpen(false);
+      setCreateName('');
+      await loadTokens();
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || 'MCP Token 生成失败');
+    } finally {
+      setTokenLoading(false);
+    }
+  };
+
+  const revealToken = async () => {
+    if (!revealTarget || !password) return;
+    setTokenLoading(true);
+    try {
+      const { data } = await axios.post(`${API}/mcp/tokens/${revealTarget.token_id}/reveal`, { password });
+      setRevealedToken(data.token);
+      setPassword('');
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || 'Token 查看失败');
+    } finally {
+      setTokenLoading(false);
+    }
+  };
+
+  const revokeToken = async (tokenId: string) => {
+    try {
+      await axios.delete(`${API}/mcp/tokens/${tokenId}`);
+      clearSensitiveToken();
+      await loadTokens();
+      message.success('MCP Token 已撤销');
+    } catch (error: any) {
+      message.error(error?.response?.data?.detail || 'MCP Token 撤销失败');
+    }
+  };
+
+  const items = [
     {
       key: 'overview',
-      label: '📋 使用流程',
+      label: '接入说明',
       children: (
-        <div className="space-y-4">
+        <div style={{ display: 'grid', gap: 18 }}>
           <Alert
-            message="系统定位"
-            description="本系统作为后端服务运行，配合 Trae / VSCode / Cursor / Claude Code 等 IDE 使用。IDE 负责代码编写，本系统负责项目管理、Agent 调度和流程控制。"
-            type="info"
-            showIcon
-          />
-          <div className="space-y-3">
-            {workflowSteps.map((step, i) => (
-              <Card key={i} size="small">
-                <div className="flex items-start gap-3">
-                  <div className="w-7 h-7 rounded-full bg-blue-500 text-white flex items-center justify-center text-sm font-bold flex-shrink-0">
-                    {i + 1}
-                  </div>
-                  <div className="flex-1">
-                    <div className="font-medium text-sm">{step.title}</div>
-                    <div className="text-xs text-gray-500 mb-1">{step.description}</div>
-                    <CodeBlock code={step.code} lang="bash" />
-                  </div>
-                </div>
-              </Card>
-            ))}
-          </div>
-        </div>
-      ),
-    },
-    {
-      key: 'trae',
-      label: '🔧 Trae',
-      children: (
-        <div className="space-y-4">
-          <Alert
-            message="Trae 集成方式"
-            description="Trae 支持通过 MCP Server 协议直接调用本系统的工具，也可以通过 REST API 在终端中调用。"
-            type="info"
-            showIcon
-          />
-          <Card title="方式一：MCP Server 配置" size="small">
-            <Paragraph className="text-sm text-gray-600">
-              在 Trae 的 MCP 配置文件中添加以下内容（通常在 <code>~/.trae/mcp.json</code> 或设置面板中）：
-            </Paragraph>
-            <CodeBlock code={mcpConfig} />
-            <Alert
-              message="注意：MCP Server 端点需要后端实现 /mcp 路由（当前版本使用 REST API 方式）"
-              type="warning"
-              showIcon
-              className="mt-2"
-            />
-          </Card>
-          <Card title="方式二：在 Trae 终端中使用 REST API" size="small">
-            <Paragraph className="text-sm text-gray-600">
-              直接在 Trae 内置终端中运行 curl 命令，或让 Trae 的 AI 助手调用 API：
-            </Paragraph>
-            <CodeBlock code={apiExamples.createProject} lang="bash" />
-            <CodeBlock code={apiExamples.analyzeReq} lang="bash" />
-          </Card>
-          <Card title="方式三：Trae 设置（如支持）" size="small">
-            <CodeBlock code={traeConfig} />
-          </Card>
-        </div>
-      ),
-    },
-    {
-      key: 'vscode',
-      label: '💙 VSCode / Cursor',
-      children: (
-        <div className="space-y-4">
-          <Alert
-            message="VSCode / Cursor 集成方式"
-            description="通过内置终端调用 REST API，或安装扩展（如 REST Client）直接发送请求。Cursor 的 AI 功能可以直接读取 API 响应并辅助开发。"
-            type="info"
-            showIcon
-          />
-          <Card title="settings.json 配置" size="small">
-            <Paragraph className="text-sm text-gray-600">
-              在 VSCode/Cursor 的 <code>.vscode/settings.json</code> 中添加：
-            </Paragraph>
-            <CodeBlock code={vscodeConfig} />
-          </Card>
-          <Card title="REST Client 扩展（推荐）" size="small">
-            <Paragraph className="text-sm text-gray-600">
-              安装 <strong>REST Client</strong> 扩展后，创建 <code>api.http</code> 文件：
-            </Paragraph>
-            <CodeBlock code={`### 创建项目
-POST http://localhost:8000/projects
-Content-Type: application/json
-
-{
-  "name": "我的项目",
-  "description": "项目描述"
-}
-
-### PM Agent 分析需求
-POST http://localhost:8000/projects/{{project_id}}/analyze
-Content-Type: application/json
-
-{
-  "requirements": "开发一个电商平台"
-}
-
-### 查看进度
-GET http://localhost:8000/projects/{{project_id}}/progress
-
-### 查看员工池
-GET http://localhost:8000/agents`} lang="http" />
-          </Card>
-          <Card title="Cursor AI 提示词模板" size="small">
-            <Paragraph className="text-sm text-gray-600">
-              在 Cursor 中使用以下提示词让 AI 自动调用本系统：
-            </Paragraph>
-            <CodeBlock code={`你是一个项目管理助手，可以通过 REST API 调用 AI Agent 系统（http://localhost:8000）。
-当用户描述项目需求时：
-1. 先调用 POST /projects 创建项目
-2. 再调用 POST /projects/{id}/analyze 分析需求
-3. 最后展示规划结果
-
-系统 API 文档：http://localhost:8000/docs`} lang="text" />
-          </Card>
-        </div>
-      ),
-    },
-    {
-      key: 'claude',
-      label: '🤖 Claude Code',
-      children: (
-        <div className="space-y-4">
-          <Alert
-            message="Claude Code 集成方式"
-            description="Claude Code 支持通过 MCP 协议调用外部工具，也可以在对话中直接使用 bash 工具调用 REST API。"
-            type="info"
-            showIcon
-          />
-          <Card title="MCP 配置（~/.claude/mcp.json）" size="small">
-            <CodeBlock code={mcpConfig} />
-          </Card>
-          <Card title="在 Claude Code 对话中使用" size="small">
-            <Paragraph className="text-sm text-gray-600">
-              直接告诉 Claude Code 调用 API：
-            </Paragraph>
-            <CodeBlock code={`# 在 Claude Code 中输入：
-请帮我创建一个项目，调用 http://localhost:8000/projects，
-项目名称是"电商平台"，描述是"B2C 电商系统"。
-然后分析需求：需要用户管理、商品管理、订单系统、支付集成。`} lang="text" />
-          </Card>
-          <Card title="CLAUDE.md 项目配置" size="small">
-            <Paragraph className="text-sm text-gray-600">
-              在项目根目录创建 <code>CLAUDE.md</code>，让 Claude Code 自动了解系统：
-            </Paragraph>
-            <CodeBlock code={`# AI Agent System 集成
-
-## 系统地址
-- 后端 API: http://localhost:8000
-- API 文档: http://localhost:8000/docs
-- Web UI: http://localhost:5173
-
-## 常用操作
-- 创建项目: POST /projects
-- 分析需求: POST /projects/{id}/analyze  
-- 查看进度: GET /projects/{id}/progress
-- 员工池: GET /agents
-- 推送 Gitee: POST /gitee/push
-
-## 注意事项
-- 不要自动推送到 Gitee，需要用户手动确认
-- 每个项目的 Agent 记忆独立，不要混用 project_id`} lang="markdown" />
-          </Card>
-        </div>
-      ),
-    },
-    {
-      key: 'codex',
-      label: 'Codex 🤖',
-      children: (
-        <div className="space-y-4">
-          <Card title="MCP 服务器配置" size="small">
-            <p>在 Codex 中配置以下 MCP Server 即可调用本系统：</p>
-            <CodeBlock code={JSON.stringify({mcpServers:{metis:{url:"http://localhost:8000/mcp"}}}, null, 2)} />
-          </Card>
-        </div>
-      ),
-    },
-    {
-      key: 'api',
-      label: '📡 REST API',
-      children: (
-        <div className="space-y-4">
-          <Alert
-            message={<span>完整 API 文档：<a href={`${API_BASE}/docs`} target="_blank" rel="noreferrer">{API_BASE}/docs</a>（Swagger UI）</span>}
             type="success"
             showIcon
-            icon={<ApiOutlined />}
+            icon={<CheckCircleOutlined />}
+            message="METIS MCP 服务已上线"
+            description={<><Text>远程地址：</Text><Text copyable code>{MCP_URL}</Text></>}
           />
-          <Row gutter={16}>
-            {[
-              { title: '项目管理', apis: [
-                { method: 'POST', path: '/projects', desc: '创建项目' },
-                { method: 'GET', path: '/projects', desc: '列出所有项目' },
-                { method: 'DELETE', path: '/projects/{id}', desc: '删除项目' },
-              ]},
-              { title: 'PM Agent', apis: [
-                { method: 'POST', path: '/projects/{id}/analyze', desc: '分析需求' },
-                { method: 'POST', path: '/projects/{id}/plan/generate', desc: '生成规划书' },
-                { method: 'GET', path: '/projects/{id}/subprojects', desc: '获取子项目' },
-              ]},
-              { title: '员工池', apis: [
-                { method: 'GET', path: '/agents', desc: '所有 Agent（按项目）' },
-                { method: 'PUT', path: '/agents/{id}/config', desc: '配置 Agent API' },
-                { method: 'DELETE', path: '/agents/{id}/config', desc: '重置 Agent API' },
-              ]},
-              { title: '数据 & Gitee', apis: [
-                { method: 'POST', path: '/data/save', desc: '手动保存到本地' },
-                { method: 'POST', path: '/data/snapshot', desc: '创建快照' },
-                { method: 'POST', path: '/gitee/push', desc: '手动推送到 Gitee' },
-                { method: 'GET', path: '/gitee/status', desc: '查看 Gitee 状态' },
-              ]},
-            ].map(group => (
-              <Col span={12} key={group.title}>
-                <Card title={group.title} size="small" className="mb-3">
-                  {group.apis.map(api => (
-                    <div key={api.path} className="flex items-center gap-2 py-1 border-b last:border-0">
-                      <Tag
-                        color={api.method === 'GET' ? 'green' : api.method === 'POST' ? 'blue' : api.method === 'DELETE' ? 'red' : 'orange'}
-                        className="text-xs w-14 text-center"
-                      >
-                        {api.method}
-                      </Tag>
-                      <code className="text-xs text-gray-600 flex-1">{api.path}</code>
-                      <span className="text-xs text-gray-400">{api.desc}</span>
-                    </div>
-                  ))}
+          <Card
+            title="访问令牌"
+            extra={<Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>新建 Token</Button>}
+            style={{ borderRadius: 14 }}
+          >
+            <List
+              locale={{ emptyText: '尚未创建 MCP Token' }}
+              dataSource={tokens}
+              renderItem={item => (
+                <List.Item
+                  actions={[
+                    <Button key="view" type="link" icon={<EyeOutlined />} onClick={() => {
+                      clearSensitiveToken();
+                      setRevealTarget(item);
+                    }}>查看</Button>,
+                    <Popconfirm
+                      key="revoke"
+                      title="撤销这个 Token？"
+                      description="使用它的客户端将立即断开。"
+                      okText="撤销"
+                      cancelText="取消"
+                      onConfirm={() => revokeToken(item.token_id)}
+                    >
+                      <Button type="link" danger icon={<DeleteOutlined />}>撤销</Button>
+                    </Popconfirm>,
+                  ]}
+                >
+                  <List.Item.Meta
+                    title={<Space><Text strong>{item.name}</Text><Tag>••••{item.masked_token.slice(-4)}</Tag></Space>}
+                    description={`创建于 ${new Date(item.created_at * 1000).toLocaleString()}`}
+                  />
+                </List.Item>
+              )}
+            />
+            <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>
+              Token 相互独立，可分别用于不同客户端；查看完整 Token 时需要重新验证账户密码。
+            </Paragraph>
+          </Card>
+          <Row gutter={[14, 14]}>
+            {(Object.keys(brands) as BrandKey[]).map(key => (
+              <Col xs={24} sm={12} lg={8} key={key}>
+                <Card hoverable onClick={() => setActiveTab(key)} style={{ borderRadius: 14, height: '100%' }}>
+                  <Brand type={key} />
+                  <Paragraph type="secondary" style={{ margin: '12px 0 0' }}>查看配置并连接 METIS 工具。</Paragraph>
                 </Card>
               </Col>
             ))}
           </Row>
+          <Card title="可用工具" style={{ borderRadius: 14 }}>
+            <Space wrap>
+              <Tag color="blue">task_execute · 项目与任务操作</Tag>
+              <Tag color="purple">file_operate · 项目文件操作</Tag>
+              <Tag color="cyan">agent_query · 状态与进度查询</Tag>
+            </Space>
+          </Card>
+          <Alert type="info" showIcon icon={<SafetyOutlined />} message="权限说明" description="MCP 使用当前登录用户权限，项目与文件仍按账号隔离；服务不会继承 IDE 身份。" />
+        </div>
+      ),
+    },
+    { key: 'trae', label: <Brand type="trae" compact />, children: configPanel('trae', 'Trae 设置 → MCP') },
+    { key: 'vscode', label: <Brand type="vscode" compact />, children: configPanel('vscode', '.vscode/mcp.json', vscodeConfig) },
+    { key: 'cursor', label: <Brand type="cursor" compact />, children: configPanel('cursor', '.cursor/mcp.json') },
+    { key: 'claude', label: <Brand type="claude" compact />, children: configPanel('claude', '~/.claude/mcp.json') },
+    {
+      key: 'codex',
+      label: <Brand type="codex" compact />,
+      children: (
+        <div style={{ display: 'grid', gap: 16 }}>
+          <Alert type="info" showIcon message={<Brand type="codex" compact />} description={<>将配置写入 <code>~/.codex/config.toml</code>，并通过环境变量提供令牌。</>} />
+          <Card size="small" title="config.toml"><CodeBlock code={codexConfig} /></Card>
+          <Card size="small" title="PowerShell 会话变量"><CodeBlock code={'$env:METIS_ACCESS_TOKEN="<你的 METIS 登录访问令牌>"'} /></Card>
+          <Alert type="warning" showIcon message="不要把真实令牌写入 config.toml 或提交到仓库" />
         </div>
       ),
     },
   ];
 
   return (
-    <div className="space-y-4">
-      <div>
-        <h2 className="text-xl font-semibold m-0">IDE 集成</h2>
-        <div className="text-xs text-gray-400 mt-1">
-          配合 Trae / VSCode / Cursor / Claude Code 使用 · REST API 接入 · 流程化项目管理
-        </div>
+    <div style={{ maxWidth: 1050, margin: '0 auto' }}>
+      <div style={{ padding: '28px 30px', marginBottom: 20, borderRadius: 18, color: '#fff', background: 'linear-gradient(135deg, #111827, #1d4ed8 58%, #0891b2)' }}>
+        <Space align="start">
+          <ApiOutlined style={{ fontSize: 26, marginTop: 5 }} />
+          <div>
+            <Title level={2} style={{ color: '#fff', margin: 0 }}>MCP 服务</Title>
+            <Text style={{ color: 'rgba(255,255,255,.8)' }}>让开发工具安全调用 METIS 的项目、文件和 Agent 能力。</Text>
+          </div>
+        </Space>
       </div>
-
-      <div className="flex gap-2 flex-wrap">
-        {[
-          { label: 'Trae', color: '#1890ff' },
-          { label: 'VSCode', color: '#007acc' },
-          { label: 'Cursor', color: '#000' },
-          { label: 'Claude Code', color: '#d97706' },
-          { label: 'Codex', color: '#10b981' },
-        ].map(ide => (
-          <Tag key={ide.label} style={{ backgroundColor: ide.color, color: '#fff', border: 'none' }}>
-            {ide.label}
-          </Tag>
-        ))}
-        <Tag color="green" icon={<CheckCircleOutlined />}>REST API</Tag>
-        <Tag color="purple" icon={<ApiOutlined />}>MCP Protocol</Tag>
-      </div>
-
-      <Tabs activeKey={activeTab} onChange={setActiveTab} items={tabItems} />
+      <Tabs activeKey={activeTab} onChange={setActiveTab} items={items} tabBarGutter={20} />
+      <div style={{ marginTop: 14, color: '#94a3b8', fontSize: 12 }}><KeyOutlined /> 连接失败时，请先检查服务地址、登录令牌和客户端是否支持远程 HTTP MCP。</div>
+      <Modal
+        open={createOpen}
+        title="新建 MCP Token"
+        okText="生成"
+        cancelText="取消"
+        confirmLoading={tokenLoading}
+        onCancel={() => { setCreateOpen(false); setCreateName(''); }}
+        onOk={generateToken}
+      >
+        <Input
+          autoFocus
+          maxLength={64}
+          placeholder="例如：Trae 工作台"
+          value={createName}
+          onChange={event => setCreateName(event.target.value)}
+          onPressEnter={generateToken}
+        />
+      </Modal>
+      <Modal
+        open={Boolean(createdToken)}
+        title="请保存 MCP Token"
+        okText="复制并关闭"
+        cancelText="关闭"
+        onCancel={clearSensitiveToken}
+        onOk={() => navigator.clipboard.writeText(createdToken).then(() => {
+          message.success('Token 已复制');
+          clearSensitiveToken();
+        })}
+      >
+        <Alert type="warning" showIcon message="关闭、切页或窗口失焦后将自动隐藏。再次查看需要验证账户密码。" />
+        <CodeBlock code={createdToken} />
+      </Modal>
+      <Modal
+        open={Boolean(revealTarget)}
+        title={`查看 Token：${revealTarget?.name || ''}`}
+        okText={revealedToken ? '复制并关闭' : '验证密码'}
+        cancelText="关闭"
+        confirmLoading={tokenLoading}
+        onCancel={clearSensitiveToken}
+        onOk={() => {
+          if (!revealedToken) {
+            revealToken();
+            return;
+          }
+          navigator.clipboard.writeText(revealedToken).then(() => {
+            message.success('Token 已复制');
+            clearSensitiveToken();
+          });
+        }}
+      >
+        {revealedToken ? (
+          <CodeBlock code={revealedToken} />
+        ) : (
+          <Input.Password
+            autoFocus
+            placeholder="请输入当前账户密码"
+            value={password}
+            onChange={event => setPassword(event.target.value)}
+            onPressEnter={revealToken}
+          />
+        )}
+      </Modal>
     </div>
   );
 };

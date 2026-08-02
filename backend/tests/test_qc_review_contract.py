@@ -182,6 +182,28 @@ def test_result_must_cover_each_criterion_and_reference_packet_files():
         )
 
 
+def test_packet_bound_blocker_does_not_require_line_or_symbol():
+    packet = {
+        "tasks": [],
+        "files": [{"path": "frontend/package.json"}],
+        "dependency_files": [],
+    }
+
+    qc.validate_qc_review_result(
+        packet,
+        acceptance_observations=[],
+        issues=[{
+            "severity": "error",
+            "file": "frontend/package.json",
+            "message": "Build script is missing",
+            "expected": "A build script",
+            "actual": "No build script",
+            "evidence": "scripts.build is absent",
+            "fix_hint": "Add the Vite build script",
+        }],
+    )
+
+
 def test_supervisor_builds_packet_before_invoking_qc_agent(monkeypatch, tmp_path):
     (tmp_path / "src").mkdir()
     (tmp_path / "src" / "task.ts").write_text("export const ok = true;\n", "utf-8")

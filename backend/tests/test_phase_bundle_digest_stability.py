@@ -96,6 +96,7 @@ def test_receipt_digest_survives_real_artifact_evidence_rebuild(
     phase.update({
         "user_confirmed": True,
         "execution_artifact_baseline_digest": baseline_digest,
+        "execution_evidence_bundle": copy.deepcopy(first),
         "validated_completion_receipt": {
             "project_id": project_id,
             "phase_id": "phase-1",
@@ -111,7 +112,9 @@ def test_receipt_digest_survives_real_artifact_evidence_rebuild(
     monkeypatch.setattr(
         routes_phases,
         "_locked_phase_evidence_bundle",
-        lambda *_args: (assignments, second),
+        lambda *_args: (_ for _ in ()).throw(
+            AssertionError("accepted historical evidence must not be rebuilt")
+        ),
     )
     monkeypatch.setattr(
         routes_phases,

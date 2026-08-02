@@ -17,12 +17,13 @@ import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Iterable, List, Optional
 
 logger = logging.getLogger(__name__)
 
 # Sentinel object: distinguishes "caller passed no default" from "caller passed None"
 _SENTINEL = object()
+_kv_transaction_state = threading.local()
 
 DATABASE_URL = os.environ.get("DATABASE_URL", "")
 REQUIRE_DATABASE_URL = os.environ.get("REQUIRE_DATABASE_URL", "").lower() in {"1", "true", "yes"}
@@ -56,9 +57,12 @@ _pg_pool = None
 # no longer permanently latched; every bounded startup attempt may recover.
 _pg_unavailable = False
 _pg_pool_lock = threading.Lock()
+_sqlite_default_dir = os.environ.get("METIS_DATA_DIR") or os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "..", "data"
+)
 _sqlite_path = os.environ.get(
     "SQLITE_PATH",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "data", "dagent.db"),
+    os.path.join(_sqlite_default_dir, "dagent.db"),
 )
 
 
@@ -196,6 +200,33 @@ def get_conn():
             raise
         finally:
             conn.close()
+
+
+@contextmanager
+def kv_transaction(*, immediate: bool = False):
+    """Share one real database transaction across ordinary KV helpers."""
+    active = getattr(_kv_transaction_state, "conn", None)
+    if active is not None:
+        yield active
+        return
+    with get_conn() as conn:
+        if immediate and not _use_postgres():
+            conn.execute("BEGIN IMMEDIATE")
+        _kv_transaction_state.conn = conn
+        try:
+            yield conn
+        finally:
+            _kv_transaction_state.conn = None
+
+
+@contextmanager
+def _kv_connection():
+    active = getattr(_kv_transaction_state, "conn", None)
+    if active is not None:
+        yield active
+    else:
+        with get_conn() as conn:
+            yield conn
 
 
 # --- Table creation (idempotent, called once on startup) ---
@@ -498,6 +529,34 @@ MIGRATIONS = (
                 ON project_files(project_id, phase_id, task_id);
         """,
     ),
+    Migration(
+        version="0004",
+        name="phase_plan_commits",
+        sqlite_sql="""
+            CREATE TABLE IF NOT EXISTS phase_plan_commits (
+                project_id            TEXT NOT NULL,
+                phase_id              TEXT NOT NULL,
+                revision              INTEGER NOT NULL,
+                phase_json            TEXT NOT NULL,
+                project_contract_json TEXT NOT NULL,
+                updated_at            REAL NOT NULL,
+                PRIMARY KEY (project_id, phase_id),
+                CHECK (revision > 0)
+            );
+        """,
+        postgres_sql="""
+            CREATE TABLE IF NOT EXISTS phase_plan_commits (
+                project_id            VARCHAR(256) NOT NULL,
+                phase_id              VARCHAR(256) NOT NULL,
+                revision              INTEGER NOT NULL,
+                phase_json            TEXT NOT NULL,
+                project_contract_json TEXT NOT NULL,
+                updated_at            DOUBLE PRECISION NOT NULL,
+                PRIMARY KEY (project_id, phase_id),
+                CHECK (revision > 0)
+            );
+        """,
+    ),
 )
 
 _migration_lock = threading.RLock()
@@ -734,7 +793,7 @@ def kv_set(key: str, value: Any) -> None:
     """Store an arbitrary serializable object in kv_store"""
     serialized = json.dumps(value, ensure_ascii=False)
     now = time.time()
-    with get_conn() as conn:
+    with _kv_connection() as conn:
         cur = conn.cursor()
         if _use_postgres():
             cur.execute(
@@ -744,12 +803,18 @@ def kv_set(key: str, value: Any) -> None:
                 ON CONFLICT (key) DO UPDATE
                   SET value = EXCLUDED.value,
                       updated_at = EXCLUDED.updated_at
+                WHERE kv_store.value IS DISTINCT FROM EXCLUDED.value
                 """,
                 (key, serialized, now),
             )
         else:
             cur.execute(
-                "INSERT OR REPLACE INTO kv_store (key, value, updated_at) VALUES (?, ?, ?)",
+                """
+                INSERT INTO kv_store (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                WHERE kv_store.value <> excluded.value
+                """,
                 (key, serialized, now),
             )
 
@@ -760,7 +825,7 @@ def kv_many_set(values: Dict[str, Any]) -> None:
         return
     now = time.time()
     rows = [(key, json.dumps(value, ensure_ascii=False), now) for key, value in values.items()]
-    with get_conn() as conn:
+    with _kv_connection() as conn:
         cur = conn.cursor()
         if _use_postgres():
             cur.executemany(
@@ -770,12 +835,18 @@ def kv_many_set(values: Dict[str, Any]) -> None:
                 ON CONFLICT (key) DO UPDATE
                   SET value = EXCLUDED.value,
                       updated_at = EXCLUDED.updated_at
+                WHERE kv_store.value IS DISTINCT FROM EXCLUDED.value
                 """,
                 rows,
             )
         else:
             cur.executemany(
-                "INSERT OR REPLACE INTO kv_store (key, value, updated_at) VALUES (?, ?, ?)",
+                """
+                INSERT INTO kv_store (key, value, updated_at) VALUES (?, ?, ?)
+                ON CONFLICT(key) DO UPDATE SET
+                    value = excluded.value, updated_at = excluded.updated_at
+                WHERE kv_store.value <> excluded.value
+                """,
                 rows,
             )
 
@@ -787,7 +858,7 @@ def kv_get(key: str, default: Any = _SENTINEL) -> Any:
     None (not {}) when the key is absent.  The internal _SENTINEL allows
     distinguishing "caller passed no default" from "caller passed None".
     """
-    with get_conn() as conn:
+    with _kv_connection() as conn:
         cur = conn.cursor()
         if _use_postgres():
             cur.execute("SELECT value FROM kv_store WHERE key = %s", (key,))
@@ -805,7 +876,7 @@ def kv_get(key: str, default: Any = _SENTINEL) -> Any:
 
 def kv_delete(key: str) -> None:
     """Delete a key from kv_store"""
-    with get_conn() as conn:
+    with _kv_connection() as conn:
         cur = conn.cursor()
         if _use_postgres():
             cur.execute("DELETE FROM kv_store WHERE key = %s", (key,))
@@ -815,7 +886,7 @@ def kv_delete(key: str) -> None:
 
 def kv_keys_prefix(prefix: str):
     """List all keys starting with the given prefix"""
-    with get_conn() as conn:
+    with _kv_connection() as conn:
         cur = conn.cursor()
         # Avoid LIKE because %, _ and the escape character would otherwise
         # change the meaning of a literal KV prefix.
@@ -824,6 +895,334 @@ def kv_keys_prefix(prefix: str):
         else:
             cur.execute("SELECT key FROM kv_store WHERE substr(key, 1, ?) = ?", (len(prefix), prefix))
         return [row[0] for row in cur.fetchall()]
+
+
+def get_phase_plan_commit(project_id: str, phase_id: str) -> Optional[Dict[str, Any]]:
+    """Read the authoritative committed phase plan for one project phase."""
+    if not project_id or not phase_id:
+        raise ValueError("project_id and phase_id are required")
+    with get_conn() as conn:
+        cur = conn.cursor()
+        placeholder = "%s" if _use_postgres() else "?"
+        cur.execute(
+            "SELECT revision, phase_json, project_contract_json, updated_at "
+            f"FROM phase_plan_commits WHERE project_id = {placeholder} "
+            f"AND phase_id = {placeholder}",
+            (project_id, phase_id),
+        )
+        row = cur.fetchone()
+    if row is None:
+        return None
+    return {
+        "revision": int(row[0]),
+        "phase": json.loads(row[1]),
+        "project_contract": json.loads(row[2]),
+        "updated_at": float(row[3]),
+    }
+
+
+def list_phase_plan_commits() -> list[Dict[str, Any]]:
+    """List authoritative phase plans for state recovery."""
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            "SELECT project_id, phase_id, revision, phase_json, "
+            "project_contract_json, updated_at FROM phase_plan_commits"
+        )
+        rows = cur.fetchall()
+    return [
+        {
+            "project_id": str(row[0]),
+            "phase_id": str(row[1]),
+            "revision": int(row[2]),
+            "phase": json.loads(row[3]),
+            "project_contract": json.loads(row[4]),
+            "updated_at": float(row[5]),
+        }
+        for row in rows
+    ]
+
+
+def initialize_phase_plan_commit(
+    project_id: str,
+    phase_id: str,
+    revision: int,
+    phase: Dict[str, Any],
+    project_contract: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Atomically migrate one legacy persisted plan without renumbering it."""
+    if not project_id or not phase_id or revision <= 0:
+        raise ValueError("legacy phase plan requires a positive revision")
+    phase_payload = json.dumps(phase, ensure_ascii=False, sort_keys=True)
+    contract_payload = json.dumps(project_contract, ensure_ascii=False, sort_keys=True)
+    with get_conn() as conn:
+        cur = conn.cursor()
+        if _use_postgres():
+            lock_key = int.from_bytes(
+                hashlib.sha256(
+                    f"phase-plan\0{project_id}\0{phase_id}".encode("utf-8")
+                ).digest()[:8],
+                "big",
+                signed=True,
+            )
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+            cur.execute(
+                """
+                INSERT INTO phase_plan_commits
+                    (project_id, phase_id, revision, phase_json,
+                     project_contract_json, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (project_id, phase_id) DO NOTHING
+                """,
+                (project_id, phase_id, revision, phase_payload,
+                 contract_payload, time.time()),
+            )
+        else:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                """
+                INSERT INTO phase_plan_commits
+                    (project_id, phase_id, revision, phase_json,
+                     project_contract_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, phase_id) DO NOTHING
+                """,
+                (project_id, phase_id, revision, phase_payload,
+                 contract_payload, time.time()),
+            )
+    committed = get_phase_plan_commit(project_id, phase_id)
+    if committed is None:
+        raise RuntimeError("legacy phase plan migration did not persist")
+    return committed
+
+
+def compare_and_swap_phase_plan(
+    project_id: str,
+    phase_id: str,
+    expected_revision: int,
+    phase: Dict[str, Any],
+    project_contract: Dict[str, Any],
+    *,
+    phase_manager: Optional[Dict[str, Any]] = None,
+    _fault_hook: Optional[Callable[[str], None]] = None,
+) -> Dict[str, Any]:
+    """Atomically replace one phase plan iff its durable revision is expected.
+
+    SQLite serializes writers with BEGIN IMMEDIATE. PostgreSQL uses a
+    transaction-scoped advisory lock, including the initially absent row case.
+    The phase and ProjectContract are one transaction payload.
+    """
+    if not project_id or not phase_id or expected_revision < 0:
+        raise ValueError("valid project_id, phase_id and expected_revision are required")
+    new_revision = expected_revision + 1
+    phase_payload = json.dumps(phase, ensure_ascii=False, sort_keys=True)
+    contract_payload = json.dumps(project_contract, ensure_ascii=False, sort_keys=True)
+    now = time.time()
+    with get_conn() as conn:
+        cur = conn.cursor()
+        postgres = _use_postgres()
+        if postgres:
+            lock_key = int.from_bytes(
+                hashlib.sha256(
+                    f"phase-plan\0{project_id}\0{phase_id}".encode("utf-8")
+                ).digest()[:8],
+                "big",
+                signed=True,
+            )
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+            cur.execute(
+                "SELECT revision FROM phase_plan_commits "
+                "WHERE project_id = %s AND phase_id = %s FOR UPDATE",
+                (project_id, phase_id),
+            )
+        else:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute(
+                "SELECT revision FROM phase_plan_commits "
+                "WHERE project_id = ? AND phase_id = ?",
+                (project_id, phase_id),
+            )
+        row = cur.fetchone()
+        actual_revision = int(row[0]) if row is not None else 0
+        if actual_revision != expected_revision:
+            return {
+                "applied": False,
+                "expected_revision": expected_revision,
+                "actual_revision": actual_revision,
+            }
+        if _fault_hook is not None:
+            _fault_hook("before_write")
+        if postgres:
+            cur.execute(
+                """
+                INSERT INTO phase_plan_commits
+                    (project_id, phase_id, revision, phase_json,
+                     project_contract_json, updated_at)
+                VALUES (%s, %s, %s, %s, %s, %s)
+                ON CONFLICT (project_id, phase_id) DO UPDATE SET
+                    revision = EXCLUDED.revision,
+                    phase_json = EXCLUDED.phase_json,
+                    project_contract_json = EXCLUDED.project_contract_json,
+                    updated_at = EXCLUDED.updated_at
+                """,
+                (project_id, phase_id, new_revision, phase_payload,
+                 contract_payload, now),
+            )
+        else:
+            cur.execute(
+                """
+                INSERT INTO phase_plan_commits
+                    (project_id, phase_id, revision, phase_json,
+                     project_contract_json, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?)
+                ON CONFLICT(project_id, phase_id) DO UPDATE SET
+                    revision = excluded.revision,
+                    phase_json = excluded.phase_json,
+                    project_contract_json = excluded.project_contract_json,
+                    updated_at = excluded.updated_at
+                """,
+                (project_id, phase_id, new_revision, phase_payload,
+                 contract_payload, now),
+            )
+        if _fault_hook is not None:
+            _fault_hook("after_write")
+        if phase_manager is not None:
+            if postgres:
+                cur.execute(
+                    "SELECT value FROM kv_store WHERE key = %s FOR UPDATE",
+                    ("phase_managers",),
+                )
+            else:
+                cur.execute(
+                    "SELECT value FROM kv_store WHERE key = ?",
+                    ("phase_managers",),
+                )
+            managers_row = cur.fetchone()
+            managers = json.loads(managers_row[0]) if managers_row else {}
+            if not isinstance(managers, dict):
+                raise RuntimeError("persisted phase_managers must be an object")
+            managers[project_id] = phase_manager
+            managers_payload = json.dumps(managers, ensure_ascii=False, sort_keys=True)
+            if postgres:
+                cur.execute(
+                    """
+                    INSERT INTO kv_store (key, value, updated_at)
+                    VALUES (%s, %s, %s)
+                    ON CONFLICT (key) DO UPDATE SET
+                        value = EXCLUDED.value, updated_at = EXCLUDED.updated_at
+                    """,
+                    ("phase_managers", managers_payload, now),
+                )
+            else:
+                cur.execute(
+                    """
+                    INSERT INTO kv_store (key, value, updated_at)
+                    VALUES (?, ?, ?)
+                    ON CONFLICT(key) DO UPDATE SET
+                        value = excluded.value, updated_at = excluded.updated_at
+                    """,
+                    ("phase_managers", managers_payload, now),
+                )
+    return {
+        "applied": True,
+        "expected_revision": expected_revision,
+        "actual_revision": new_revision,
+    }
+
+
+def delete_idempotency_reservation(scope: str, actor_id: str, key: str) -> None:
+    """Release an uncompleted reservation after its business transaction aborts."""
+    storage_key = (
+        key if len(key) <= 256
+        else f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+    )
+    placeholder = "%s" if _use_postgres() else "?"
+    with get_conn() as conn:
+        cur = conn.cursor()
+        cur.execute(
+            f"DELETE FROM idempotency_records WHERE scope = {placeholder} "
+            f"AND actor_id = {placeholder} AND key = {placeholder} "
+            "AND status = 'reserved'",
+            (scope, actor_id, storage_key),
+        )
+
+
+def commit_project_with_idempotency(
+    project_id: str,
+    project: Dict[str, Any],
+    *,
+    scope: str,
+    actor_id: str,
+    key: str,
+    request_hash: str,
+    response: Dict[str, Any],
+) -> None:
+    """Atomically persist a project and complete its reserved request."""
+    storage_key = key if len(key) <= 256 else (
+        f"sha256:{hashlib.sha256(key.encode('utf-8')).hexdigest()}"
+    )
+    with get_conn() as conn:
+        cur = conn.cursor()
+        postgres = _use_postgres()
+        if postgres:
+            lock_key = int.from_bytes(
+                hashlib.sha256(b"projects-kv").digest()[:8], "big", signed=True
+            )
+            cur.execute("SELECT pg_advisory_xact_lock(%s)", (lock_key,))
+            cur.execute(
+                "SELECT value FROM kv_store WHERE key = %s FOR UPDATE", ("projects",)
+            )
+            projects_row = cur.fetchone()
+            cur.execute(
+                "SELECT request_hash, status FROM idempotency_records "
+                "WHERE scope=%s AND actor_id=%s AND key=%s FOR UPDATE",
+                (scope, actor_id, storage_key),
+            )
+        else:
+            cur.execute("BEGIN IMMEDIATE")
+            cur.execute("SELECT value FROM kv_store WHERE key = ?", ("projects",))
+            projects_row = cur.fetchone()
+            cur.execute(
+                "SELECT request_hash, status FROM idempotency_records "
+                "WHERE scope=? AND actor_id=? AND key=?",
+                (scope, actor_id, storage_key),
+            )
+        reservation = cur.fetchone()
+        if reservation is None or reservation[0] != request_hash or reservation[1] != "reserved":
+            raise RuntimeError("project idempotency reservation is not commit-ready")
+        persisted = json.loads(projects_row[0]) if projects_row else {}
+        if project_id in persisted:
+            raise RuntimeError("project id already exists")
+        persisted[project_id] = project
+        now = time.time()
+        projects_json = json.dumps(persisted, ensure_ascii=False, sort_keys=True)
+        response_json = json.dumps(response, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        if postgres:
+            cur.execute(
+                "INSERT INTO kv_store(key,value,updated_at) VALUES(%s,%s,%s) "
+                "ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value, updated_at=EXCLUDED.updated_at",
+                ("projects", projects_json, now),
+            )
+            cur.execute(
+                "UPDATE idempotency_records SET status='completed', resource_type=%s, "
+                "resource_id=%s, response_json=%s, error_code=NULL, updated_at=%s "
+                "WHERE scope=%s AND actor_id=%s AND key=%s AND request_hash=%s AND status='reserved'",
+                ("project", project_id, response_json, now, scope, actor_id, storage_key, request_hash),
+            )
+        else:
+            cur.execute(
+                "INSERT INTO kv_store(key,value,updated_at) VALUES(?,?,?) "
+                "ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at",
+                ("projects", projects_json, now),
+            )
+            cur.execute(
+                "UPDATE idempotency_records SET status='completed', resource_type=?, "
+                "resource_id=?, response_json=?, error_code=NULL, updated_at=? "
+                "WHERE scope=? AND actor_id=? AND key=? AND request_hash=? AND status='reserved'",
+                ("project", project_id, response_json, now, scope, actor_id, storage_key, request_hash),
+            )
+        if cur.rowcount != 1:
+            raise RuntimeError("project idempotency completion lost its reservation")
 
 
 def _project_file_path(value: Any) -> str:
@@ -1020,6 +1419,34 @@ def delete_project_files(project_id: str) -> None:
             f"DELETE FROM project_files WHERE project_id = {placeholder}",
             (project_id,),
         )
+
+
+def delete_phase_project_files(
+    project_id: str,
+    phase_id: str,
+    *,
+    retain_paths: Optional[Iterable[str]] = None,
+) -> int:
+    """Atomically remove durable file ownership for one reset phase."""
+    if not project_id or not phase_id:
+        raise ValueError("project_id and phase_id are required")
+    retained = {
+        _project_file_path(path) for path in (retain_paths or ())
+    }
+    with get_conn() as conn:
+        cur = conn.cursor()
+        placeholder = "%s" if _use_postgres() else "?"
+        sql = (
+            "DELETE FROM project_files "
+            f"WHERE project_id = {placeholder} AND phase_id = {placeholder}"
+        )
+        params: List[Any] = [project_id, phase_id]
+        if retained:
+            marks = ", ".join(placeholder for _ in retained)
+            sql += f" AND path NOT IN ({marks})"
+            params.extend(sorted(retained))
+        cur.execute(sql, tuple(params))
+        return max(int(cur.rowcount or 0), 0)
 
 
 def database_healthcheck() -> Dict[str, Any]:

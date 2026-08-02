@@ -12,9 +12,48 @@ from core.delivery_documents import (
     DeliveryContentionError,
     load_final_qa_scope,
     load_phase_qa_scope,
+    reconcile_phase_delivery_generation,
     record_successful_task_delivery,
     validate_delivery_write_intents,
 )
+
+
+def test_reconcile_phase_delivery_generation_retires_stale_unregistered_file(
+    tmp_path,
+):
+    plan = _phase_plan()
+    old_payload = b"old generation\n"
+    current_payload = b"current generation\n"
+    (tmp_path / "legacy.py").write_bytes(old_payload)
+    record_successful_task_delivery(
+        workspace=tmp_path, project_id="proj-generation", phase_id="phase-1",
+        phase_plan=plan, task_id="phase-1-task-1", agent_id="agent-old",
+        expert_id="expert-1", agent_role="backend", summary="old",
+        delivery_evidence=_evidence("legacy.py", old_payload), baseline_files={},
+    )
+    (tmp_path / "app.py").write_bytes(current_payload)
+    record_successful_task_delivery(
+        workspace=tmp_path, project_id="proj-generation", phase_id="phase-1",
+        phase_plan=plan, task_id="phase-1-task-2", agent_id="agent-current",
+        expert_id="expert-2", agent_role="backend", summary="current",
+        delivery_evidence=_evidence("app.py", current_payload), baseline_files={},
+    )
+    (tmp_path / "legacy.py").unlink()
+
+    retired = reconcile_phase_delivery_generation(
+        workspace=tmp_path,
+        project_id="proj-generation",
+        phase_id="phase-1",
+        current_agent_ids={"agent-current"},
+        registered_paths={"app.py"},
+    )
+    scope = load_phase_qa_scope(
+        project_id="proj-generation", phase_id="phase-1", workspace=tmp_path,
+    )
+
+    assert retired == ["legacy.py"]
+    assert scope["issues"] == []
+    assert [item["path"] for item in scope["files"]] == ["app.py"]
 
 
 class _SequencedModel:

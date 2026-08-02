@@ -118,12 +118,12 @@ def test_signoff_returns_fixed_completed_contract(monkeypatch, tmp_path):
 
     result = asyncio.run(routes_supervisor.sign_off(project.project_id))
 
-    assert result == {
-        "passed": True,
-        "status": "completed",
-        "artifact_sha256": compute_delivery_manifest(tmp_path)["artifact_sha256"],
-        "blockers": [],
-    }
+    assert result["passed"] is True
+    assert result["status"] == "completed"
+    assert result["artifact_sha256"] == compute_delivery_manifest(tmp_path)["artifact_sha256"]
+    assert result["blockers"] == []
+    assert result["receipt"]["schema_version"] == "metis/signoff-receipt/v1"
+    assert result["receipt"]["artifact_sha256"] == result["artifact_sha256"]
     assert persisted == ["completed"]
 
 
@@ -150,8 +150,10 @@ def test_signoff_status_is_read_only_and_idempotent(monkeypatch, tmp_path):
     first = asyncio.run(routes_supervisor.get_signoff_status(project.project_id))
     second = asyncio.run(routes_supervisor.sign_off(project.project_id))
 
-    assert first == second
     assert first["status"] == "completed"
+    assert first["receipt"] is None
+    assert second["status"] == "completed"
+    assert second["receipt"]["schema_version"] == "metis/signoff-receipt/v1"
 
 
 def test_signoff_blocks_invalid_authoritative_delivery_documents(

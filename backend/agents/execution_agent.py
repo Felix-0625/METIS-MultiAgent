@@ -736,11 +736,17 @@ class ExecutionAgent:
             normalized = rel_path.replace("\\", "/")
             if normalized.startswith("output/") or normalized.endswith(".log"):
                 continue
-            if policy_kind == "architecture_document":
+            if policy_kind in {"architecture_document", "documentation"}:
                 if (
-                    normalized.startswith("docs/architecture/")
-                    and p.suffix.lower() in {".md", ".txt"}
-                ):
+                    (
+                        policy_kind == "documentation"
+                        and normalized.startswith("docs/")
+                    )
+                    or (
+                        policy_kind == "architecture_document"
+                        and normalized.startswith("docs/architecture/")
+                    )
+                ) and p.suffix.lower() in {".md", ".txt"}:
                     result.append(rel_path)
                 continue
             if normalized.startswith("docs/") and p.suffix.lower() in (".md", ".txt"):
@@ -841,9 +847,14 @@ class ExecutionAgent:
         if missing_required:
             issues.append("Missing required delivery files: " + ", ".join(missing_required))
         if not deliverables:
-            if str(self.artifact_policy.get("kind") or "runnable") == "architecture_document":
+            policy_kind = str(self.artifact_policy.get("kind") or "runnable")
+            if policy_kind == "architecture_document":
                 issues.append(
                     "No architecture contract deliverable was written under docs/architecture/."
+                )
+            elif policy_kind == "documentation":
+                issues.append(
+                    "No documentation deliverable was written under docs/."
                 )
             else:
                 issues.append("No runnable/source deliverable was written. Expected real files such as index.html or src/*.")
@@ -855,7 +866,9 @@ class ExecutionAgent:
                 "missing_required_files": missing_required,
             }
 
-        if str(self.artifact_policy.get("kind") or "runnable") == "architecture_document":
+        if str(self.artifact_policy.get("kind") or "runnable") in {
+            "architecture_document", "documentation",
+        }:
             for rel_path in deliverables:
                 target = self.workspace / rel_path
                 if not target.is_file():
@@ -876,7 +889,14 @@ class ExecutionAgent:
                 "missing_required_files": missing_required,
             }
 
-        contract_text = description + "\n" + " ".join(str(item) for item in (tech_stack or []))
+        # This pre-QC gate validates only the explicit file contract and
+        # objective structural safety. Semantic requirements belong to the
+        # executor self-review and the later QC/QA stages; deriving hidden
+        # requirements from keywords here makes generation and validation
+        # disagree for arbitrary technologies.
+        description = ""
+        tech_stack = []
+        contract_text = ""
         desc_lower = contract_text.lower()
         expects_html = "html" in desc_lower or "index.html" in desc_lower or "单文件" in description
         expects_local_storage = "localstorage" in desc_lower
@@ -1003,47 +1023,6 @@ class ExecutionAgent:
             and not any((self.workspace / "frontend").glob("tsconfig*.json"))
         ):
             issues.append("TypeScript was required, but no frontend tsconfig*.json was delivered.")
-        fastapi_source_in_scope = any(self._path_is_allowed(path) for path in (
-            "backend/main.py",
-            "backend/src/main.py",
-            "backend/app/main.py",
-        ))
-        if "fastapi" in desc_lower and fastapi_source_in_scope:
-            backend_python = [
-                path for path in normalized_deliverables
-                if path.startswith("backend/") and path.endswith(".py")
-            ]
-            backend_javascript = [
-                path for path in normalized_deliverables
-                if path.startswith("backend/")
-                and (path.endswith((".js", ".jsx", ".ts", ".tsx")) or path == "backend/package.json")
-            ]
-            if not backend_python:
-                issues.append(
-                    "FastAPI (Python) was required, but no Python backend source file was delivered."
-                )
-            if backend_javascript:
-                issues.append(
-                    "FastAPI was required, but JavaScript/TypeScript backend files were delivered: "
-                    + ", ".join(backend_javascript[:5])
-                )
-
-        expects_pytest = "pytest" in desc_lower or "testclient" in desc_lower
-        pytest_in_scope = any(self._path_is_allowed(path) for path in (
-            "backend/tests/test_app.py",
-            "tests/test_app.py",
-        ))
-        if expects_pytest and pytest_in_scope:
-            python_tests = [
-                path for path in normalized_deliverables
-                if path.endswith(".py")
-                and ("/tests/" in f"/{path}" or Path(path).name.startswith("test_"))
-            ]
-            if not python_tests:
-                issues.append(
-                    "pytest/FastAPI TestClient coverage was required, but no Python test file was delivered."
-                )
-
         html_files = [f for f in deliverables if f.lower().endswith(".html")]
         html_in_scope = any(self._path_is_allowed(path) for path in (
             "index.html",
@@ -2098,6 +2077,11 @@ DELIVERABLE CONTRACT:
                 "- Return JSON: {\"files\":[{\"path\":\"...\",\"content\":\"...\"}],\"complete\":true}.\n"
                 "- For single-file HTML tasks, path must be index.html.\n"
                 "- Output must be complete and directly runnable.\n"
+                "- Before returning, perform your own delivery review against the complete "
+                "locked task, technologies, acceptance criteria, existing project context, "
+                "and explicit required-file list. Add every source/config/test file needed "
+                "for a coherent implementation; an empty explicit list does not mean that "
+                "no files are needed. Return only after that self-review passes.\n"
             )
 
         if is_fix_task and self.allowed_path_prefixes:

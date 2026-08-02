@@ -1,4 +1,5 @@
 """项目管理系统路由"""
+import asyncio
 import time
 import uuid
 from fastapi import APIRouter, HTTPException, Depends, Header
@@ -15,7 +16,7 @@ from models.schemas import (
 )
 from core.auth import get_current_user, UserModel
 from core.execution_runs import IdempotencyConflict, IdempotencyStore
-from core.database import delete_project_files
+from core.database import commit_project_with_idempotency, delete_idempotency_reservation, delete_project_files
 
 router = APIRouter(tags=["projects"])
 _idempotency = IdempotencyStore()
@@ -29,7 +30,12 @@ async def _create_project_once(request: ProjectRequest, current_user: UserModel)
         global_sm_agent=get_user_sm_agent(current_user.user_id),
     )
     projects[project_id] = ctx
-    await _persist_all_async()
+    try:
+        await _persist_all_async()
+    except Exception:
+        if projects.get(project_id) is ctx:
+            projects.pop(project_id, None)
+        raise
     return {
         **ctx.to_dict(),
         "project_id": project_id,
@@ -42,6 +48,22 @@ async def _create_project_once(request: ProjectRequest, current_user: UserModel)
         },
         "message": f"项目 {request.name} 已创建，独立 Agent 团队已就绪"
     }
+
+
+def _new_project_response(request: ProjectRequest, current_user: UserModel):
+    project_id = f"proj-{uuid.uuid4().hex[:6]}"
+    ctx = ProjectContext(
+        project_id, request.name, request.description,
+        owner_user_id=current_user.user_id, hermes_client=hermes_client,
+        global_sm_agent=get_user_sm_agent(current_user.user_id),
+    )
+    response = {
+        **ctx.to_dict(), "project_id": project_id,
+        "agents": {"pm": ctx.pm.agent_id, "hr": ctx.hr.agent_id, "pg": ctx.pg.agent_id,
+                   "supervisor": ctx.supervisor.agent_id, "ccb": ctx.ccb.agent_id},
+        "message": f"项目 {request.name} 已创建，独立 Agent 团队已就绪",
+    }
+    return project_id, ctx, response
 
 @router.post("/projects")
 async def create_project(
@@ -73,21 +95,22 @@ async def create_project(
         )
 
     try:
-        response = await _create_project_once(request, current_user)
-        _idempotency.complete(
-            "projects.create", current_user.user_id, idempotency_key, payload,
-            resource_type="project", resource_id=response["project_id"], response=response,
+        project_id, ctx, response = _new_project_response(request, current_user)
+        await asyncio.to_thread(
+            commit_project_with_idempotency,
+            project_id, ctx.to_persist(), scope="projects.create",
+            actor_id=current_user.user_id, key=idempotency_key,
+            request_hash=_idempotency.hash_request(payload), response=response,
         )
+        projects[project_id] = ctx
         return response
     except Exception:
         try:
-            _idempotency.fail(
-                "projects.create", current_user.user_id, idempotency_key, payload,
-                error_code="project_creation_failed",
-                response={"detail": "project creation failed"},
+            delete_idempotency_reservation(
+                "projects.create", current_user.user_id, idempotency_key,
             )
         except Exception:
-            logger.exception("Failed to persist project idempotency failure")
+            logger.exception("Failed to release project idempotency reservation")
         raise
 
 
@@ -116,6 +139,12 @@ async def delete_project(project_id: str):
     if project_id not in projects:
         raise HTTPException(status_code=404, detail="项目不存在")
     ctx = projects[project_id]  # 先拿到上下文，获取 agent ID 列表
+    from core.llm_usage import archive_project_llm_usage
+    archive_project_llm_usage(
+        user_id=str(getattr(ctx, "owner_user_id", "") or ""),
+        project_id=project_id,
+        project_name=ctx.name,
+    )
     del projects[project_id]
     # 清理关联的全局状态（防内存泄漏）
     from core.orchestrator import remove_orchestrator

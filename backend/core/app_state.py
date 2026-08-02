@@ -193,6 +193,32 @@ def _restore_workspace(ctx: ProjectContext, snapshot: Dict[str, str]) -> None:
             logger.warning("Failed to restore workspace file %s: %s", relative, exc)
 
 
+def _authoritative_workspace_snapshot(
+    snapshot: Dict[str, str],
+    authoritative_files: Dict[str, Dict[str, Any]],
+) -> Dict[str, str]:
+    """Prefer legacy CRLF delivery-doc bytes only when LF bytes are identical."""
+    restored: Dict[str, str] = {}
+    generated_paths = {"docs/metis/file-responsibility.json"}
+    generated_prefix = "docs/metis/phase-deliveries/"
+    for path, record in authoritative_files.items():
+        content = bytes(record["content"])
+        legacy_encoded = snapshot.get(path)
+        is_delivery_document = (
+            path in generated_paths
+            or (path.startswith(generated_prefix) and path.endswith(".json"))
+        )
+        if is_delivery_document and isinstance(legacy_encoded, str):
+            try:
+                legacy = base64.b64decode(legacy_encoded, validate=True)
+            except (ValueError, TypeError):
+                legacy = b""
+            if legacy != content and legacy.replace(b"\r\n", b"\n") == content:
+                content = legacy
+        restored[path] = base64.b64encode(content).decode("ascii")
+    return restored
+
+
 # ─── 持久化工具 ───────────────────────────────────────────────────────────────
 
 # 尾缘合并：限制写入频率，但每次已等待完成的状态变更都必须落库。
@@ -584,16 +610,22 @@ def _restore_from_disk():
                 if isinstance(supervisor_quality_runs, dict)
                 else {}
             )
+            signoff_receipt = data.get("signoff_receipt")
+            ctx.signoff_receipt = (
+                copy.deepcopy(signoff_receipt)
+                if isinstance(signoff_receipt, dict)
+                else None
+            )
             restored_projects[pid] = ctx
             snapshot = saved_workspace_files.get(pid, {})
             _restore_workspace(ctx, snapshot if isinstance(snapshot, dict) else {})
             authoritative_files = load_project_files(pid)
             _restore_workspace(
                 ctx,
-                {
-                    path: base64.b64encode(record["content"]).decode("ascii")
-                    for path, record in authoritative_files.items()
-                },
+                _authoritative_workspace_snapshot(
+                    snapshot if isinstance(snapshot, dict) else {},
+                    authoritative_files,
+                ),
             )
         except Exception as exc:
             logger.exception("Skip project that failed to restore [project=%s]: %s", pid, exc)
@@ -1239,6 +1271,7 @@ async def lifespan(app: FastAPI):
         logger.warning("未验证账号清理失败: %s", e)
     # 启动定时清理任务（每小时执行一次）
     _cleanup_task = None
+    _execution_recovery_task = None
     try:
         async def _periodic_cleanup():
             while True:
@@ -1250,12 +1283,34 @@ async def lifespan(app: FastAPI):
         _cleanup_task = asyncio.create_task(_periodic_cleanup())
     except Exception as e:
         logger.warning("启动定时清理任务失败: %s", e)
+    try:
+        async def _periodic_execution_recovery():
+            # A process can restart while a durable lease is still valid. The
+            # one-shot startup recovery must therefore be followed by a small
+            # watchdog that reclaims it immediately after lease expiry.
+            while True:
+                await asyncio.sleep(15)
+                try:
+                    await resume_pending_execution_runs()
+                except Exception as e:
+                    logger.exception("定时恢复中断执行任务失败: %s", e)
+        _execution_recovery_task = asyncio.create_task(
+            _periodic_execution_recovery()
+        )
+    except Exception as e:
+        logger.warning("启动执行恢复任务失败: %s", e)
     yield
     # 关闭时取消定时任务
     if _cleanup_task:
         _cleanup_task.cancel()
         try:
             await _cleanup_task
+        except asyncio.CancelledError:
+            pass
+    if _execution_recovery_task:
+        _execution_recovery_task.cancel()
+        try:
+            await _execution_recovery_task
         except asyncio.CancelledError:
             pass
     # 关闭时保存数据
@@ -1288,6 +1343,7 @@ app.middleware("http")(body_size_limit_middleware)
 AUTH_WHITELIST = {
     "/", "/health", "/nginx-health",
     "/auth/login",
+    "/mcp",  # dedicated MCP bearer authentication is enforced by the route
     "/openapi.json", "/docs", "/redoc",
     "/favicon.ico",
 }
@@ -1381,15 +1437,21 @@ async def global_auth_middleware(request: Request, call_next):
     # ── 设置用户级 API 配置到 contextvar ──────────────────────────────────
     # 后续 hermes_client.chat() 调用会自动使用此用户的 Key
     from core.user_scope import current_user_id
+    from core.llm_usage import current_llm_scope
 
     user_config = user_api_configs.get(user.user_id) or DEFAULT_API_CONFIG
     user_scope_token = current_user_id.set(str(user.user_id))
     token_ctx = current_user_api_config.set(user_config)
+    llm_scope_token = current_llm_scope.set({
+        "user_id": str(user.user_id),
+        "project_id": protected_project_id or "",
+    })
     try:
         response = await call_next(request)
         return response
     finally:
         current_user_api_config.reset(token_ctx)
+        current_llm_scope.reset(llm_scope_token)
         current_user_id.reset(user_scope_token)
 
 

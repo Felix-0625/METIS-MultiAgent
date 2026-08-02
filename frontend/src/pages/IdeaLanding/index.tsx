@@ -656,15 +656,15 @@ const IdeaLanding: React.FC = () => {
 
   // ── 渲染 ────────────────────────────────────────────────────────────────
   return (
-    <div style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: '#f5f5f5' }}>
+    <div className="metis-idea-workspace" style={{ display: 'flex', height: '100vh', overflow: 'hidden', background: '#f5f5f5' }}>
       {/* 左侧：对话列表 */}
-      <div style={{
+      <div className="metis-idea-sidebar" style={{
         width: 260, flexShrink: 0, background: '#fff',
         borderRight: '1px solid #f0f0f0',
         display: 'flex', flexDirection: 'column', overflow: 'hidden',
       }}>
         {/* 头部 */}
-        <div style={{ padding: '14px 12px 10px', borderBottom: '1px solid #f0f0f0', flexShrink: 0 }}>
+        <div className="metis-idea-sidebar-header" style={{ padding: '14px 12px 10px', borderBottom: '1px solid #f0f0f0', flexShrink: 0 }}>
           <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 8 }}>
             <span style={{ fontWeight: 700, fontSize: 15, color: '#1f1f1f' }}>
               <BulbOutlined style={{ color: '#faad14', marginRight: 6 }} />
@@ -739,9 +739,9 @@ const IdeaLanding: React.FC = () => {
       </div>
 
       {/* 右侧：对话区 + 文档面板 */}
-      <div style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
+      <div className="metis-idea-main" style={{ flex: 1, display: 'flex', flexDirection: 'column', overflow: 'hidden' }}>
         {/* 顶部标题栏 */}
-        <div style={{
+        <div className="metis-idea-header" style={{
           padding: '10px 20px', background: '#fff', borderBottom: '1px solid #f0f0f0',
           display: 'flex', alignItems: 'center', gap: 12, flexShrink: 0,
         }}>
@@ -770,7 +770,7 @@ const IdeaLanding: React.FC = () => {
         {(activeConvId || messages.length > 0) && renderPhaseBar()}
 
         {/* 内容区：聊天 + 文档 */}
-        <div style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
+        <div className="metis-idea-content" style={{ flex: 1, display: 'flex', minHeight: 0, overflow: 'hidden' }}>
           <StressTest
             messages={messages}
             sending={sending}

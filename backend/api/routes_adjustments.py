@@ -2710,6 +2710,40 @@ def _final_qa_round_limit() -> int:
 
 
 MAX_FINAL_QC_ROUNDS = _final_qa_round_limit()
+FINAL_QA_DISCOVERY_PASS_LIMIT = 2
+FINAL_QA_ISSUE_REPAIR_ATTEMPT_LIMIT = 3
+
+
+def _final_qa_handoff_signatures(status: Dict[str, Any]) -> set[str]:
+    return {
+        str(issue.get("final_qa_signature") or _final_qa_issue_signature(issue))
+        for issue in status.get("needs_manual") or []
+        if isinstance(issue, dict)
+    }
+
+
+def _handoff_final_qa_issues(
+    status: Dict[str, Any],
+    issues: List[Dict[str, Any]],
+    reason: str,
+) -> List[Dict[str, Any]]:
+    """Persist a deduplicated Engineer handoff without passing Final QA."""
+    existing = {
+        str(issue.get("final_qa_signature") or _final_qa_issue_signature(issue)): dict(issue)
+        for issue in status.get("needs_manual") or []
+        if isinstance(issue, dict)
+    }
+    for issue in issues:
+        signature = _final_qa_issue_signature(issue)
+        manual = _final_qa_manual_issue(issue, reason)
+        manual["final_qa_signature"] = signature
+        manual["handoff_target"] = "fullstack_engineer"
+        manual["file_label"] = "待整改"
+        existing[signature] = manual
+    handed_off = list(existing.values())
+    status["needs_manual"] = handed_off
+    status["handoff_count"] = len(handed_off)
+    return handed_off
 
 
 def _final_qa_rework_failures(results: List[Any]) -> List[str]:
@@ -3284,6 +3318,15 @@ def _runtime_failure_actionable(result: Dict[str, Any]) -> bool:
     return bool(result.get("actionable", True))
 
 
+def _runtime_acceptance_executed(result: Dict[str, Any]) -> bool:
+    """Whether a runtime gate actually ran, independent of remote enablement."""
+    return bool(
+        result.get("enabled") is True
+        or result.get("mode") == "local"
+        or result.get("source") == "local_deterministic_runtime"
+    )
+
+
 def _safe_runtime_rework_path(path: str) -> str:
     raw = str(path or "").strip().replace("\\", "/")
     candidate = PurePosixPath(raw)
@@ -3586,10 +3629,53 @@ async def _run_final_qa_loop(project_id: str):
     if not fence_token:
         raise ProjectWriteFenceConflict("Final QA write fence capability is unavailable")
 
+    persist_application_state = globals()["_persist_all_async"]
+    durable_status_present = project_id in _final_qa_status
+    durable_status = copy.deepcopy(_final_qa_status.get(project_id))
+    durable_qc_results = copy.deepcopy(ctx.qc_results)
+    durable_agents = copy.deepcopy(getattr(ctx, "agents", {}))
+    durable_subprojects = copy.deepcopy(getattr(ctx, "subprojects", []))
+
+    def restore_durable_projection() -> None:
+        if durable_status_present:
+            current = _final_qa_status.get(project_id)
+            if isinstance(current, dict):
+                current.clear()
+                current.update(copy.deepcopy(durable_status))
+            else:
+                _final_qa_status[project_id] = copy.deepcopy(durable_status)
+        else:
+            _final_qa_status.pop(project_id, None)
+        ctx.qc_results.clear()
+        ctx.qc_results.update(copy.deepcopy(durable_qc_results))
+        if hasattr(ctx, "agents"):
+            ctx.agents.clear()
+            ctx.agents.update(copy.deepcopy(durable_agents))
+        if hasattr(ctx, "subprojects"):
+            ctx.subprojects[:] = copy.deepcopy(durable_subprojects)
+
+    async def _persist_all_async() -> None:
+        nonlocal durable_status_present, durable_status
+        nonlocal durable_qc_results, durable_agents, durable_subprojects
+        try:
+            await persist_application_state()
+        except Exception as exc:
+            restore_durable_projection()
+            setattr(exc, "_final_qa_checkpoint_rolled_back", True)
+            raise
+        durable_status_present = project_id in _final_qa_status
+        durable_status = copy.deepcopy(_final_qa_status.get(project_id))
+        durable_qc_results = copy.deepcopy(ctx.qc_results)
+        durable_agents = copy.deepcopy(getattr(ctx, "agents", {}))
+        durable_subprojects = copy.deepcopy(getattr(ctx, "subprojects", []))
+
     status = _final_qa_status.setdefault(project_id, {
         "status": "running",
         "round": 0,
-        "total_rounds": MAX_FINAL_QC_ROUNDS,
+        "total_rounds": None,
+        "round_limit_enabled": False,
+        "discovery_pass_limit": FINAL_QA_DISCOVERY_PASS_LIMIT,
+        "issue_repair_attempt_limit": FINAL_QA_ISSUE_REPAIR_ATTEMPT_LIMIT,
         "logs": [],
         "all_passed": False,
         "needs_manual": [],
@@ -3653,6 +3739,7 @@ async def _run_final_qa_loop(project_id: str):
         *,
         generation: str,
         artifact_sha256: str,
+        external_findings: Optional[List[Dict[str, Any]]] = None,
     ):
         from core.hermes_client import current_user_api_config
 
@@ -3673,13 +3760,14 @@ async def _run_final_qa_loop(project_id: str):
                     "scope_digest": artifact_sha256,
                     "artifact_digest": artifact_sha256,
                     "final_qa_scope": final_qa_scope,
+                    "external_findings": list(external_findings or []),
                 },
             )
         finally:
             current_user_api_config.reset(config_token)
 
     async def verify_reworked_phases(phase_ids: List[str]) -> List[str]:
-        """Re-run deterministic Pre-QA and phase QC before the next Final QA round."""
+        """Run targeted deterministic verification before full Final QA/QC."""
         from api.routes_phases import (
             _execute_phase_pre_qa,
             _supervisor_scope_snapshot,
@@ -3699,21 +3787,6 @@ async def _run_final_qa_loop(project_id: str):
             if pre_qa.get("passed") is not True:
                 failures.append(f"phase {phase_id}: Pre-QA failed")
                 continue
-            scope = _supervisor_scope_snapshot(ctx, phase_id)
-            qc_result = await asyncio.to_thread(
-                _run_qc_for_subproject,
-                ctx,
-                phase_id,
-                str(phase.get("name") or phase_id),
-                is_final_phase=False,
-                qa_context={
-                    "run_id": run_id,
-                    "qa_round_id": f"{run_id}:rework:{phase_id}",
-                    "artifact_digest": str(scope.get("artifact_digest") or ""),
-                },
-            )
-            if qc_result.get("passed") is not True:
-                failures.append(f"phase {phase_id}: Supervisor QC failed")
         return failures
     # 全项目终审只扫描一次完整工作区。按阶段/专家重复扫描会把同一问题
     # 复制成多份，并导致错误的返工归属。
@@ -3864,11 +3937,15 @@ async def _run_final_qa_loop(project_id: str):
                     })
         return found
 
-    previous_issue_signatures: set[str] = set()
-    stagnant_rounds = 0
     pending_rework_snapshot: Dict[Path, Optional[bytes]] = {}
     pending_rework_signatures: set[str] = set()
-    for round_num in range(1, MAX_FINAL_QC_ROUNDS + 1):
+    issue_repair_attempts = {
+        str(key): int(value or 0)
+        for key, value in (status.get("issue_repair_attempts") or {}).items()
+    }
+    round_num = int(status.get("round") or 0)
+    while True:
+        round_num += 1
         refreshed_scope = load_final_qa_scope(
             project_id=project_id,
             workspace=workspace,
@@ -3914,7 +3991,7 @@ async def _run_final_qa_loop(project_id: str):
         status["qc_artifact_sha256"] = qc_artifact_sha256
         _store_final_qa_run_status(ctx, status)
         await _persist_all_async()
-        log(f"━━ 第 {round_num} 轮质检（共 {MAX_FINAL_QC_ROUNDS} 轮）")
+        log(f"━━ 第 {round_num} 轮最终质检")
 
         # 对完整项目工作区做一次整体质检
         all_passed = True
@@ -4068,7 +4145,10 @@ async def _run_final_qa_loop(project_id: str):
                 )
                 qc_entry["runtime_acceptance"] = runtime_result
                 required = _runtime_acceptance_required()
-                if required and not runtime_result.get("enabled"):
+                runtime_executed = _runtime_acceptance_executed(
+                    runtime_result
+                )
+                if required and not runtime_executed:
                     status["status"] = "failed"
                     status["all_passed"] = False
                     status["failed_reason"] = "RUNTIME_ACCEPTANCE_UNAVAILABLE"
@@ -4080,7 +4160,7 @@ async def _run_final_qa_loop(project_id: str):
                     _store_final_qa_run_status(ctx, status)
                     await _persist_all_async()
                     return
-                if runtime_result.get("enabled") and not runtime_result.get("passed"):
+                if runtime_executed and not runtime_result.get("passed"):
                     if not _runtime_failure_actionable(runtime_result):
                         status.update({
                             "status": "infrastructure_blocked",
@@ -4101,8 +4181,39 @@ async def _run_final_qa_loop(project_id: str):
                         scope_files=scope_files,
                         valid_criteria=valid_criteria,
                     )
-                    runtime_issues.append(runtime_issue)
-                    open_issues.append(runtime_issue)
+                    # Runtime QA is evidence, not the final reviewer. Feed its
+                    # deterministic finding to an independent Final QC pass so
+                    # QC can locate an existing delivery file and route repair
+                    # to the original owner. A malformed QC response falls back
+                    # to the normalized machine issue without blocking format.
+                    try:
+                        qc_review = await asyncio.wait_for(
+                            asyncio.get_event_loop().run_in_executor(
+                                None,
+                                lambda: run_qc_with_project_config(
+                                    sp_id,
+                                    sp_name,
+                                    generation=qc_generation,
+                                    artifact_sha256=qc_artifact_sha256,
+                                    external_findings=[runtime_issue],
+                                ),
+                            ),
+                            timeout=90.0,
+                        )
+                    except Exception:
+                        qc_review = {}
+                    reviewed_runtime_issues = [
+                        item
+                        for item in (qc_review.get("issues_detail") or [])
+                        if isinstance(item, dict)
+                        and item.get("status", "open") == "open"
+                    ]
+                    if reviewed_runtime_issues:
+                        runtime_issues.extend(reviewed_runtime_issues)
+                        open_issues.extend(reviewed_runtime_issues)
+                    else:
+                        runtime_issues.append(runtime_issue)
+                        open_issues.append(runtime_issue)
                     sp_passed = False
                     qc_entry["passed"] = False
                     qc_entry["error_count"] = qc_entry.get("error_count", 0) + 1
@@ -4173,10 +4284,10 @@ async def _run_final_qa_loop(project_id: str):
 
         status["active_issues"] = latest_open_issues
 
-        # A repair batch is allowed to trigger the next QC round only when it
-        # actually shrank the previous blocker set.  If it introduced a new
-        # blocker or failed to resolve any old blocker, restore the exact
-        # pre-repair bytes and stop for manual intervention.
+        # A repair batch may advance only when it shrinks the blocker set.
+        # Regression/no-progress restores the exact bytes and retries without
+        # terminating the whole Final QA run.  Only the repeatedly unresolved
+        # issue is handed to the full-stack engineer.
         if pending_rework_signatures and not all_passed:
             current_signatures = {
                 _final_qa_issue_signature(issue) for issue in latest_open_issues
@@ -4184,32 +4295,80 @@ async def _run_final_qa_loop(project_id: str):
             resolved_signatures = pending_rework_signatures - current_signatures
             new_signatures = current_signatures - pending_rework_signatures
             if new_signatures or not resolved_signatures:
+                restored = False
                 try:
                     _restore_final_qa_rework_snapshot(pending_rework_snapshot)
+                    restored = True
                     rollback_message = "Final QA rework regressed or made no progress; workspace restored"
                 except Exception as exc:
                     rollback_message = (
                         "Final QA rework regressed and snapshot restore failed: "
                         f"{exc.__class__.__name__}"
                     )
+                if not restored:
+                    status.update({
+                        "status": "failed_recovery",
+                        "all_passed": False,
+                        "failed_reason": "REWORK_ROLLBACK_FAILED",
+                        "message": rollback_message,
+                        "current_step": "completed",
+                        "finished_at": time.time(),
+                    })
+                    log(rollback_message)
+                    _store_final_qa_run_status(ctx, status)
+                    await _persist_all_async()
+                    return
+                repeated: List[Dict[str, Any]] = []
+                issue_by_signature = {
+                    _final_qa_issue_signature(issue): issue
+                    for issue in latest_open_issues
+                }
+                for signature in pending_rework_signatures:
+                    issue_repair_attempts[signature] = (
+                        issue_repair_attempts.get(signature, 0) + 1
+                    )
+                    if (
+                        issue_repair_attempts[signature]
+                        >= FINAL_QA_ISSUE_REPAIR_ATTEMPT_LIMIT
+                        and signature in issue_by_signature
+                    ):
+                        repeated.append(issue_by_signature[signature])
+                status["issue_repair_attempts"] = dict(issue_repair_attempts)
+                if repeated:
+                    _handoff_final_qa_issues(
+                        status,
+                        repeated,
+                        "Automatic Final QA repair failed three times",
+                    )
                 status.update({
-                    "status": "needs_manual",
+                    "status": "repair_retrying",
                     "all_passed": False,
-                    "needs_manual": _final_qa_manual_issues(
-                        latest_open_issues, rollback_message
-                    ),
-                    "action_required": {"options": ["manual_fix", "rebuild_phase"]},
                     "regression": bool(new_signatures),
                     "rollback_message": rollback_message,
-                    "current_step": "completed",
-                    "finished_at": time.time(),
                 })
                 log(rollback_message)
+                pending_rework_snapshot = {}
+                pending_rework_signatures = set()
                 _store_final_qa_run_status(ctx, status)
                 await _persist_all_async()
-                return
+                continue
             pending_rework_snapshot = {}
             pending_rework_signatures = set()
+
+        if all_passed and status.get("needs_manual"):
+            status.update({
+                "status": "completed_with_deferred_issues",
+                "all_passed": False,
+                "quality_cycle_completed": True,
+                "release_ready": False,
+                "message": "Final QA/QC completed with deferred remediation items",
+                "action_required": {"options": ["open_fullstack_engineer"]},
+                "current_step": "completed",
+                "finished_at": time.time(),
+            })
+            _store_final_qa_run_status(ctx, status)
+            await _persist_all_async()
+            break
 
         if all_passed:
             phase_manager = _phase_managers.get(project_id)
@@ -4311,55 +4470,80 @@ async def _run_final_qa_loop(project_id: str):
                 or ""
             ).strip()
         ]
+        reclassification_signatures: set[str] = set()
         if unassigned_issues:
-            message = (
-                "Final QA found blocking issues without an authorized repair owner; "
-                "no rework or follow-up QC was started"
-            )
-            status.update({
-                "status": "needs_manual",
-                "all_passed": False,
-                "needs_manual": _final_qa_manual_issues(
-                    unassigned_issues, message
-                ),
-                "failed_reason": "REWORK_OWNER_UNRESOLVED",
-                "message": message,
-                "action_required": {"options": ["manual_fix", "rebuild_phase"]},
-                "current_step": "completed",
-                "finished_at": time.time(),
-            })
-            log(message)
-            _store_final_qa_run_status(ctx, status)
-            await _persist_all_async()
-            return
+            repeated_unassigned: List[Dict[str, Any]] = []
+            for issue in unassigned_issues:
+                signature = _final_qa_issue_signature(issue)
+                issue_repair_attempts[signature] = (
+                    issue_repair_attempts.get(signature, 0) + 1
+                )
+                if (
+                    issue_repair_attempts[signature]
+                    >= FINAL_QA_ISSUE_REPAIR_ATTEMPT_LIMIT
+                ):
+                    repeated_unassigned.append(issue)
+                else:
+                    reclassification_signatures.add(signature)
+            status["issue_repair_attempts"] = dict(issue_repair_attempts)
+            if repeated_unassigned:
+                message = (
+                    "Final QC could not establish a safe original owner after "
+                    "three reviews; the issue was recorded for later user-led "
+                    "full-stack remediation"
+                )
+                _handoff_final_qa_issues(
+                    status, repeated_unassigned, message
+                )
+                log(message)
 
         current_signatures = {
             _final_qa_issue_signature(issue) for issue in latest_open_issues
         }
-        if current_signatures and current_signatures == previous_issue_signatures:
-            stagnant_rounds += 1
-        else:
-            stagnant_rounds = 0
-        previous_issue_signatures = current_signatures
-        no_progress = stagnant_rounds >= 2
-
-        if round_num >= MAX_FINAL_QC_ROUNDS or no_progress:
-            # 超出上限，标记 needs_manual
-            reason = (
-                "连续两轮返修后问题未变化"
-                if no_progress
-                else f"已达最大质检轮次（{MAX_FINAL_QC_ROUNDS}）"
-            )
-            log(f"❌ {reason}，剩余问题标记为需人工介入")
-            manual_list = []
-            for iss in latest_open_issues:
-                manual_list.append(_final_qa_manual_issue(
-                    iss, f"最终整体质检停止：{reason}，请人工介入"
-                ))
-            status["needs_manual"] = manual_list
-            status["status"] = "needs_manual"
-            status["current_step"] = "completed"
-            status["action_required"] = {"options": ["manual_fix", "rebuild_phase"]}
+        handed_off_signatures = _final_qa_handoff_signatures(status)
+        deferred_signatures = (
+            handed_off_signatures | reclassification_signatures
+        )
+        latest_open_issues = [
+            issue for issue in latest_open_issues
+            if _final_qa_issue_signature(issue) not in deferred_signatures
+        ]
+        current_signatures -= deferred_signatures
+        open_issues_by_agent = {
+            agent_id: [
+                issue for issue in issues
+                if _final_qa_issue_signature(issue) not in handed_off_signatures
+            ]
+            for agent_id, issues in open_issues_by_agent.items()
+        }
+        open_issues_by_agent = {
+            agent_id: issues
+            for agent_id, issues in open_issues_by_agent.items()
+            if issues
+        }
+        if reclassification_signatures and not latest_open_issues:
+            status.update({
+                "status": "qc_reclassifying",
+                "all_passed": False,
+                "message": (
+                    "Final QC is reclassifying findings that do not yet have "
+                    "a safe original owner"
+                ),
+            })
+            _store_final_qa_run_status(ctx, status)
+            await _persist_all_async()
+            continue
+        if not latest_open_issues:
+            status.update({
+                "status": "completed_with_deferred_issues",
+                "all_passed": False,
+                "quality_cycle_completed": True,
+                "release_ready": False,
+                "message": "Final QA/QC completed with deferred remediation items",
+                "action_required": {"options": ["open_fullstack_engineer"]},
+                "current_step": "completed",
+                "finished_at": time.time(),
+            })
             _store_final_qa_run_status(ctx, status)
             await _persist_all_async()
             break
@@ -4382,17 +4566,15 @@ async def _run_final_qa_loop(project_id: str):
         if not authorized_rework_paths:
             message = (
                 "Final QA found issues but no safe delivery-file target was identified; "
-                "no rework or follow-up QC was started"
+                "the issues were transferred to the full-stack engineer"
             )
+            _handoff_final_qa_issues(status, latest_open_issues, message)
             status.update({
-                "status": "needs_manual",
+                "status": "awaiting_engineer_repair",
                 "all_passed": False,
-                "needs_manual": _final_qa_manual_issues(
-                    latest_open_issues, message
-                ),
                 "failed_reason": "REWORK_TARGET_UNRESOLVED",
                 "message": message,
-                "action_required": {"options": ["manual_fix", "rebuild_phase"]},
+                "action_required": {"options": ["open_fullstack_engineer"]},
                 "current_step": "completed",
                 "finished_at": time.time(),
             })
@@ -4406,17 +4588,15 @@ async def _run_final_qa_loop(project_id: str):
         if not pending_rework_snapshot:
             message = (
                 "Final QA found issues but no safe delivery-file target was identified; "
-                "no rework or follow-up QC was started"
+                "the issues were transferred to the full-stack engineer"
             )
+            _handoff_final_qa_issues(status, latest_open_issues, message)
             status.update({
-                "status": "needs_manual",
+                "status": "awaiting_engineer_repair",
                 "all_passed": False,
-                "needs_manual": _final_qa_manual_issues(
-                    latest_open_issues, message
-                ),
                 "failed_reason": "REWORK_TARGET_UNRESOLVED",
                 "message": message,
-                "action_required": {"options": ["manual_fix", "rebuild_phase"]},
+                "action_required": {"options": ["open_fullstack_engineer"]},
                 "current_step": "completed",
                 "finished_at": time.time(),
             })
@@ -4576,36 +4756,60 @@ async def _run_final_qa_loop(project_id: str):
                     )
             if rework_errors:
                 rework_guard.revoke()
-                with project_write_guard(
-                    project_id, Path(ctx.workspace), fence_token
-                ):
-                    _restore_final_qa_rework_snapshot(
-                        pending_rework_snapshot
+                try:
+                    with project_write_guard(
+                        project_id, Path(ctx.workspace), fence_token
+                    ):
+                        _restore_final_qa_rework_snapshot(
+                            pending_rework_snapshot
+                        )
+                except Exception as exc:
+                    status.update({
+                        "status": "failed_recovery",
+                        "all_passed": False,
+                        "failed_reason": "REWORK_ROLLBACK_FAILED",
+                        "message": f"Final QA rework rollback failed: {exc.__class__.__name__}",
+                        "current_step": "completed",
+                        "finished_at": time.time(),
+                    })
+                    _store_final_qa_run_status(ctx, status)
+                    await _persist_all_async()
+                    return
+                repeated = []
+                for issue in latest_open_issues:
+                    signature = _final_qa_issue_signature(issue)
+                    issue_repair_attempts[signature] = (
+                        issue_repair_attempts.get(signature, 0) + 1
                     )
-                status["status"] = "failed"
+                    if issue_repair_attempts[signature] >= FINAL_QA_ISSUE_REPAIR_ATTEMPT_LIMIT:
+                        repeated.append(issue)
+                status["issue_repair_attempts"] = dict(issue_repair_attempts)
+                if repeated:
+                    _handoff_final_qa_issues(
+                        status, repeated,
+                        "Automatic Final QA repair failed three times",
+                    )
+                status["status"] = "repair_retrying"
                 status["all_passed"] = False
                 status["failed_reason"] = "REWORK_FAILED"
-                status["message"] = "Final QA rework failed; no further QC round was started"
+                status["message"] = "Final QA rework failed; workspace restored and retry scheduled"
                 status["rework_errors"] = rework_errors
                 status["retryable"] = True
-                status["action_required"] = {"options": ["retry_acceptance"]}
                 log("Final QA rework failed: " + " | ".join(rework_errors[:3]))
-                status["finished_at"] = time.time()
-                status["current_item"] = None
-                status["current_step"] = "completed"
+                pending_rework_snapshot = {}
+                pending_rework_signatures = set()
                 _store_final_qa_run_status(ctx, status)
                 await _persist_all_async()
-                return
+                continue
             if not rework_tasks:
+                message = "Final QA found issues but dispatched no repair task"
+                _handoff_final_qa_issues(status, latest_open_issues, message)
                 status.update({
-                    "status": "needs_manual",
+                    "status": "awaiting_engineer_repair",
                     "all_passed": False,
                     "failed_reason": "REWORK_NOT_DISPATCHED",
-                    "message": "Final QA found issues but dispatched no repair task",
-                    "needs_manual": _final_qa_manual_issues(
-                        latest_open_issues, status["message"]
-                    ),
-                    "action_required": {"options": ["manual_fix", "rebuild_phase"]},
+                    "message": message,
+                    "action_required": {"options": ["open_fullstack_engineer"]},
                     "current_step": "completed",
                     "finished_at": time.time(),
                 })
@@ -4614,31 +4818,55 @@ async def _run_final_qa_loop(project_id: str):
                 await _persist_all_async()
                 return
             if not _final_qa_snapshot_changed(pending_rework_snapshot):
+                restored = False
                 try:
                     _restore_final_qa_rework_snapshot(pending_rework_snapshot)
+                    restored = True
                     rollback_message = "Final QA rework returned successfully but changed no targeted file"
                 except Exception as exc:
                     rollback_message = (
                         "Final QA rework changed no targeted file and snapshot restore failed: "
                         f"{exc.__class__.__name__}"
                     )
+                if not restored:
+                    status.update({
+                        "status": "failed_recovery",
+                        "all_passed": False,
+                        "failed_reason": "REWORK_ROLLBACK_FAILED",
+                        "message": rollback_message,
+                        "current_step": "completed",
+                        "finished_at": time.time(),
+                    })
+                    log(rollback_message)
+                    _store_final_qa_run_status(ctx, status)
+                    await _persist_all_async()
+                    return
+                repeated = []
+                for issue in latest_open_issues:
+                    signature = _final_qa_issue_signature(issue)
+                    issue_repair_attempts[signature] = (
+                        issue_repair_attempts.get(signature, 0) + 1
+                    )
+                    if issue_repair_attempts[signature] >= FINAL_QA_ISSUE_REPAIR_ATTEMPT_LIMIT:
+                        repeated.append(issue)
+                status["issue_repair_attempts"] = dict(issue_repair_attempts)
+                if repeated:
+                    _handoff_final_qa_issues(
+                        status, repeated,
+                        "Automatic Final QA repair failed three times",
+                    )
                 status.update({
-                    "status": "needs_manual",
+                    "status": "repair_retrying",
                     "all_passed": False,
-                    "failed_reason": "REWORK_NO_PROGRESS",
                     "message": rollback_message,
-                    "needs_manual": _final_qa_manual_issues(
-                        latest_open_issues, rollback_message
-                    ),
                     "rework_files_changed": False,
-                    "action_required": {"options": ["manual_fix", "rebuild_phase"]},
-                    "current_step": "completed",
-                    "finished_at": time.time(),
                 })
                 log(rollback_message)
+                pending_rework_snapshot = {}
+                pending_rework_signatures = set()
                 _store_final_qa_run_status(ctx, status)
                 await _persist_all_async()
-                return
+                continue
             if isinstance(pending_rework_snapshot, _FinalQAReworkSnapshot):
                 before_manifest, _ = _decode_adjustment_snapshot(
                     pending_rework_snapshot.recovery_snapshot
@@ -4748,7 +4976,11 @@ def _on_final_qa_done(project_id: str, task: asyncio.Task) -> None:
     cancelled = task.cancelled()
     error = None if cancelled else task.exception()
     status = _final_qa_status.get(project_id)
-    if status is not None and (cancelled or error is not None):
+    checkpoint_rolled_back = bool(
+        error is not None
+        and getattr(error, "_final_qa_checkpoint_rolled_back", False)
+    )
+    if status is not None and (cancelled or error is not None) and not checkpoint_rolled_back:
         status["status"] = "interrupted" if cancelled else "failed"
         status["all_passed"] = False
         status["message"] = (
@@ -4771,11 +5003,12 @@ def _on_final_qa_done(project_id: str, task: asyncio.Task) -> None:
                     "Final QA write fence could not be released project=%s",
                     project_id,
                 )
-        _store_final_qa_run_status(ctx, status)
-        try:
-            asyncio.get_running_loop().create_task(_persist_all_async())
-        except RuntimeError:
-            pass
+        if not checkpoint_rolled_back:
+            _store_final_qa_run_status(ctx, status)
+            try:
+                asyncio.get_running_loop().create_task(_persist_all_async())
+            except RuntimeError:
+                pass
 
 def register_final_qa_reinspection(
     ctx: ProjectContext,
@@ -5398,14 +5631,18 @@ async def _trigger_final_qa_locked(
     phases = phase_manager.phases if phase_manager else []
     phase_blockers = validate_final_qa_readiness(ctx, phases)
     if not phases or phase_blockers:
-        detail = "All phases must be confirmed and completed before Final QA"
-        if phase_blockers:
-            detail += ": " + "; ".join(phase_blockers[:5])
-        raise HTTPException(status_code=409, detail=detail)
+        blockers = phase_blockers or ["No executable project phases were found"]
+        raise HTTPException(status_code=409, detail={
+            "code": "FINAL_QA_PREREQUISITES_NOT_MET",
+            "message": "最终验收前置条件未满足",
+            "blockers": blockers,
+        })
     current = _final_qa_status.get(project_id, {})
     if current and current.get("status") not in {
-        "passed", "needs_manual", "failed", "not_started",
-        "interrupted", "infrastructure_blocked",
+        "passed", "needs_manual", "awaiting_engineer_repair",
+        "completed_with_deferred_issues", "failed",
+        "failed_recovery", "not_started", "interrupted",
+        "infrastructure_blocked",
     }:
         return {"success": True, "already_running": True, "message": "全项目质检循环已在运行", "project_id": project_id}
     owned_registration_id = ""
@@ -5605,7 +5842,10 @@ async def _trigger_final_qa_locked(
         "required_paths": run_required_paths,
         "status": "running",
         "round": 0,
-        "total_rounds": MAX_FINAL_QC_ROUNDS,
+        "total_rounds": None,
+        "round_limit_enabled": False,
+        "discovery_pass_limit": FINAL_QA_DISCOVERY_PASS_LIMIT,
+        "issue_repair_attempt_limit": FINAL_QA_ISSUE_REPAIR_ATTEMPT_LIMIT,
         "logs": [],
         "all_passed": False,
         "needs_manual": [],
@@ -5641,7 +5881,7 @@ async def _trigger_final_qa_locked(
     task.add_done_callback(lambda completed, pid=project_id: _on_final_qa_done(pid, completed))
     return {
         "success": True,
-        "message": f"最终整体质检已启动（最多 {MAX_FINAL_QC_ROUNDS} 轮，后台运行）",
+        "message": "最终整体质检已启动（按问题收敛，后台运行）",
         "project_id": project_id,
     }
 
@@ -5705,7 +5945,9 @@ async def get_final_qa_status(project_id: str):
             else None
         )
         if isinstance(persisted_run, dict) and persisted_run.get("status") not in {
-            "passed", "failed", "needs_manual", "infrastructure_blocked",
+            "passed", "failed", "needs_manual", "awaiting_engineer_repair",
+            "completed_with_deferred_issues",
+            "failed_recovery", "infrastructure_blocked",
             "recovery_blocked",
         }:
             status = {
@@ -5761,12 +6003,17 @@ async def get_final_qa_status(project_id: str):
                 restored_status = "failed"
             elif qa_result.get("passed") is True:
                 restored_status = "passed"
-            elif restored_status not in {"failed", "needs_manual"}:
+            elif restored_status not in {
+                "failed", "needs_manual", "awaiting_engineer_repair",
+                "completed_with_deferred_issues",
+                "failed_recovery",
+            }:
                 restored_status = "failed"
             status = {
                 "status": restored_status,
                 "round": int(qa_result.get("qc_round") or 0),
-                "total_rounds": MAX_FINAL_QC_ROUNDS,
+                "total_rounds": None,
+                "round_limit_enabled": False,
                 "all_passed": restored_status == "passed",
                 "qc_summary": {
                     "score": qa_result.get("score"),

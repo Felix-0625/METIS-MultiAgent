@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Tuple
 
 SECRET_PATTERNS = [
     re.compile(r"(?i)(api[_-]?key|secret|token|password)\s*[:=]\s*['\"][^'\"\s]{16,}['\"]"),
-    re.compile(r"sk-[A-Za-z0-9_-]{20,}"),
+    re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{20,}"),
     re.compile(r"(?i)bearer\s+[A-Za-z0-9._-]{20,}"),
 ]
 

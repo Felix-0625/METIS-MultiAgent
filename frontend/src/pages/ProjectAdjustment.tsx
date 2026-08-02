@@ -158,8 +158,9 @@ const PhaseConfirmCard: React.FC<{
 
 // ─── 主组件 ──────────────────────────────────────────────────────────────────
 
-const ProjectAdjustment: React.FC = () => {
-  const { id: projectId } = useParams<{ id: string }>();
+const ProjectAdjustment: React.FC<{ projectId?: string }> = ({ projectId: projectIdProp }) => {
+  const { id: routeProjectId } = useParams<{ id: string }>();
+  const projectId = projectIdProp || routeProjectId;
 
   const [msgs, setMsgs] = useState<GroupMsg[]>([]);
   const [sending, setSending] = useState(false);

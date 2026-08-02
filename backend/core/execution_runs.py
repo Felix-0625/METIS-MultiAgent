@@ -26,7 +26,7 @@ MAX_IDEMPOTENCY_RECORD_KEY_LENGTH = 256
 ALLOWED_TRANSITIONS = {
     "pending": frozenset({"running", "blocked", "cancelled"}),
     "running": frozenset({"pending", "succeeded", "failed", "timeout", "blocked", "cancelled"}),
-    "blocked": frozenset({"pending", "running", "cancelled"}),
+    "blocked": frozenset({"pending", "running", "failed", "cancelled"}),
     "succeeded": frozenset(),
     "failed": frozenset(),
     "timeout": frozenset(),
@@ -505,7 +505,10 @@ class DurableRunRegistry:
             row = self._select_run(cur, run_id)
             if row["status"] not in {"pending", "running", "blocked"}:
                 raise InvalidTransition(f"cannot cancel a {row['status']} run")
-            self._transition(cur, row, "cancelled", now, reason=f"{actor}: {reason}")
+            self._transition(
+                cur, row, "cancelled", now,
+                reason=f"{actor}: {reason}", last_error=reason,
+            )
             self._propagate_critical_failure(cur, row, "cancelled", now)
         return self.get(run_id)
 
@@ -564,7 +567,10 @@ class DurableRunRegistry:
             row = self._select_run(cur, run_id)
             if row["status"] not in {"pending", "running"}:
                 raise InvalidTransition(f"cannot block a {row['status']} run")
-            self._transition(cur, row, "blocked", now, reason=reason)
+            self._transition(
+                cur, row, "blocked", now,
+                reason=reason, last_error=reason,
+            )
             self._propagate_critical_failure(cur, row, "blocked", now)
         return self.get(run_id)
 
@@ -804,11 +810,13 @@ class DurableRunRegistry:
         if not bool(child["critical"]) or not child["parent_run_id"]:
             return
         parent = self._select_run(cur, child["parent_run_id"])
-        if parent["status"] not in {"pending", "running"}:
+        if parent["status"] not in {"pending", "running", "blocked"}:
+            return
+        if parent["status"] == "blocked" and child_status not in {"failed", "timeout"}:
             return
         parent_status = (
             "failed"
-            if parent["status"] == "running" and child_status in {"failed", "timeout"}
+            if child_status in {"failed", "timeout"}
             else "blocked"
         )
         reason = f"critical child {child['run_id']} entered {child_status}"

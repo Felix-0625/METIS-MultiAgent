@@ -36,22 +36,19 @@ interface ModelPreset {
 
 const MODEL_PRESETS: Record<string, ModelPreset[]> = {
   'OpenAI / ChatGPT': [
-    { label: 'GPT-5.5 Pro（推荐）', model: 'gpt-5.5-pro', api_base: 'https://api.openai.com/v1', note: '旗舰顶配/110万Token' },
-    { label: 'GPT-5.5 Instant', model: 'gpt-5.5-instant', api_base: 'https://api.openai.com/v1', note: '极速日常' },
-    { label: 'GPT-5.5 Nano', model: 'gpt-5.5-nano', api_base: 'https://api.openai.com/v1', note: '低成本批量' },
-    { label: 'GPT-4o', model: 'gpt-4o', api_base: 'https://api.openai.com/v1', note: '经典多模态' },
-    { label: 'GPT-4o mini', model: 'gpt-4o-mini', api_base: 'https://api.openai.com/v1', note: '高性价比' },
-    { label: 'GPT-3.5 Turbo', model: 'gpt-3.5-turbo', api_base: 'https://api.openai.com/v1', note: '入门低价' },
+    { label: 'GPT-5.6 Sol（推荐）', model: 'gpt-5.6-sol', api_base: 'https://api.openai.com/v1', note: '旗舰能力' },
+    { label: 'GPT-5.6 Terra', model: 'gpt-5.6-terra', api_base: 'https://api.openai.com/v1', note: '能力与成本均衡' },
+    { label: 'GPT-5.6 Luna', model: 'gpt-5.6-luna', api_base: 'https://api.openai.com/v1', note: '高并发低成本' },
   ],
   'Anthropic (Claude)': [
-    { label: 'Claude Opus 4.8（推荐）', model: 'claude-opus-4-20250514', api_base: 'https://api.anthropic.com/v1', note: '旗舰/100万Token/深度推理' },
-    { label: 'Claude Sonnet 4.6', model: 'claude-sonnet-4-20250514', api_base: 'https://api.anthropic.com/v1', note: '均衡主力/代码多模态' },
-    { label: 'Claude Sonnet 4.5', model: 'claude-sonnet-4-20241022', api_base: 'https://api.anthropic.com/v1', note: '企业通用/200K上下文' },
+    { label: 'Claude Fable 5（推荐）', model: 'claude-fable-5', api_base: 'https://api.anthropic.com/v1', note: '最高能力' },
+    { label: 'Claude Opus 5', model: 'claude-opus-5', api_base: 'https://api.anthropic.com/v1', note: '复杂 Agent 与代码' },
+    { label: 'Claude Sonnet 5', model: 'claude-sonnet-5', api_base: 'https://api.anthropic.com/v1', note: '速度与能力均衡' },
   ],
   'Google (Gemini)': [
-    { label: 'Gemini 3.5 Pro（推荐）', model: 'gemini-3.5-pro', api_base: 'https://generativelanguage.googleapis.com/v1beta/openai', note: '旗舰/100万Token/多模态' },
-    { label: 'Gemini 3.5 Flash', model: 'gemini-3.5-flash', api_base: 'https://generativelanguage.googleapis.com/v1beta/openai', note: '高速低价/实时语音' },
-    { label: 'Gemini 3.1 Ultra', model: 'gemini-3.1-ultra', api_base: 'https://generativelanguage.googleapis.com/v1beta/openai', note: '私有化部署' },
+    { label: 'Gemini 3.6 Flash（推荐）', model: 'gemini-3.6-flash', api_base: 'https://generativelanguage.googleapis.com/v1beta/openai', note: '最新稳定主力' },
+    { label: 'Gemini 3.5 Flash', model: 'gemini-3.5-flash', api_base: 'https://generativelanguage.googleapis.com/v1beta/openai', note: 'Agent 与代码任务' },
+    { label: 'Gemini 3.1 Pro（预览）', model: 'gemini-3.1-pro-preview', api_base: 'https://generativelanguage.googleapis.com/v1beta/openai', note: '复杂推理' },
   ],
   'xAI (Grok)': [
     { label: 'Grok 4.3（推荐）', model: 'grok-4.3', api_base: 'https://api.x.ai/v1', note: '旗舰/百万上下文/实时联网' },
@@ -65,24 +62,18 @@ const MODEL_PRESETS: Record<string, ModelPreset[]> = {
     { label: 'Qwen3.7-Max（推荐）', model: 'qwen3.7-max', api_base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', note: '旗舰/128K上下文/深度推理' },
     { label: 'Qwen3.7-Plus', model: 'qwen3.7-plus', api_base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', note: '企业均衡主力/32K' },
     { label: 'Qwen3.7-Flash', model: 'qwen3.7-flash', api_base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', note: '极速低价/8K' },
-    { label: 'Qwen-VL（视觉）', model: 'qwen-vl-max', api_base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', note: '多模态视觉' },
-    { label: 'Qwen-Audio（语音）', model: 'qwen-audio', api_base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', note: '语音识别' },
-    { label: 'Qwen-Code（代码）', model: 'qwen-coder-plus', api_base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', note: '代码专项' },
-    { label: 'Qwen 嵌入模型', model: 'text-embedding-v3', api_base: 'https://dashscope.aliyuncs.com/compatible-mode/v1', note: '向量嵌入' },
   ],
   '月之暗面 (Kimi)': [
     { label: 'Kimi K2.6（推荐）', model: 'kimi-k2.6', api_base: 'https://api.moonshot.cn/v1', note: '200万Token/超长文本' },
     { label: 'Kimi K2.6 Code', model: 'kimi-k2.6-code', api_base: 'https://api.moonshot.cn/v1', note: '代码专项/多文件重构' },
   ],
   '智谱AI (GLM)': [
-    { label: 'GLM-5.2 Ultra（推荐）', model: 'glm-5.2-ultra', api_base: 'https://open.bigmodel.cn/api/paas/v4', note: '旗舰/100万Token/长Agent' },
-    { label: 'GLM-5.2 Standard', model: 'glm-5.2-standard', api_base: 'https://open.bigmodel.cn/api/paas/v4', note: '均衡通用/32K' },
+    { label: 'GLM-5.1（推荐）', model: 'glm-5.1', api_base: 'https://api.z.ai/api/paas/v4', note: '长程 Agent 与代码' },
+    { label: 'GLM-5 Turbo', model: 'glm-5-turbo', api_base: 'https://api.z.ai/api/paas/v4', note: '高速主力' },
   ],
   'MiniMax': [
-    { label: 'MiniMax M3 Ultra（推荐）', model: 'MiniMax-M3-Ultra', api_base: 'https://api.minimax.chat/v1', note: '多模态旗舰/100万Token' },
-    { label: 'MiniMax M3 Flash', model: 'MiniMax-M3-Flash', api_base: 'https://api.minimax.chat/v1', note: '高并发极速版' },
-    { label: 'MiniMax M2.7', model: 'MiniMax-M2.7', api_base: 'https://api.minimax.chat/v1', note: '纯文本旗舰/200K上下文' },
-    { label: 'MiniMax M2.7 Highspeed', model: 'MiniMax-M2.7-highspeed', api_base: 'https://api.minimax.chat/v1', note: '极速/实时对话' },
+    { label: 'MiniMax M3（推荐）', model: 'MiniMax-M3', api_base: 'https://api.minimax.io/v1', note: '旗舰 Agent/代码/多模态' },
+    { label: 'MiniMax M2.7', model: 'MiniMax-M2.7', api_base: 'https://api.minimax.io/v1', note: '稳定高性价比' },
   ],
   '本地 Ollama（免费）': [
     { label: 'Qwen2.5 7B', model: 'qwen2.5:7b', api_base: 'http://localhost:11434/v1', note: '推荐' },
@@ -141,7 +132,7 @@ const Settings: React.FC = () => {
       setGiteeStatus(giteeRes);
     } catch {
       defaultApiForm.setFieldsValue({
-        model: 'gpt-4o',
+        model: 'gpt-5.6-sol',
         api_base: 'https://api.openai.com/v1',
         max_tokens: 20480,
         temperature: 0.7,
@@ -314,9 +305,10 @@ const Settings: React.FC = () => {
                   extra={<Text type="secondary" className="text-xs">仅对你生效（按账号隔离），不影响其他用户</Text>}
                 >
                   <div className="mb-4">
-                    <div className="text-sm font-medium mb-2 flex items-center gap-1">
+                    <div className="mb-2 flex items-center gap-2">
                       <ThunderboltOutlined className="text-yellow-500" />
-                      快速选择模型（自动填充 URL 和模型名）
+                      <span className="text-sm font-medium">快速选择模型</span>
+                      <span className="text-xs text-gray-400">仅用于快速填充模型名称和 URL</span>
                     </div>
                     <Select
                       style={{ width: '100%' }}
@@ -347,9 +339,6 @@ const Settings: React.FC = () => {
                         </OptGroup>
                       ))}
                     </Select>
-                    <div className="text-xs text-gray-400 mt-1">
-                      选择后可在下方修改任意字段，最终以下方填写的内容为准
-                    </div>
                   </div>
 
                   <Divider className="my-3" />
@@ -360,7 +349,7 @@ const Settings: React.FC = () => {
                         <Form.Item
                           label="模型名称"
                           name="model"
-                          extra={<span className="text-xs text-gray-400">如：deepseek-v4-pro、gpt-4o、claude-3-5-sonnet-20241022</span>}
+                          extra={<span className="text-xs text-gray-400">如：deepseek-v4-pro、gpt-5.6-sol、claude-sonnet-5</span>}
                         >
                           <Input placeholder="输入模型名称" />
                         </Form.Item>
@@ -679,7 +668,7 @@ const Settings: React.FC = () => {
           },
           {
             key: 'ide',
-            label: <span><CodeOutlined /> IDE 集成</span>,
+            label: <span><CodeOutlined /> MCP 服务</span>,
             children: <IdeIntegration />,
           },
         ]}

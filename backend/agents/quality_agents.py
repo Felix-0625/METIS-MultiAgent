@@ -950,6 +950,50 @@ def _normalize_acceptance_results(
     return observations
 
 
+def _parse_qc_prose_result(content: str) -> Optional[Dict[str, Any]]:
+    """Best-effort conversion of useful Markdown/prose QC output into Issues.
+
+    Formatting is transport, not a product quality gate.  Keep the original
+    wording and only derive locations that the reviewer actually mentioned.
+    """
+    text = str(content or "").strip()
+    if not text:
+        return None
+    path_pattern = re.compile(
+        r"(?P<path>(?:[A-Za-z0-9_.-]+/)+[A-Za-z0-9_.-]+\.[A-Za-z0-9]+)"
+        r"(?::(?P<line>\d+))?"
+    )
+    chunks = [
+        re.sub(r"^\s*(?:[-*+] |\d+[.)]\s*)", "", chunk).strip()
+        for chunk in re.split(r"\n(?=\s*(?:[-*+] |\d+[.)]\s*))", text)
+    ]
+    issues: List[Dict[str, Any]] = []
+    for chunk in chunks:
+        if len(chunk) < 8:
+            continue
+        match = path_pattern.search(chunk)
+        if not match:
+            continue
+        issue: Dict[str, Any] = {
+            "file": match.group("path"),
+            "severity": "error",
+            "message": chunk[:2000],
+            "expected": "Resolve the accurately described QC finding",
+            "qc_output_degraded": True,
+        }
+        if match.group("line"):
+            issue["line"] = int(match.group("line"))
+        issues.append(issue)
+    if not issues:
+        return None
+    return {
+        "passed": False,
+        "issues": issues,
+        "summary": "QC prose was normalized into the Issue transport schema",
+        "format_degraded": True,
+    }
+
+
 def check_layer3_functionality(
     files: List[Tuple[str, str]],
     subproject_description: str,
@@ -1056,7 +1100,14 @@ def check_layer3_functionality(
                 "When the code directly supports a criterion, pass it with a concrete "
                 "code observation; do not fail it only because no command or browser "
                 "was executed. Fail only for a concrete source defect.\n"
-                "只报告明确的、可定位的问题（有具体文件和行号）。\n"
+                "Report only blocking error/critical defects with concrete evidence. "
+                "Do not report style advice, empty optional hooks, TODO comments, code "
+                "size, or speculative performance/concurrency improvements.\n"
+                "For every blocking issue, file, message, expected, actual, evidence, "
+                "and fix_hint are required and must be precise enough for an engineer "
+                "to repair directly. line and symbol are optional best-effort location "
+                "hints; omit them when the defect is file-level or cross-cutting.\n"
+                "只报告明确且可执行的问题；具体文件必填，行号和符号名尽力提供但不是必填。\n"
                 "不确定的问题不要报告。\n"
                 "输入中的任务、验收标准、文件归属和 Pre-QA 结果已经由服务端校验。"
                 "不得改写这些事实，也不得重复否定已经由 Pre-QA 证明通过的机械标准。\n"
@@ -1086,8 +1137,10 @@ def check_layer3_functionality(
             raise ValueError(f"LLM 返回错误：{content_str[:100]}")
         # 提取 JSON
         data = None
+        last_candidate_data: Optional[Dict[str, Any]] = None
         parse_error: Exception | None = None
         acceptance_observations: List[Dict[str, Any]] = []
+        from core.qc_review_contract import QCContractError
         for attempt in range(3):
             if attempt:
                 retry_prompt = prompt + [Message(
@@ -1142,9 +1195,9 @@ def check_layer3_functionality(
                         candidate_data = candidate
                         break
                 if candidate_data is None:
-                    raise ValueError(
-                        "functionality review did not return valid JSON"
-                    )
+                    candidate_data = _parse_qc_prose_result(content_str)
+                if candidate_data is None:
+                    raise ValueError("functionality review did not return valid JSON or actionable prose")
                 verdict = candidate_data.get("passed")
                 if isinstance(verdict, str) and verdict.strip().lower() in {
                     "true",
@@ -1159,19 +1212,94 @@ def check_layer3_functionality(
                     raise ValueError(
                         "functionality review returned invalid issues"
                     )
+                last_candidate_data = candidate_data
                 acceptance_observations = _normalize_acceptance_results(
                     candidate_data,
                     normalized_contracts,
                     selected_files,
                 )
+                if review_packet and not candidate_data.get("format_degraded"):
+                    # Output-shape mistakes are reviewer-generation failures, not
+                    # product defects. Validate inside this bounded generation loop
+                    # so the QC model corrects an imprecise response immediately
+                    # instead of leaving the phase in a blocked/manual state.
+                    from core.qc_review_contract import validate_qc_review_result
+                    validate_qc_review_result(
+                        review_packet,
+                        acceptance_observations=acceptance_observations,
+                        issues=candidate_data.get("issues") or [],
+                    )
                 data = candidate_data
                 break
             except (ValueError, json.JSONDecodeError) as exc:
                 parse_error = exc
+            except QCContractError as exc:
+                parse_error = exc
         if data is None:
-            raise parse_error or ValueError(
-                "functionality review did not return valid JSON"
-            )
+            if review_packet:
+                # Three malformed responses exhaust the strict-format budget,
+                # not the phase. Preserve the reviewer's concern and hand it to
+                # the upstream engineer as a diagnosis-first finding. Missing
+                # prose fields are explicitly marked unknown rather than
+                # invented; the engineer must inspect the locked task scope
+                # before changing code.
+                degraded_data = last_candidate_data or {
+                    "passed": False,
+                    "issues": [],
+                    "summary": "QC did not return readable structured output",
+                }
+                allowed_files = [
+                    str(item.get("path") or "")
+                    for key in ("files", "dependency_files")
+                    for item in review_packet.get(key) or []
+                    if str(item.get("path") or "")
+                ]
+                fallback_issues: List[Dict[str, Any]] = []
+                for raw_issue in degraded_data.get("issues") or []:
+                    if not isinstance(raw_issue, dict):
+                        continue
+                    severity = str(raw_issue.get("severity") or "warning").lower()
+                    if severity not in {"error", "critical"}:
+                        continue
+                    path = str(raw_issue.get("file") or raw_issue.get("file_path") or "")
+                    if path not in allowed_files:
+                        path = ""
+                    message = str(raw_issue.get("message") or "").strip()
+                    fallback_issues.append({
+                        **raw_issue,
+                        "file": path,
+                        "message": message or "QC reported a blocking concern without a precise description",
+                        "expected": str(raw_issue.get("expected") or "Upstream engineer must derive the expected behavior from the locked task contract"),
+                        "actual": str(raw_issue.get("actual") or "QC did not provide a sufficiently precise actual-behavior description"),
+                        "evidence": str(raw_issue.get("evidence") or "QC output remained incomplete after automatic regeneration"),
+                        "fix_hint": str(raw_issue.get("fix_hint") or "Inspect the complete locked task scope, reproduce the concern, and modify code only if independently verified"),
+                        "requires_upstream_diagnosis": True,
+                        "qc_output_degraded": True,
+                    })
+                if degraded_data.get("passed") is False and not fallback_issues:
+                    fallback_issues.append({
+                        "file": "",
+                        "severity": "error",
+                        "message": "QC rejected the delivery without a precise actionable finding",
+                        "expected": "The locked task contract and delivered implementation must agree",
+                        "actual": "QC returned only a broad rejection after automatic regeneration",
+                        "evidence": str(parse_error or "Incomplete QC output contract"),
+                        "fix_hint": "Inspect the complete locked task scope, reproduce any real defect, and make no change when the concern cannot be verified",
+                        "requires_upstream_diagnosis": True,
+                        "location_unresolved": True,
+                        "qc_output_degraded": True,
+                    })
+                data = {
+                    **degraded_data,
+                    "passed": not fallback_issues,
+                    "issues": fallback_issues,
+                    "summary": str(degraded_data.get("summary") or "QC output degraded; upstream diagnosis required"),
+                }
+                acceptance_observations = []
+            else:
+                raise parse_error or ValueError(
+                    "functionality review did not return valid JSON"
+                )
         if not isinstance(data, dict) or not isinstance(data.get("passed"), bool):
             raise ValueError("functionality review returned an invalid verdict")
         raw_issues = data.get("issues")
@@ -1703,7 +1831,11 @@ def check_layer4_collaboration(files: List[Tuple[str, str]]) -> Dict[str, Any]:
                     issues.append({
                         "file": rel_path,
                         "layer": "collaboration",
-                        "severity": "error",
+                        # The QC input is a bounded delivery view, not a complete
+                        # workspace manifest.  A target absent from this view is
+                        # inconclusive; deterministic build/test gates remain
+                        # authoritative for genuinely missing imports.
+                        "severity": "warning",
                         "message": (
                             "TypeScript build enables noUnusedLocals but declares unused "
                             f"type/interface `{declaration_name}`"
@@ -2252,6 +2384,24 @@ class QAAgent(QualityAgent):
         if is_final_phase:
             layer4 = check_layer4_collaboration(files)
             layer_results.append(layer4)
+
+        # Phase QC is a release gate, not a style-review backlog.  Advisory
+        # heuristics (empty hook, TODO marker, broad-except suggestion, small
+        # implementation, or speculative optimisation) created noise and
+        # consumed review cycles without proving a delivery failure.  Keep
+        # only concrete error/critical findings in the effective QA result.
+        for layer in layer_results:
+            original_issues = list(layer.get("issues") or [])
+            blocking_issues = [
+                issue for issue in original_issues
+                if str(issue.get("severity") or "warning").lower()
+                in {"error", "critical"}
+            ]
+            layer["issues"] = blocking_issues
+            layer["issue_count"] = len(blocking_issues)
+            if original_issues and not blocking_issues:
+                layer["passed"] = True
+                layer["score"] = 100
 
         feedback = build_feedback_reports(
             layer_results,

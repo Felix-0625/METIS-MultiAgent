@@ -337,7 +337,8 @@ def verify_contract_artifacts(
         except (OSError, UnicodeError):
             issues.append(VerificationIssue("unreadable_required_file", "required file is not readable UTF-8 text", path))
             continue
-        if not content.strip():
+        empty_marker_files = {"__init__.py", "__init__.pyi", ".gitkeep", "py.typed"}
+        if not content.strip() and target.name not in empty_marker_files:
             issues.append(VerificationIssue("empty_required_file", "required file is empty", path))
         for label, pattern in _PLACEHOLDER_PATTERNS:
             effective_pattern = (

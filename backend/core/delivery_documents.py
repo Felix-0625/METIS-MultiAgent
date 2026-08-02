@@ -113,18 +113,15 @@ def _load_database_document(
     return value, str(record.get("sha256") or "") or None
 
 
-def _atomic_write_pair(payloads: Iterable[tuple[Path, Dict[str, Any]]]) -> None:
+def _atomic_write_pair(payloads: Iterable[tuple[Path, bytes]]) -> None:
     prepared = []
     replaced = []
     try:
-        for path, value in payloads:
+        for path, payload in payloads:
             path.parent.mkdir(parents=True, exist_ok=True)
             previous = path.read_bytes() if path.is_file() else None
             temporary = path.with_name(f".{path.name}.{uuid.uuid4().hex}.tmp")
-            temporary.write_text(
-                json.dumps(value, ensure_ascii=False, indent=2) + "\n",
-                encoding="utf-8",
-            )
+            temporary.write_bytes(payload)
             prepared.append((path, temporary, previous))
         for path, temporary, previous in prepared:
             os.replace(temporary, path)
@@ -532,8 +529,8 @@ def record_successful_task_delivery(
         )
         try:
             _atomic_write_pair((
-                (responsibility_path, responsibility),
-                (phase_delivery_path, phase_delivery),
+                (responsibility_path, responsibility_bytes),
+                (phase_delivery_path, phase_delivery_bytes),
             ))
         except OSError:
             logger.exception(
@@ -586,7 +583,9 @@ def load_phase_qa_scope(
     )
     issues = []
     scoped_files: Dict[str, Dict[str, Any]] = {}
-    delivered_by_path: Dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
+    delivered_by_path: Dict[
+        str, list[tuple[str, Mapping[str, Any], Mapping[str, Any]]]
+    ] = {}
     incomplete_task_ids = []
     ledger_files = responsibility.get("files") or {}
     for task_id, task in (phase_delivery.get("tasks") or {}).items():
@@ -604,7 +603,9 @@ def load_phase_qa_scope(
             path = _normalized_path(raw.get("path"))
             if is_qc_excluded_path(path):
                 continue
-            delivered_by_path.setdefault(path, []).append((str(task_id), raw))
+            delivered_by_path.setdefault(path, []).append(
+                (str(task_id), raw, delivery)
+            )
 
     for path, deliveries in delivered_by_path.items():
         ledger = ledger_files.get(path)
@@ -626,7 +627,8 @@ def load_phase_qa_scope(
         actual_sha = str(ledger.get("sha256") or "")
         actual_revision = int(ledger.get("current_revision") or 0)
         current_delivery = next((
-            (task_id, raw) for task_id, raw in deliveries
+            (task_id, raw, delivery)
+            for task_id, raw, delivery in deliveries
             if str(raw.get("sha256") or "") == actual_sha
             and int(raw.get("revision") or 0) == actual_revision
         ), None)
@@ -657,14 +659,23 @@ def load_phase_qa_scope(
                     ),
                 })
                 continue
-        task_id, _raw = current_delivery
+        task_id, _raw, current_delivery_owner = current_delivery
         scoped_files[path] = {
             "path": path,
-            "phase_id": str(responsible.get("phase_id") or phase_id),
-            "task_id": str(responsible.get("task_id") or task_id),
-            "agent_id": str(responsible.get("agent_id") or ""),
-            "expert_id": str(responsible.get("expert_id") or ""),
-            "agent_role": str(responsible.get("agent_role") or ""),
+            "phase_id": phase_id,
+            "task_id": task_id,
+            "agent_id": str(
+                current_delivery_owner.get("agent_id")
+                or responsible.get("agent_id") or ""
+            ),
+            "expert_id": str(
+                current_delivery_owner.get("expert_id")
+                or responsible.get("expert_id") or ""
+            ),
+            "agent_role": str(
+                current_delivery_owner.get("agent_role")
+                or responsible.get("agent_role") or ""
+            ),
             "revision": actual_revision,
             "sha256": actual_sha,
             "size_bytes": int(ledger.get("size_bytes") or 0),
@@ -680,6 +691,99 @@ def load_phase_qa_scope(
             responsibility.get("ledger_revision") or 0
         ),
     }
+
+
+def reconcile_phase_delivery_generation(
+    *,
+    workspace: Path,
+    project_id: str,
+    phase_id: str,
+    current_agent_ids: Iterable[str],
+    registered_paths: Iterable[str],
+) -> list[str]:
+    """Retire files owned only by an earlier execution generation."""
+    workspace = Path(workspace)
+    phase_path = f"{PHASE_DELIVERY_DIRECTORY}/{phase_id}.json"
+    with _workspace_lock(workspace):
+        records = load_project_files(project_id)
+        if (
+            RESPONSIBILITY_RELATIVE_PATH not in records
+            or phase_path not in records
+        ):
+            return []
+        responsibility, responsibility_hash = _load_database_document(
+            records, RESPONSIBILITY_RELATIVE_PATH, RESPONSIBILITY_SCHEMA, {},
+        )
+        phase_delivery, phase_hash = _load_database_document(
+            records, phase_path, PHASE_DELIVERY_SCHEMA, {},
+        )
+        active_agents = {str(value) for value in current_agent_ids if value}
+        registered = {_normalized_path(value) for value in registered_paths if value}
+        files = responsibility.get("files") or {}
+        stale_paths = sorted(
+            path for path, entry in files.items()
+            if isinstance(entry, Mapping)
+            and str((entry.get("current_responsible") or {}).get("phase_id") or "") == phase_id
+            and str((entry.get("current_responsible") or {}).get("agent_id") or "") not in active_agents
+            and _normalized_path(path) not in registered
+        )
+        if not stale_paths:
+            return []
+        stale = set(stale_paths)
+        superseded = responsibility.setdefault("superseded_files", [])
+        for path in stale_paths:
+            superseded.append({
+                "path": path,
+                "reason": "previous_execution_generation",
+                "record": files.pop(path),
+                "superseded_at": _now_iso(),
+            })
+        for task in (phase_delivery.get("tasks") or {}).values():
+            delivery = task.get("delivery") if isinstance(task, Mapping) else None
+            if not isinstance(delivery, dict):
+                continue
+            delivery["files"] = [
+                item for item in (delivery.get("files") or [])
+                if _normalized_path(item.get("path")) not in stale
+            ]
+        responsibility["ledger_revision"] = int(
+            responsibility.get("ledger_revision") or 0
+        ) + 1
+        responsibility["generated_at"] = _now_iso()
+        phase_delivery["generated_at"] = _now_iso()
+        phase_delivery["responsibility_ledger_revision"] = responsibility[
+            "ledger_revision"
+        ]
+        responsibility_bytes = (
+            json.dumps(responsibility, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+        phase_bytes = (
+            json.dumps(phase_delivery, ensure_ascii=False, indent=2) + "\n"
+        ).encode("utf-8")
+        commit_project_files(
+            project_id,
+            {
+                RESPONSIBILITY_RELATIVE_PATH: {
+                    "content": responsibility_bytes,
+                    "kind": "file_responsibility_document",
+                    "phase_id": phase_id,
+                },
+                phase_path: {
+                    "content": phase_bytes,
+                    "kind": "phase_delivery_document",
+                    "phase_id": phase_id,
+                },
+            },
+            expected_sha256={
+                RESPONSIBILITY_RELATIVE_PATH: responsibility_hash,
+                phase_path: phase_hash,
+            },
+        )
+        _atomic_write_pair((
+            (workspace / RESPONSIBILITY_RELATIVE_PATH, responsibility_bytes),
+            (workspace / phase_path, phase_bytes),
+        ))
+        return stale_paths
 
 
 def load_final_qa_scope(

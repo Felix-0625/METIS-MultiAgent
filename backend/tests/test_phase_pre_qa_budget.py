@@ -64,6 +64,60 @@ def test_non_applicable_pre_qa_evidence_is_not_added_to_quality_round():
     assert machine.records[0]["metadata"]["applicable"] is True
 
 
+def test_passed_pre_qa_records_structured_scoped_summary():
+    class _ScopedEvidenceMachine(_EvidenceMachine):
+        def to_dict(self):
+            return {
+                "run_id": "run-1",
+                "scope": {
+                    "project_id": "project-1",
+                    "phase_id": "phase-1",
+                    "phase_generation_id": "generation-1",
+                    "scope_digest": "scope-1",
+                    "artifact_digest": "artifact-1",
+                },
+            }
+
+    machine = _ScopedEvidenceMachine()
+    routes_phases._record_pre_qa_machine_evidence(machine, {
+        "passed": True,
+        "status": "passed",
+        "evidence": [{
+            "kind": "file_exists",
+            "gate_id": "required-file",
+            "command": "check required file",
+            "exit_code": 0,
+            "passed": True,
+            "applicable": True,
+            "executed": True,
+            "log_digest": "sha256:raw",
+        }],
+    })
+
+    summary = next(record for record in machine.records if record["kind"] == "pre_qa")
+    assert summary["passed"] is True
+    assert summary["metadata"] == {
+        "project_id": "project-1",
+        "phase_id": "phase-1",
+        "phase_generation_id": "generation-1",
+        "scope_digest": "scope-1",
+        "artifact_digest": "artifact-1",
+        "result": "passed",
+        "evidence_count": 1,
+    }
+
+
+def test_failed_pre_qa_does_not_record_passing_summary():
+    machine = _EvidenceMachine()
+    routes_phases._record_pre_qa_machine_evidence(machine, {
+        "passed": False,
+        "status": "pre_qa_failed",
+        "evidence": [],
+    })
+
+    assert not any(record["kind"] == "pre_qa" for record in machine.records)
+
+
 def _ctx(tmp_path, project_id):
     return SimpleNamespace(
         project_id=project_id,

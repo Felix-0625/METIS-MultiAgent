@@ -497,7 +497,7 @@ class PMMemberAgent:
         }
 
     def to_persist(self) -> Dict:
-        return {
+        payload = {
             "member_id": self.member_id,
             "name": self.name,
             "agent_id": self.agent_id,
@@ -509,6 +509,7 @@ class PMMemberAgent:
             "phase_confirmed": self.phase_confirmed,
             "status": self.status,
         }
+        return payload
 
     def from_persist(self, data: Dict) -> None:
         self.conversation_history = data.get("conversation_history", [])
@@ -1423,7 +1424,7 @@ class PMLeaderAgent(AgentBase):
         }
 
     def to_persist(self) -> Dict:
-        return {
+        payload = {
             "draft_plan": self.draft_plan,
             "final_plan": self.final_plan,
             "plan_confirmed": self.plan_confirmed,
@@ -1442,6 +1443,7 @@ class PMLeaderAgent(AgentBase):
             "requirement_events": self.requirement_events,
             "members": {mid: m.to_persist() for mid, m in self.members.items()},
         }
+        return json.loads(json.dumps(payload, ensure_ascii=False))
 
     def from_persist(self, data: Dict) -> None:
         loaded_draft = data.get("draft_plan")
@@ -1476,7 +1478,11 @@ class PMLeaderAgent(AgentBase):
         self.canonical_requirements = rebuilt_canonical
         self.requirements_revision = rebuilt_revision
         self.requirements_digest = rebuilt_digest
-        self.plan_status = data.get("plan_status") or ("confirmed" if self.plan_confirmed else "saved")
+        self.plan_status = (
+            data.get("plan_status")
+            if "plan_status" in data
+            else ("confirmed" if self.plan_confirmed else "saved")
+        )
 
         requirements_bound_plan = (
             self.final_plan if self.plan_confirmed and self.final_plan else self.draft_plan

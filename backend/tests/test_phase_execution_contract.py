@@ -7,6 +7,7 @@ from core.evidence import EvidenceKind, create_evidence
 from core.phase_execution_contract import (
     PHASE_EXECUTION_SCHEMA_VERSION,
     PhaseExecutionContractError,
+    _artifact_evidence_for_assignment,
     _merged_phase_tasks,
     acceptance_criterion_contracts,
     build_phase_dispatch_plan,
@@ -17,6 +18,61 @@ from core.phase_execution_contract import (
     validate_task_graph,
     validate_task_owners,
 )
+
+
+def test_historical_task_artifact_survives_same_phase_successor(tmp_path):
+    path = "frontend/src/App.vue"
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"successor bytes")
+    original = b"original bytes"
+    evidence, digest, _ = _artifact_evidence_for_assignment(
+        phase_id="phase-1",
+        agent_id="agent-original",
+        run_id="run-original",
+        workspace=tmp_path,
+        file_registry={path: {
+            "phase_id": "phase-1",
+            "agent_id": "agent-successor",
+        }},
+        required_files=[path],
+        delivery_evidence={"files": [{
+            "path": path,
+            "sha256": hashlib.sha256(original).hexdigest(),
+            "size": len(original),
+        }]},
+    )
+
+    assert digest.startswith("sha256:")
+    assert evidence.payload["checks"][0]["passed"] is True
+    assert evidence.payload["checks"][0]["historical_delivery"] is True
+
+
+def test_historical_task_artifact_rejects_cross_phase_successor(tmp_path):
+    path = "frontend/src/App.vue"
+    target = tmp_path / path
+    target.parent.mkdir(parents=True)
+    target.write_bytes(b"later phase bytes")
+    original = b"original bytes"
+    evidence, digest, _ = _artifact_evidence_for_assignment(
+        phase_id="phase-1",
+        agent_id="agent-original",
+        run_id="run-original",
+        workspace=tmp_path,
+        file_registry={path: {
+            "phase_id": "phase-2",
+            "agent_id": "agent-successor",
+        }},
+        required_files=[path],
+        delivery_evidence={"files": [{
+            "path": path,
+            "sha256": hashlib.sha256(original).hexdigest(),
+            "size": len(original),
+        }]},
+    )
+
+    assert digest == ""
+    assert evidence.payload["checks"][0]["passed"] is False
 
 
 def test_phase_pm_acceptance_criteria_are_the_execution_contract():
@@ -979,6 +1035,57 @@ def test_dispatch_serializes_independent_tasks_owned_by_same_agent():
         ["one"],
         ["two"],
     ]
+
+
+def test_dispatch_serializes_different_agents_that_touch_same_file():
+    tasks = [
+        {
+            "task_id": "create-ui", "name": "Create UI", "roles": ["frontend"],
+            "dependencies": [], "required_files": ["frontend/src/App.vue"],
+            "acceptance_criteria": ["UI exists"],
+        },
+        {
+            "task_id": "wire-ui", "name": "Wire UI", "roles": ["integration"],
+            "dependencies": [], "required_files": ["frontend\\src\\App.vue"],
+            "acceptance_criteria": ["UI is wired"],
+        },
+    ]
+    phase = _phase(roles=("frontend", "integration"), tasks=tasks)
+    assignments = [
+        {"agent_id": "agent-ui", "required_role": "frontend", "task_ids": ["create-ui"]},
+        {"agent_id": "agent-integration", "required_role": "integration", "task_ids": ["wire-ui"]},
+    ]
+
+    plan = build_phase_dispatch_plan([phase], "phase-1", assignments)
+
+    assert [[task["task_id"] for task in wave] for wave in plan["waves"]] == [
+        ["create-ui"],
+        ["wire-ui"],
+    ]
+
+
+def test_dispatch_keeps_different_agents_with_disjoint_files_parallel():
+    tasks = [
+        {
+            "task_id": "ui", "name": "UI", "roles": ["frontend"],
+            "dependencies": [], "required_files": ["frontend/src/App.vue"],
+            "acceptance_criteria": ["UI exists"],
+        },
+        {
+            "task_id": "api", "name": "API", "roles": ["backend"],
+            "dependencies": [], "required_files": ["backend/app/main.py"],
+            "acceptance_criteria": ["API exists"],
+        },
+    ]
+    phase = _phase(roles=("frontend", "backend"), tasks=tasks)
+    assignments = [
+        {"agent_id": "agent-ui", "required_role": "frontend", "task_ids": ["ui"]},
+        {"agent_id": "agent-api", "required_role": "backend", "task_ids": ["api"]},
+    ]
+
+    plan = build_phase_dispatch_plan([phase], "phase-1", assignments)
+
+    assert [[task["task_id"] for task in wave] for wave in plan["waves"]] == [["ui", "api"]]
 
 
 def test_cycle_unknown_dependency_and_future_phase_fail_closed():

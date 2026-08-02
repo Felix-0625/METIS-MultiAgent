@@ -14,9 +14,10 @@ import {
   BulbOutlined, SettingOutlined,
   MenuFoldOutlined, MenuUnfoldOutlined, FolderOpenOutlined, AppstoreOutlined,
   TeamOutlined, PartitionOutlined, DashboardOutlined,
-  AuditOutlined, ToolOutlined, CodeOutlined,
+  AuditOutlined, CodeOutlined,
   ArrowLeftOutlined, LogoutOutlined, UsergroupAddOutlined,
   QuestionCircleOutlined,
+  BarChartOutlined,
 } from '@ant-design/icons';
 import { detectPlatform } from './platform/detect';
 import type { Platform } from './platform/detect';
@@ -31,15 +32,14 @@ const Settings = lazy(() => import('./pages/Settings'));
 const PMTeamChat = lazy(() => import('./pages/PMTeamChat'));
 const PhaseBoard = lazy(() => import('./pages/PhaseBoard'));
 const EngineerWorkspace = lazy(() => import('./pages/EngineerWorkspace'));
-const TeamHealth = lazy(() => import('./pages/PhaseBoard/TeamHealth'));
 const SupervisorLeaderPage = lazy(() => import('./pages/SupervisorLeaderPage'));
-const ProjectAdjustment = lazy(() => import('./pages/ProjectAdjustment'));
 const IdeaLanding = lazy(() => import('./pages/IdeaLanding'));
 const ResourceCenter = lazy(() => import('./pages/ResourceCenter'));
 const TestDashboard = lazy(() => import('./pages/TestDashboard'));
 const LoginPage = lazy(() => import('./pages/LoginPage'));
 const UserManagement = lazy(() => import('./pages/UserManagement'));
 const Guide = lazy(() => import('./pages/Guide'));
+const DataDashboard = lazy(() => import('./pages/DataDashboard'));
 
 const { Sider, Content } = Layout;
 
@@ -83,7 +83,6 @@ const ProjectLayout: React.FC = () => {
     { key: 'files',       label: '文件管理',    icon: <FolderOpenOutlined />, external: false },
     { key: 'team',        label: '团队页',      icon: <TeamOutlined />,      external: false },
     { key: 'supervisor',  label: '监督组长',    icon: <AuditOutlined />,      external: false },
-    { key: 'adjustment',  label: '项目调整',    icon: <ToolOutlined />,       external: false },
     { key: 'engineer',    label: '全栈工程师',  icon: <CodeOutlined />,       external: true  },
   ];
 
@@ -91,13 +90,13 @@ const ProjectLayout: React.FC = () => {
 
   return (
     <div style={{ display: 'flex', flexDirection: 'column', height: '100%' }}>
-      <div style={{
+      <div className="metis-project-header" style={{
         position: 'sticky', top: 0, zIndex: 60,
         background: '#fff', borderBottom: '1px solid #e0e0e0',
         padding: '16px 24px 0', boxShadow: '0 2px 8px rgba(0,0,0,0.03)',
       }}>
         <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginBottom: 14 }}>
-          <button onClick={() => navigate('/projects')} style={{
+          <button className="metis-project-back" onClick={() => navigate('/projects')} style={{
             background: '#f5f5f5', border: '1px solid #e0e0e0', borderRadius: 8,
             padding: '5px 14px', cursor: 'pointer', fontSize: 13, color: '#595959',
             display: 'flex', alignItems: 'center', gap: 6, fontWeight: 500, whiteSpace: 'nowrap',
@@ -110,7 +109,7 @@ const ProjectLayout: React.FC = () => {
             </span>
           )}
         </div>
-        <div style={{ display: 'flex', gap: 20, paddingBottom: 0 }}>
+        <div className="metis-project-tabs" style={{ display: 'flex', gap: 20, paddingBottom: 0 }}>
           {tabItems.map(item => (
             <button
               key={item.key}
@@ -139,9 +138,9 @@ const ProjectLayout: React.FC = () => {
           <Route path="board"       element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><ProgressBoard /></div>} />
           <Route path="files"       element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><FileBrowser /></div>} />
           <Route path="supervisor"  element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><SupervisorLeaderPage /></div>} />
-          <Route path="adjustment"  element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><ProjectAdjustment /></div>} />
-          <Route path="team"       element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><TeamHealth /></div>} />
-          <Route path="agents"      element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><ProjectAgents /></div>} />
+          <Route path="adjustment"  element={<Navigate to={`/engineer/${id}?tab=adjustment`} replace />} />
+          <Route path="team"       element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><ProjectAgents /></div>} />
+          <Route path="agents"      element={<Navigate to={`/projects/${id}/team`} replace />} />
           <Route path="qa"          element={<div style={{ height: '100%', overflowY: 'auto', padding: '16px 20px' }}><QAReport /></div>} />
           <Route path="*"           element={<Navigate to="pm-team" replace />} />
         </Routes>
@@ -230,6 +229,7 @@ const App: React.FC = () => {
     { key: '/projects',  icon: <FolderOpenOutlined />,  label: '项目' },
     { key: '/idea',      icon: <BulbOutlined />,         label: '想法落地' },
     { key: '/resources', icon: <AppstoreOutlined />,     label: '资源中心' },
+    { key: '/dashboard', icon: <BarChartOutlined />,      label: '数据看板' },
     { key: '/guide',     icon: <QuestionCircleOutlined />, label: '使用说明' },
     { key: '/settings',  icon: <SettingOutlined />,      label: '设置' },
     ...(isAdmin
@@ -256,9 +256,10 @@ const App: React.FC = () => {
           </Routes>
         </Suspense>
       ) : (
-      <Layout className="min-h-screen">
+      <Layout className="min-h-screen metis-shell">
         <Sider
           trigger={null} collapsible collapsed={collapsed} width={240}
+          className="metis-sider"
           style={{
             position: 'fixed', height: '100vh', left: 0, top: 0, zIndex: 100,
             background: '#1c1b1f', borderRight: '1px solid rgba(255,255,255,0.06)',
@@ -325,8 +326,8 @@ const App: React.FC = () => {
           )}
         </Sider>
 
-        <Layout style={{ marginLeft: collapsed ? 80 : 240, transition: 'margin-left 0.2s' }}>
-          <Content style={{ minHeight: '100vh', background: '#f5f5f5' }}>
+        <Layout className="metis-main-layout" style={{ marginLeft: collapsed ? 80 : 240, transition: 'margin-left 0.2s' }}>
+          <Content className="metis-content" style={{ minHeight: '100vh', background: '#f5f5f5' }}>
             <Suspense fallback={<div style={{ minHeight: '100%', background: '#f5f5f5' }} />}>
             <Routes>
               <Route path="/"           element={<Navigate to="/projects" replace />} />
@@ -339,6 +340,7 @@ const App: React.FC = () => {
               <Route path="/test-board" element={<Navigate to="/dev/test-dashboard" replace />} />
               <Route path="/projects"   element={<div style={{ padding: 24, minHeight: '100vh' }}><ProjectList /></div>} />
               <Route path="/resources"  element={<ResourceCenter />} />
+              <Route path="/dashboard"  element={<div style={{ padding: 24, minHeight: '100vh' }}><DataDashboard /></div>} />
               <Route path="/guide"     element={<Guide />} />
               <Route path="/settings"   element={<div style={{ padding: 24, minHeight: '100vh' }}><Settings /></div>} />
               <Route path="/idea"       element={<IdeaLanding />} />

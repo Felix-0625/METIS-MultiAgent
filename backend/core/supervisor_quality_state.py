@@ -123,7 +123,9 @@ def _is_blocker(issue: Dict[str, Any]) -> bool:
     status = str(issue.get("status") or "open").strip().lower()
     severity = str(issue.get("severity") or "error").strip().lower()
     # "deferred" = 5 轮上限后转人工延后，不阻塞当前流程推进（人工队列后续处理）
-    return status not in {"fixed", "verified", "resolved", "deferred"} and severity in {
+    return status not in {
+        "fixed", "verified", "resolved", "deferred", "needs_manual",
+    } and severity in {
         "error", "critical", "blocker", "p0", "p1",
     }
 
@@ -142,6 +144,7 @@ class SupervisorQualityMachine:
         self.data: Dict[str, Any] = copy.deepcopy(data) if isinstance(data, dict) else {}
         self._normalize()
         self._validate_persisted_state()
+        self._persisted_data = _json_copy(self.data)
 
     @classmethod
     def from_dict(cls, data: Optional[Dict[str, Any]] = None) -> "SupervisorQualityMachine":
@@ -149,6 +152,16 @@ class SupervisorQualityMachine:
 
     def to_dict(self) -> Dict[str, Any]:
         return _json_copy(self.data)
+
+    def mark_persisted(self) -> None:
+        """Advance the rollback baseline only after durable commit succeeds."""
+        self._persisted_data = _json_copy(self.data)
+
+    def rollback_unpersisted(self) -> Dict[str, Any]:
+        """Restore the last durable state after a failed checkpoint write."""
+        self.data.clear()
+        self.data.update(_json_copy(self._persisted_data))
+        return self.to_dict()
 
     @property
     def state(self) -> str:
@@ -617,12 +630,15 @@ class SupervisorQualityMachine:
             self._touch("qa_round_resumed")
             return self.to_dict()
 
-        if int(self.data.get("business_rounds_used", 0)) >= MAX_BUSINESS_QA_ROUNDS:
+        if (
+            int(self.data.get("business_rounds_used", 0)) >= MAX_BUSINESS_QA_ROUNDS
+            and not self.data.get("manual_verification_override")
+        ):
             return self._block("The five business QA rounds are exhausted", [])
         if not self._evidence_complete_list(
             self.data.get("pending_evidence") or [],
             self.data.get("required_pre_qa_evidence_kinds") or [],
-        ):
+        ) or not self._pre_qa_evidence_matches_locked_scope():
             raise IllegalQualityTransition(
                 "Complete scoped verification evidence is required before QA"
             )
@@ -1048,6 +1064,7 @@ class SupervisorQualityMachine:
         self.data["manual_items"] = []
         self.data["waiting_for"] = []
         self.data["completed_at"] = None
+        self.data["manual_verification_override"] = True
         self.data["pending_evidence"] = []
         self.data["pending_commands"] = []
         self.data["pending_verification_log"] = []
@@ -1207,6 +1224,36 @@ class SupervisorQualityMachine:
             return self._evidence_complete(record)
         finally:
             self.data["required_evidence_kinds"] = original
+
+    def _pre_qa_evidence_matches_locked_scope(self) -> bool:
+        """Require every pre-QA gate record to bind the immutable run scope."""
+        locked = self.data.get("scope") or {}
+        required = set(self.data.get("required_pre_qa_evidence_kinds") or [])
+        if "pre_qa" not in required:
+            return True
+        evidence = self.data.get("pending_evidence") or []
+        binding_keys = (
+            "project_id",
+            "phase_id",
+            "phase_generation_id",
+            "scope_digest",
+            "artifact_digest",
+        )
+        for kind in required:
+            matching = [item for item in evidence if item.get("kind") == kind]
+            if not matching:
+                return False
+            if not any(
+                all(
+                    not locked.get(key)
+                    or str((item.get("metadata") or {}).get(key) or "")
+                    == str(locked.get(key) or "")
+                    for key in binding_keys
+                )
+                for item in matching
+            ):
+                return False
+        return True
 
     def _refresh_completion_gate(self, issues: Iterable[Dict[str, Any]]) -> None:
         current = self.active_round

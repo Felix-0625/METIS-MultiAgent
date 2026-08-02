@@ -304,6 +304,7 @@ async def _commit_synthesis_result(
     bound_revision: int,
     bound_digest: str,
     result: Dict[str, Any],
+    rollback_snapshot: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """CAS and persist one synthesis result as a single linearized commit."""
     async with _requirements_transaction_lock(project_id):
@@ -312,7 +313,12 @@ async def _commit_synthesis_result(
                 leader,
                 reason="requirements_revision_changed_during_synthesis",
             )
-            await _persist_all_async()
+            try:
+                await _persist_all_async()
+            except Exception:
+                if rollback_snapshot is not None:
+                    _restore_requirement_state(leader, rollback_snapshot)
+                raise
             raise HTTPException(
                 status_code=409,
                 detail={
@@ -320,7 +326,12 @@ async def _commit_synthesis_result(
                     **_requirements_metadata(leader),
                 },
             )
-        await _persist_all_async()
+        try:
+            await _persist_all_async()
+        except Exception:
+            if rollback_snapshot is not None:
+                _restore_requirement_state(leader, rollback_snapshot)
+            raise
         return _public_pm_payload({
             **result,
             **_requirements_metadata(leader),
@@ -794,6 +805,7 @@ async def synthesize_pm_plan(project_id: str, body: Dict):
         ) from exc
     bound_revision = leader.requirements_revision
     bound_digest = leader.requirements_digest
+    synthesis_snapshot = _snapshot_requirement_state(leader)
     fast_mode = body.get("fast_mode", False)
     if not str(requirements).strip():
         leader.plan_status = "validation_failed"
@@ -821,6 +833,7 @@ async def synthesize_pm_plan(project_id: str, body: Dict):
             bound_revision=bound_revision,
             bound_digest=bound_digest,
             result=result,
+            rollback_snapshot=synthesis_snapshot,
         )
 
     try:
@@ -866,6 +879,7 @@ async def synthesize_pm_plan(project_id: str, body: Dict):
         bound_revision=bound_revision,
         bound_digest=bound_digest,
         result=result,
+        rollback_snapshot=synthesis_snapshot,
     )
 
 

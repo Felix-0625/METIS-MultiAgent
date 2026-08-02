@@ -17,6 +17,23 @@ from agents.quality_agents import (
 )
 
 
+def test_qc_markdown_is_normalized_without_format_blocking():
+    from agents.quality_agents import _parse_qc_prose_result
+
+    result = _parse_qc_prose_result(
+        "1. frontend/src/App.vue:42 createTask only updates local state\n"
+        "2. backend/app/main.py health route is missing"
+    )
+
+    assert result is not None
+    assert result["passed"] is False
+    assert [issue["file"] for issue in result["issues"]] == [
+        "frontend/src/App.vue",
+        "backend/app/main.py",
+    ]
+    assert result["issues"][0]["line"] == 42
+
+
 def test_quality_delivery_path_matches_directory_case_insensitively(tmp_path):
     package = tmp_path / "backend" / "package.json"
     package.parent.mkdir()
@@ -586,7 +603,7 @@ def test_concise_complete_code_warns_without_blocking(monkeypatch, tmp_path) -> 
 
     assert result["passed"] is True
     assert result["error_count"] == 0
-    assert result["warning_count"] == 1
+    assert result["warning_count"] == 0
     assert result["needs_rewrite"] is False
 
 

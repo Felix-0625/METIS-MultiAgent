@@ -1,10 +1,11 @@
-import React from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Button, Tag, Badge, Input, Alert, Tooltip } from 'antd';
 import {
   PlayCircleOutlined, AuditOutlined, CheckCircleOutlined,
   LoadingOutlined, FileOutlined, UserOutlined, EditOutlined,
   BugOutlined, OrderedListOutlined, CrownOutlined, SafetyOutlined,
   RocketOutlined, ReloadOutlined,
+  DownOutlined, RightOutlined,
 } from '@ant-design/icons';
 import axios from 'axios';
 import { AutoRepairStatus, PhaseInfo, ReviewResult, FileRecord, API } from './types';
@@ -99,6 +100,14 @@ const PhaseCard: React.FC<PhaseCardProps> = ({
     : '质检记录尚未生成';
   const borderColor = isCompleted ? '#52c41a' : isFailedPhase ? '#ff4d4f' : isActive ? '#1677ff' : '#e8e8e8';
   const boxShadow = isActive ? '0 0 0 2px rgba(22,119,255,0.1)' : undefined;
+  const [expanded, setExpanded] = useState(!isCompleted);
+  const wasCompleted = useRef(isCompleted);
+
+  useEffect(() => {
+    if (isCompleted && !wasCompleted.current) setExpanded(false);
+    if (isActive) setExpanded(true);
+    wasCompleted.current = isCompleted;
+  }, [isActive, isCompleted]);
 
   return (
     <div style={{
@@ -148,6 +157,15 @@ const PhaseCard: React.FC<PhaseCardProps> = ({
           </div>
         </div>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center', flexShrink: 0, flexWrap: 'wrap', justifyContent: 'flex-end' }}>
+          <Button
+            size="small"
+            type="text"
+            icon={expanded ? <DownOutlined /> : <RightOutlined />}
+            aria-label={expanded ? `收起${phase.name}` : `展开${phase.name}`}
+            onClick={() => setExpanded(value => !value)}
+          >
+            {expanded ? '收起' : '展开'}
+          </Button>
           <Button size="small" icon={<OrderedListOutlined />} onClick={() => onSetTaskPreview(phase.phase_id)}>
             任务预览
           </Button>
@@ -169,7 +187,7 @@ const PhaseCard: React.FC<PhaseCardProps> = ({
                 disabled={!canStart || (!!startingPhase && startingPhase !== phase.phase_id)}
                 onClick={() => onStartPhase(phase.phase_id)}
               >
-                启动阶段
+                分配专家并执行
               </Button>
             </Tooltip>
           )}
@@ -235,7 +253,7 @@ const PhaseCard: React.FC<PhaseCardProps> = ({
       </div>
 
       {/* ── Phase Body (shown when active or completed) ── */}
-      {(isActive || isCompleted) && (
+      {expanded && (isActive || isCompleted) && (
         <div style={{ padding: '0 16px 14px', borderTop: '1px solid #f0f0f0', paddingTop: 12 }}>
           {isActive && !canReview && (
             <Alert
@@ -405,7 +423,7 @@ const PhaseCard: React.FC<PhaseCardProps> = ({
       )}
 
       {/* ── Children (PM/Supervisor Chat panels from index.tsx) ── */}
-      {children}
+      {expanded && children}
     </div>
   );
 };

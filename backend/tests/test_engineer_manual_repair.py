@@ -43,18 +43,23 @@ def _patch_engineer_route(monkeypatch, project, agent):
     async def persist():
         return None
 
-    async def reinspection(_project_id, _ctx, _defect):
-        return {"success": True, "status": {"status": "starting", "running": True}}
+    async def targeted_verification(_ctx, _defect, _agent):
+        return {
+            "status": "deferred",
+            "passed": False,
+            "retryable": True,
+            "reason": "test_verification_spec_unavailable",
+            "issues": [],
+        }
 
     monkeypatch.setattr(routes_engineer, "_get_project", lambda _project_id: project)
     monkeypatch.setattr(routes_engineer, "_get_engineer", lambda _project_id: agent)
     monkeypatch.setattr(routes_engineer, "_build_engineer_context", lambda *_args: None)
     monkeypatch.setattr(routes_engineer, "_persist_all_async", persist)
-    monkeypatch.setattr(routes_engineer, "_start_authoritative_reinspection", reinspection)
     monkeypatch.setattr(
         routes_engineer,
-        "_register_authoritative_reinspection",
-        lambda *_args, **_kwargs: None,
+        "_run_engineer_targeted_verification",
+        targeted_verification,
     )
     default_target = Path(project.workspace) / "app.py"
     if default_target.is_file():
@@ -111,7 +116,7 @@ class _ConfirmedPlanMixin:
         }
 
 
-def test_engineer_apply_fix_requires_final_qa(monkeypatch, tmp_path):
+def test_engineer_apply_fix_uses_independent_targeted_verification(monkeypatch, tmp_path):
     target = tmp_path / "app.py"
     target.write_text("print('old')\n", encoding="utf-8")
     issue = {
@@ -141,8 +146,109 @@ def test_engineer_apply_fix_requires_final_qa(monkeypatch, tmp_path):
     ))
     assert issue["status"] == "pending_verification"
     assert issue["repair_workspace_digest"] == compute_workspace_digest(tmp_path)
-    assert result["requires_final_qa"] is True
-    assert result["authoritative_reinspection"]["status"]["running"] is True
+    assert result["requires_final_qa"] is False
+    assert result["targeted_verification"]["status"] == "deferred"
+    assert "authoritative_reinspection" not in result
+
+
+def test_targeted_verification_pass_closes_issue_without_reopening_quality_chain(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "app.py"
+    target.write_text("print('old')\n", encoding="utf-8")
+    issue = {
+        "rule_id": "python.syntax",
+        "status": "needs_manual",
+        "file_path": "app.py",
+        "symbol": "test_actionable_target",
+        "layer": "syntax",
+    }
+    phase = {"phase_id": "phase-1", "status": "completed", "user_confirmed": True}
+    project = SimpleNamespace(
+        project_id="proj-1",
+        workspace=tmp_path,
+        subprojects=[phase],
+        qc_results={"phase-1": {"qa": {"issues_detail": [issue], "qa_round": 7}}},
+    )
+
+    class Agent(_ConfirmedPlanMixin):
+        file_edit_counter = {}
+
+        def apply_fix(self, **_kwargs):
+            target.write_text("print('new')\n", encoding="utf-8")
+            return {"success": True, "backup_path": ""}
+
+    agent = Agent()
+    _patch_engineer_route(monkeypatch, project, agent)
+
+    async def passed(*_args):
+        return {
+            "status": "verified",
+            "passed": True,
+            "retryable": False,
+            "reason": "originating_static_check_replayed",
+            "issues": [],
+        }
+
+    monkeypatch.setattr(routes_engineer, "_run_engineer_targeted_verification", passed)
+    result = asyncio.run(routes_engineer.engineer_apply_fix(
+        "proj-1", _request(defect_id=_defect_id(issue))
+    ))
+
+    assert result["status"] == "verified"
+    assert result["requires_final_qa"] is False
+    assert issue["status"] == "verified"
+    assert phase == {"phase_id": "phase-1", "status": "completed", "user_confirmed": True}
+    assert project.qc_results["phase-1"]["qa"]["qa_round"] == 7
+
+
+def test_targeted_verification_failure_rolls_back_without_consuming_qa_round(
+    monkeypatch, tmp_path
+):
+    target = tmp_path / "app.py"
+    target.write_text("print('old')\n", encoding="utf-8")
+    issue = {
+        "rule_id": "python.behavior",
+        "status": "needs_manual",
+        "file_path": "app.py",
+        "symbol": "test_actionable_target",
+    }
+    project = SimpleNamespace(
+        project_id="proj-1",
+        workspace=tmp_path,
+        subprojects=[],
+        qc_results={"phase-1": {"qa": {"issues_detail": [issue], "qa_round": 4}}},
+    )
+
+    class Agent(_ConfirmedPlanMixin):
+        file_edit_counter = {}
+
+        def apply_fix(self, **_kwargs):
+            target.write_text("print('regression')\n", encoding="utf-8")
+            return {"success": True, "backup_path": ""}
+
+    agent = Agent()
+    _patch_engineer_route(monkeypatch, project, agent)
+
+    async def failed(*_args):
+        return {
+            "status": "failed",
+            "passed": False,
+            "retryable": False,
+            "reason": "original_issue_still_failing",
+            "issues": ["expected old behavior"],
+        }
+
+    monkeypatch.setattr(routes_engineer, "_run_engineer_targeted_verification", failed)
+    result = asyncio.run(routes_engineer.engineer_apply_fix(
+        "proj-1", _request(defect_id=_defect_id(issue))
+    ))
+
+    assert result["success"] is False
+    assert result["rolled_back"] is True
+    assert target.read_text(encoding="utf-8") == "print('old')\n"
+    assert issue["status"] == "needs_manual"
+    assert project.qc_results["phase-1"]["qa"]["qa_round"] == 4
 
 
 def test_engineer_uses_canonical_issue_id_for_listing_and_apply_fix(
@@ -789,80 +895,6 @@ def test_apply_fix_returns_409_when_project_write_fence_is_active(
     assert "Final QA active" in str(caught.value.detail)
 
 
-def test_failed_authoritative_schedule_restores_file_issue_and_counter(
-    monkeypatch, tmp_path
-):
-    target = tmp_path / "app.py"
-    target.write_text("print('old')\n", encoding="utf-8")
-    issue = {
-        "rule_id": "python.output",
-        "id": "issue-1",
-        "status": "needs_manual",
-        "file_path": "app.py",
-    }
-    project = SimpleNamespace(
-        workspace=tmp_path,
-        subprojects=[],
-        qc_results={"__whole_project__": {"qa": {"issues_detail": [issue]}}},
-    )
-    agent = FullStackEngineerAgent.__new__(FullStackEngineerAgent)
-    agent.workspace = tmp_path
-    agent.file_edit_counter = {}
-    agent.file_last_score = {}
-    agent.pending_fixes = {}
-    agent.repair_history = {}
-    canonical_id = _defect_id(issue)
-    agent.confirmed_fix_plans = {
-        canonical_id: {
-            "file_path": "app.py",
-            "version": "plan-v1",
-            "issue_version": routes_engineer.canonicalize_issue(issue)["observation_id"],
-            "authorization": {"mode": "whole_file"},
-            "baseline_sha256": hashlib.sha256(target.read_bytes()).hexdigest(),
-            "target_baseline_artifact_sha256": compute_delivery_manifest(
-                tmp_path
-            )["artifact_sha256"],
-        }
-    }
-    agent.FILE_EDIT_LIMIT = 3
-    agent._quick_static_check = lambda *_args: {"passed": True, "score": 100}
-    agent.add_project_memory = lambda *_args, **_kwargs: None
-
-    scheduling_attempts = 0
-
-    async def flaky_reinspection(*_args):
-        nonlocal scheduling_attempts
-        scheduling_attempts += 1
-        if scheduling_attempts == 1:
-            raise HTTPException(status_code=409, detail="QA run conflict")
-        return {"success": True, "status": {"status": "starting", "running": True}}
-
-    _patch_engineer_route(monkeypatch, project, agent)
-    monkeypatch.setattr(
-        routes_engineer, "_start_authoritative_reinspection", flaky_reinspection
-    )
-    with pytest.raises(HTTPException) as caught:
-        asyncio.run(routes_engineer.engineer_apply_fix(
-            "proj-1", _request(defect_id=canonical_id)
-        ))
-    assert caught.value.status_code == 409
-    assert target.read_text(encoding="utf-8") == "print('old')\n"
-    assert issue == {
-        "rule_id": "python.output",
-        "id": "issue-1",
-        "status": "needs_manual",
-        "file_path": "app.py",
-        "symbol": "test_actionable_target",
-    }
-    assert str(target.resolve()) not in agent.file_edit_counter
-    retry = asyncio.run(routes_engineer.engineer_apply_fix(
-        "proj-1", _request(defect_id=canonical_id)
-    ))
-    assert retry["success"] is True
-    assert scheduling_attempts == 2
-    assert issue["status"] == "pending_verification"
-
-
 def test_phase_reinspection_schedule_failure_restores_supervisor_ownership(
     monkeypatch, tmp_path
 ):
@@ -940,61 +972,6 @@ def test_phase_reinspection_schedule_failure_restores_supervisor_ownership(
     assert routes_phases._auto_repair_states[key] == prior_state
     assert routes_phases._auto_repair_api_configs[key] == prior_config
     assert phase == {"id": phase_id, "status": "waiting_engineer"}
-
-
-def test_failed_schedule_does_not_rollback_over_later_workspace_write(
-    monkeypatch, tmp_path
-):
-    target = tmp_path / "app.py"
-    target.write_text("print('old')\n", encoding="utf-8")
-    issue = {
-        "rule_id": "python.output",
-        "id": "legacy-1",
-        "status": "needs_manual",
-        "file_path": "app.py",
-        "expected": "old",
-        "actual": "broken",
-    }
-    canonical_id = _defect_id(issue)
-    project = SimpleNamespace(
-        workspace=tmp_path,
-        subprojects=[],
-        qc_results={"__whole_project__": {"qa": {"issues_detail": [issue]}}},
-    )
-
-    class Agent(_ConfirmedPlanMixin):
-        file_edit_counter = {}
-        file_last_score = {}
-        pending_fixes = {}
-
-        def apply_fix(self, **_kwargs):
-            target.write_text("print('repair')\n", encoding="utf-8")
-            return {"success": True, "backup_path": ""}
-
-    async def failed_after_late_write(*_args):
-        late = tmp_path / "frontend" / "src" / "data" / "client.ts"
-        late.parent.mkdir(parents=True)
-        late.write_text("do not overwrite\n", encoding="utf-8")
-        raise HTTPException(status_code=409, detail="QA scheduling failed")
-
-    _patch_engineer_route(monkeypatch, project, Agent())
-    monkeypatch.setattr(
-        routes_engineer,
-        "_start_authoritative_reinspection",
-        failed_after_late_write,
-    )
-    with pytest.raises(HTTPException) as caught:
-        asyncio.run(routes_engineer.engineer_apply_fix(
-            "proj-1", _request(defect_id=canonical_id)
-        ))
-    assert caught.value.status_code == 409
-    assert target.read_text(encoding="utf-8") == "print('repair')\n"
-    assert (
-        tmp_path / "frontend" / "src" / "data" / "client.ts"
-    ).read_text(encoding="utf-8") == "do not overwrite\n"
-    assert issue["status"] == "needs_manual"
-    assert "rollback_refused_artifact_digest" in issue
-    assert "rollback_refused_target_sha256" in issue
 
 
 def test_confirmed_plan_restores_from_app_state_and_can_apply(
@@ -1247,13 +1224,21 @@ def test_two_concurrent_apply_requests_allow_exactly_one_transaction(
     entered = asyncio.Event()
     release = asyncio.Event()
 
-    async def held_reinspection(*_args):
+    async def held_targeted_verification(*_args):
         entered.set()
         await release.wait()
-        return {"success": True, "status": {"status": "starting", "running": True}}
+        return {
+            "status": "verified",
+            "passed": True,
+            "retryable": False,
+            "reason": "originating_check_replayed",
+            "issues": [],
+        }
 
     monkeypatch.setattr(
-        routes_engineer, "_start_authoritative_reinspection", held_reinspection
+        routes_engineer,
+        "_run_engineer_targeted_verification",
+        held_targeted_verification,
     )
 
     async def scenario():

@@ -526,7 +526,7 @@ def _make_exec_agent(
             expert_pool = get_expert_pool(str(getattr(ctx, "owner_user_id", "") or ""))
         except Exception as exc:
             logger.warning("加载专家池失败，跳过专家记忆注入 agent=%s: %s", agent_id, exc)
-    return ExecutionAgent(
+    execution_agent = ExecutionAgent(
         agent_id=agent_id,
         role=agent_info.get("role", "开发工程师"),
         workspace=ctx.workspace,
@@ -563,6 +563,9 @@ def _make_exec_agent(
         execution_guard=execution_guard,
         immutable_path_scope=bool(immutable_scope),
     )
+    execution_agent._hermes.usage_user_id = str(getattr(ctx, "owner_user_id", "") or "")
+    execution_agent._hermes.usage_project_id = str(getattr(ctx, "project_id", "") or "")
+    return execution_agent
 
 def _run_with_user_api_config(user_api_config, callback):
     """Run blocking model work with an isolated request-level API config."""
@@ -829,25 +832,9 @@ async def _start_phase_quality_cycle_if_ready(ctx: ProjectContext) -> None:
                         state.get("status"),
                     )
                     continue
-                # A durable task attempt may report success before the route has
-                # persisted its task-scoped receipt. Keep the merged Agent and
-                # subproject open until every locked task in this generation is
-                # accounted for; otherwise task 1 can start QC while task 2 is
-                # still queued.
-                for agent in phase_agents:
-                    if str(agent.get("status") or "").lower() in {
-                        "completed", "succeeded",
-                    }:
-                        transition_agent(
-                            agent, "working", progress=min(
-                                int(agent.get("progress") or 0), 99,
-                            ),
-                            message="Waiting for remaining locked task attempts",
-                        )
-                for child in children:
-                    if str(child.get("status") or "").lower() == "completed":
-                        child["status"] = "in_progress"
-                        child["progress"] = min(int(child.get("progress") or 0), 99)
+                # Keep each successful task terminal while later DAG tasks run.
+                # Phase-level readiness is still guarded by locked_ready, so
+                # preserving the task result cannot start QC early.
                 continue
             projectable_statuses = {"completed", "succeeded"}
             if not (
@@ -916,7 +903,7 @@ async def _start_phase_quality_cycle_if_ready(ctx: ProjectContext) -> None:
             # start_auto_repair 前置条件未就绪（如 artifact 未绑定）不应让执行循环
             # 静默中断；记录后下一轮重试。真实失败由 auto_repair state 自身状态机标记。
             import logging as _lg
-            _lg.getLogger("routes_execution").warning(
+            _lg.getLogger("routes_execution").exception(
                 "start_auto_repair raised for phase=%s; will retry next cycle", phase_id
             )
 
@@ -1904,7 +1891,11 @@ def _assert_current_phase_attempt(payload: Dict[str, Any]) -> None:
         artifact_policy = payload.get("artifact_policy") or {}
         required_task_files = {
             str(item).replace("\\", "/")
-            for item in (artifact_policy.get("required_files") or [])
+            for item in (
+                artifact_policy.get("planned_files")
+                or artifact_policy.get("required_files")
+                or []
+            )
             if str(item)
         }
         allowed_task_files = {
@@ -1912,10 +1903,20 @@ def _assert_current_phase_attempt(payload: Dict[str, Any]) -> None:
             for item in (artifact_policy.get("allowed_path_prefixes") or [])
             if str(item)
         }
+        def _scope_covers(path: str) -> bool:
+            return any(
+                path == scope
+                or (scope.endswith("/") and path.startswith(scope))
+                for scope in allowed_task_files
+            )
+
         task_scope_matches = (
             required_task_files == expected_task_files
-            and allowed_task_files == expected_task_files
-        )
+            and (
+                artifact_policy.get("workspace_exclusive") is True
+                or all(_scope_covers(path) for path in expected_task_files)
+            )
+        ) if expected_task_files else not required_task_files
     if (
         not phase
         or str(coordinator_run.get("run_type") or "") != "phase.dispatch"
@@ -1992,6 +1993,52 @@ async def _maintain_durable_run_lease(
                 if cancel:
                     cancel.set()
                 return
+
+
+async def _wait_for_agent_run_file_lease(
+    ctx: ProjectContext,
+    agent_id: str,
+    run_id: str,
+    attempt_scope: Dict[str, Any],
+    payload: Dict[str, Any],
+    cancel_event: threading.Event,
+) -> Dict[str, Any]:
+    """Wait through ordinary file contention without failing the task run.
+
+    The durable run is already claimed and heartbeating.  Keeping that single
+    attempt alive prevents lock contention from consuming execution retries or
+    propagating a false critical failure to the phase coordinator.
+    """
+    delay = 0.25
+    waiting = False
+    while True:
+        _guard_cancelled_run(cancel_event)
+        await asyncio.to_thread(_assert_current_phase_attempt, payload)
+        try:
+            lease = await asyncio.to_thread(
+                _ensure_agent_run_file_lease,
+                ctx,
+                agent_id,
+                run_id,
+                attempt_scope,
+            )
+        except LeaseConflict as exc:
+            waiting = True
+            agent = ctx.agents.get(agent_id)
+            if agent is None:
+                raise
+            agent["recovery_status"] = "waiting_file_lock"
+            agent["file_lock_wait_reason"] = _sanitize_error(exc)
+            agent.setdefault("file_lock_waiting_since", time.time())
+            await asyncio.sleep(delay)
+            delay = min(delay * 2, 5.0)
+            continue
+        if waiting:
+            agent = ctx.agents.get(agent_id) or {}
+            agent["recovery_status"] = "resumed_after_file_lock"
+            agent.pop("file_lock_wait_reason", None)
+            agent.pop("file_lock_waiting_since", None)
+        return lease
 
 
 def _evidence_for_result(run_id: str, result: Dict[str, Any]):
@@ -2088,21 +2135,21 @@ async def _execute_durable_agent_run(
             )
             _run_execution_guards[run_id] = execution_fence
             try:
-                lease_claim = await asyncio.to_thread(
-                    _ensure_agent_run_file_lease,
+                lease_claim = await _wait_for_agent_run_file_lease(
                     ctx,
                     agent_id,
                     run_id,
                     dict(payload.get("artifact_policy") or {}),
+                    payload,
+                    cancel_event,
                 )
                 execution_fence.bind_expert_lock(
                     str(lease_claim.get("lock_id") or "")
                 )
-            except (LeaseConflict, ValueError, RuntimeError) as exc:
+            except (ValueError, RuntimeError) as exc:
                 lease_stop.set()
                 await lease_task
-                reason = f"run file lease unavailable: {_sanitize_error(exc)}"
-                ctx.agents[agent_id]["recovery_status"] = "waiting_for_lease"
+                reason = f"run file lease invalid: {_sanitize_error(exc)}"
                 blocked = await asyncio.to_thread(
                     _run_registry.block, run_id, reason=reason,
                 )
@@ -2506,6 +2553,12 @@ def _locked_agent_receipt_projection(
     phase = phase_manager.get_phase(phase_id) if phase_manager else None
     if not isinstance(phase, dict):
         return {"status": "working", "progress": 99}
+    if (
+        str(phase.get("status") or "").lower() == "completed"
+        and phase.get("user_confirmed") is True
+        and isinstance(phase.get("validated_completion_receipt"), dict)
+    ):
+        return {"status": "completed", "progress": 100}
 
     receipts = agent_info.get("task_execution_receipts") or {}
     coordinator = phase.get("execution_coordinator") or {}
@@ -2554,7 +2607,12 @@ def _locked_agent_receipt_projection(
                         or f"locked task {task_id} failed before receipt commit"
                     ),
                 }
-            return {"status": "working", "progress": 99}
+            agent_status = str(agent_info.get("status") or "").strip().lower()
+            if agent_status in {"queued", "pending", "idle", "waiting"}:
+                return {"status": "queued", "progress": 0}
+            return {"status": "working", "progress": min(
+                int(agent_info.get("progress") or 0), 99,
+            )}
         is_current = (
             str(receipt.get("task_id") or task_id) == task_id
             and str(receipt.get("agent_id") or "")
@@ -2581,8 +2639,13 @@ def _locked_agent_receipt_projection(
                 )
             )
         )
+        durable_status = ""
         if not is_current:
-            return {"status": "working", "progress": 99}
+            if durable_status in {"pending", "queued"}:
+                return {"status": "queued", "progress": 0}
+            return {"status": "working", "progress": min(
+                int(agent_info.get("progress") or 0), 99,
+            )}
         receipt_status = str(receipt.get("status") or "").strip().lower()
         if receipt_status in failure_statuses:
             return {

@@ -69,9 +69,12 @@ const PlanSidebar: React.FC<PlanSidebarProps> = ({
     setPlanWarnings([]);
     try {
       const userRequirements = messages
-        .filter(msg => msg.role === 'user' && msg.content.trim())
-        .slice(-6)
-        .map(msg => msg.content.trim())
+        .filter(msg =>
+          (msg.role === 'user' || msg.role === 'assistant')
+          && msg.content.trim()
+        )
+        .slice(-12)
+        .map(msg => `${msg.role}:\n${msg.content.trim()}`)
         .join('\n');
       const res: any = await axios.post(`${API}/projects/${projectId}/phases/${phaseId}/plan-experts`, {
         phase_description: phaseDesc,

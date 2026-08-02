@@ -14,10 +14,13 @@ import {
   PlusOutlined, RobotOutlined, UserOutlined,
   LinkOutlined, DisconnectOutlined, ReloadOutlined,
   PlayCircleOutlined, ThunderboltOutlined,
-  ArrowRightOutlined, InfoCircleOutlined, CheckCircleOutlined,
 } from '@ant-design/icons';
 import { Alert } from 'antd';
 import axios from 'axios';
+import {
+  BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip as ChartTooltip,
+  ResponsiveContainer, PieChart, Pie, Cell,
+} from 'recharts';
 import { API_BASE_URL } from '../services/apiBase';
 
 const API = API_BASE_URL;
@@ -34,6 +37,10 @@ interface AgentInfo {
   message?: string;
   created_at: number;
   project_id: string;
+  started_at?: number;
+  finished_at?: number;
+  output_files?: string[];
+  domains?: string[];
 }
 
 interface SubprojectInfo {
@@ -77,6 +84,7 @@ const ProjectAgents: React.FC = () => {
   const [executingAgents, setExecutingAgents] = useState<Set<string>>(new Set());
   const [executingAll, setExecutingAll] = useState(false);
   const [project, setProject] = useState<any>(null);
+  const [projectMetrics, setProjectMetrics] = useState<any>(null);
   const [fetchError, setFetchError] = useState('');
   const [form] = Form.useForm();
 
@@ -84,14 +92,16 @@ const ProjectAgents: React.FC = () => {
     if (!projectId) return;
     if (showLoading) setLoading(true);
     try {
-      const [agentsRes, spRes, projectRes] = await Promise.all([
+      const [agentsRes, spRes, projectRes, metricsRes] = await Promise.all([
         axios.get(`${API}/projects/${projectId}/agents`),
         axios.get(`${API}/projects/${projectId}/subprojects/list`),
         axios.get(`${API}/projects/${projectId}`),
+        axios.get(`${API}/projects/${projectId}/metrics`),
       ]);
       setAgents(agentsRes.data.agents || []);
       setSubprojects(spRes.data.subprojects || []);
       setProject(projectRes.data);
+      setProjectMetrics(metricsRes.data);
       setFetchError('');
     } catch (e: any) {
       setFetchError(e.response?.data?.detail || e.message || 'Agent 状态加载失败');
@@ -199,10 +209,37 @@ const ProjectAgents: React.FC = () => {
   // 统计
   const stats = {
     total: agents.length,
+    roles: new Set(agents.map(a => a.role).filter(Boolean)).size,
     idle: agents.filter(a => a.status === 'idle').length,
     working: agents.filter(a => ACTIVE_AGENT_STATUSES.has(a.status)).length,
+    completed: agents.filter(a => a.status === 'completed').length,
+    failed: agents.filter(a => a.status === 'failed').length,
     assigned: subprojects.filter(s => s.agent_id).length,
   };
+  const completedTasks = subprojects.filter(s => s.status === 'completed').length;
+  const outputFileCount = new Set(agents.flatMap(a => a.output_files || [])).size;
+  const completedDurations = agents
+    .filter(a => a.started_at && a.finished_at && a.finished_at >= a.started_at)
+    .map(a => Number(a.finished_at) - Number(a.started_at));
+  const averageDurationSeconds = completedDurations.length > 0
+    ? Math.round(completedDurations.reduce((sum, value) => sum + value, 0) / completedDurations.length)
+    : null;
+  const skillAuthorizedAgents = agents.filter(a => a.skill_names?.length > 0).length;
+  const durationChartData = agents
+    .filter(a => a.started_at && a.finished_at && a.finished_at >= a.started_at)
+    .map(a => ({
+      name: (a.subproject_id ? subprojects.find(s => s.id === a.subproject_id)?.name : a.role) || a.role,
+      seconds: Math.round(Number(a.finished_at) - Number(a.started_at)),
+    }));
+  const outputChartData = agents
+    .map(a => ({ name: a.role || a.id, files: new Set(a.output_files || []).size }))
+    .filter(item => item.files > 0);
+  const taskStatusData = [
+    { name: '已完成', value: completedTasks, color: '#52c41a' },
+    { name: '执行中', value: subprojects.filter(s => ['working', 'executing', 'in_progress'].includes(s.status)).length, color: '#1677ff' },
+    { name: '待开始', value: subprojects.filter(s => ['pending', 'idle'].includes(s.status)).length, color: '#bfbfbf' },
+    { name: '失败', value: subprojects.filter(s => ['failed', 'error', 'blocked'].includes(s.status)).length, color: '#ff4d4f' },
+  ].filter(item => item.value > 0);
 
   // Agent 列表列
   const agentColumns = [
@@ -221,18 +258,6 @@ const ProjectAgents: React.FC = () => {
         <Space>
           <RobotOutlined className="text-blue-500" />
           <span className="font-medium">{role}</span>
-        </Space>
-      ),
-    },
-    {
-      title: '已授权 Skill',
-      dataIndex: 'skill_names',
-      key: 'skill_names',
-      render: (skills: string[]) => (
-        <Space wrap size={4}>
-          {skills.length > 0
-            ? skills.map(s => <Tag key={s} color="blue" className="text-xs">{s}</Tag>)
-            : <span className="text-gray-400 text-xs">暂无</span>}
         </Space>
       ),
     },
@@ -257,46 +282,16 @@ const ProjectAgents: React.FC = () => {
       },
     },
     {
-      title: '进度',
-      key: 'progress',
-      width: 140,
-      render: (_: any, record: AgentInfo) => {
-        const sp = subprojects.find(s => s.agent_id === record.id);
-        const prog = sp?.progress || 0;
-        const status = record.status;
-        return (
-          <div className="flex flex-col gap-0.5">
-            <Progress
-              percent={prog}
-              size="small"
-              strokeColor={prog === 100 ? '#52c41a' : ACTIVE_AGENT_STATUSES.has(status) ? '#1890ff' : '#d9d9d9'}
-              showInfo={false}
-            />
-            <span className="text-xs text-gray-400">
-              {prog === 100 ? '✅ 完成' : ACTIVE_AGENT_STATUSES.has(status) ? `⏳ ${prog}%` : `${prog}%`}
-            </span>
-          </div>
-        );
-      },
-    },
-    {
-      title: '操作',
-      key: 'action',
-      width: 120,
-      render: (_: any, record: AgentInfo) => (
-        <Tooltip title={record.phase_id ? '阶段 Agent 由阶段看板的执行协调器统一调度' : '调用 LLM 生成代码，写入项目文件夹'}>
-          <Button
-            size="small"
-            type="primary"
-            icon={<PlayCircleOutlined />}
-            loading={executingAgents.has(record.id)}
-            disabled={Boolean(record.phase_id)}
-            onClick={() => handleExecuteAgent(record.id)}
-            style={{ backgroundColor: '#52c41a', borderColor: '#52c41a' }}
-          >
-            开始工作
-          </Button>
-        </Tooltip>
+      title: '已授权 Skill',
+      dataIndex: 'skill_names',
+      key: 'skill_names',
+      width: '38%',
+      render: (skills: string[]) => (
+        <Space wrap size={4}>
+          {skills?.length > 0
+            ? skills.map(s => <Tag key={s} color="blue" className="text-xs">{s}</Tag>)
+            : <span className="text-gray-400 text-xs">暂无授权</span>}
+        </Space>
       ),
     },
   ];
@@ -361,29 +356,14 @@ const ProjectAgents: React.FC = () => {
         return <Tag color={map[status] || 'default'}>{textMap[status] || status}</Tag>;
       },
     },
-    {
-      title: '进度',
-      dataIndex: 'progress',
-      key: 'progress',
-      width: 80,
-      render: (p: number) => <span className="text-sm font-medium">{p}%</span>,
-    },
   ];
-
-  // 阶段提示配置
-  const phaseHints: Record<string, { type: 'info' | 'warning' | 'success'; msg: string; next: string }> = {
-    planning:     { type: 'info',    msg: '当前处于【规划期】：请先在「PM 组长」页面完成需求讨论并确认总规划，系统随后生成阶段看板。', next: '下一步：确认总规划 → 进入阶段看板' },
-    team_building:{ type: 'warning', msg: '当前处于【组建期】：请在此页面创建 Agent 并分配子项目负责人，完成后点击「全部执行」或顶部「全部执行 →」进入执行期。', next: '下一步：创建 Agent → 分配子项目 → 点击「全部执行」' },
-    running:      { type: 'info',    msg: '当前处于【执行期】：Agent 正在执行各子项目。请在阶段看板确认所有 Agent 均为“已完成”，再启动质检循环。', next: '下一步：阶段看板 → 核对 Agent 终态 → 启动质检循环' },
-    executing:    { type: 'info',    msg: '当前处于【执行期】：Agent 正在执行各子项目。请在阶段看板确认所有 Agent 均为“已完成”，再启动质检循环。', next: '下一步：阶段看板 → 核对 Agent 终态 → 启动质检循环' },
-    qa:           { type: 'warning', msg: '当前处于【质检期】：请先确认所有 Agent 执行成功，再核对质检报告与最终整体质检。当前前端不会提供绕过验收门禁的签核操作。', next: '下一步：核对 Agent 终态 → 修复问题 → 在文件管理运行最终整体质检' },
-    completed:    { type: 'success', msg: '后端已将项目标记为完成。请仍以最终整体质检和运行验收证据为准；该状态不代表文件已自动归档。', next: '请核对最终质检证据后下载项目归档' },
-  };
-  const status = project?.status || 'planning';
-  const hint = project ? (phaseHints[status] || phaseHints['planning']) : null;
 
   return (
     <div className="space-y-4">
+      <div>
+        <h2 className="text-xl font-semibold mb-1">项目团队</h2>
+        <div className="text-sm text-gray-500">查看成员角色、授权能力和职责分配；任务进度统一在进度看板查看。</div>
+      </div>
       {fetchError && (
         <Alert
           type="error"
@@ -393,21 +373,6 @@ const ProjectAgents: React.FC = () => {
           action={<Button size="small" onClick={() => void fetchData(true)}>重试</Button>}
         />
       )}
-      {/* 当前阶段提示 + 下一步任务 */}
-      {hint && <Alert
-        type={hint.type}
-        showIcon
-        icon={hint.type === 'success' ? <CheckCircleOutlined /> : <InfoCircleOutlined />}
-        message={<span className="font-medium text-sm">{hint.msg}</span>}
-        description={
-          hint.type !== 'success' && (
-            <span className="text-xs text-gray-500 flex items-center gap-1">
-              <ArrowRightOutlined /> {hint.next}
-            </span>
-          )
-        }
-      />}
-
       {/* 统计 */}
       <Row gutter={16}>
         <Col span={6}>
@@ -422,7 +387,7 @@ const ProjectAgents: React.FC = () => {
         </Col>
         <Col span={6}>
           <Card size="small">
-            <Statistic title="执行中" value={stats.working} valueStyle={{ color: '#1890ff' }} />
+            <Statistic title="角色类型" value={stats.roles} valueStyle={{ color: '#722ed1' }} />
           </Card>
         </Col>
         <Col span={6}>
@@ -434,25 +399,9 @@ const ProjectAgents: React.FC = () => {
 
       {/* Agent 列表 */}
       <Card
-        title={<Space><RobotOutlined /> 项目 Agent（本项目专属，与其他项目隔离）</Space>}
+        title={<Space><RobotOutlined /> 团队成员名单</Space>}
         extra={
-          <Space>
-            <Button icon={<ReloadOutlined />} onClick={() => void fetchData(true)} size="small">刷新</Button>
-            {agents.length > 0 && (
-              <Button
-                icon={<ThunderboltOutlined />}
-                loading={executingAll}
-                disabled={hasPhaseOwnedAgents}
-                onClick={handleExecuteAll}
-                style={{ backgroundColor: '#fa8c16', borderColor: '#fa8c16', color: '#fff' }}
-              >
-                全部执行
-              </Button>
-            )}
-            <Button type="primary" icon={<PlusOutlined />} onClick={() => setCreateModal(true)}>
-              创建 Agent
-            </Button>
-          </Space>
+          <Button icon={<ReloadOutlined />} onClick={() => void fetchData(true)} size="small">刷新</Button>
         }
       >
         {agents.length === 0 ? (
@@ -469,19 +418,66 @@ const ProjectAgents: React.FC = () => {
         )}
       </Card>
 
-      {/* 子项目负责人分配 */}
-      <Card title="子项目负责人分配（每个子项目唯一负责人）">
-        {subprojects.length === 0 ? (
-          <Empty description="暂无子项目，请先在 PM 对话中完成需求规划" />
-        ) : (
-          <Table
-            columns={spColumns}
-            dataSource={subprojects}
-            rowKey="id"
-            pagination={false}
-            size="small"
-          />
-        )}
+      <Card title="团队数据看板">
+        <Row gutter={[16, 16]}>
+          <Col xs={12} md={6}>
+            <Statistic title="任务完成率" value={subprojects.length ? Math.round(completedTasks / subprojects.length * 100) : 0} suffix="%" />
+          </Col>
+          <Col xs={12} md={6}>
+            <Statistic title="实际产出文件" value={outputFileCount} suffix="个" />
+          </Col>
+          <Col xs={12} md={6}>
+            <Statistic title="Agent 平均执行时长" value={averageDurationSeconds ?? '-'} suffix={averageDurationSeconds == null ? undefined : '秒'} />
+          </Col>
+          <Col xs={12} md={6}>
+            <Statistic title="Skill 授权覆盖" value={agents.length ? Math.round(skillAuthorizedAgents / agents.length * 100) : 0} suffix="%" />
+          </Col>
+          <Col xs={12} md={6}>
+            <Statistic title="阶段一次通过率" value={projectMetrics?.quality?.first_pass_rate != null ? Math.round(projectMetrics.quality.first_pass_rate * 100) : '-'} suffix={projectMetrics?.quality?.first_pass_rate == null ? undefined : '%'} />
+          </Col>
+          <Col span={24}><Divider style={{ margin: '4px 0' }} /></Col>
+          <Col xs={24} lg={8}>
+            <div className="font-medium mb-3">任务状态分布</div>
+            <div style={{ height: 240 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <PieChart>
+                  <Pie data={taskStatusData} dataKey="value" nameKey="name" innerRadius={48} outerRadius={82} label>
+                    {taskStatusData.map(item => <Cell key={item.name} fill={item.color} />)}
+                  </Pie>
+                  <ChartTooltip />
+                </PieChart>
+              </ResponsiveContainer>
+            </div>
+          </Col>
+          <Col xs={24} lg={8}>
+            <div className="font-medium mb-3">Agent 执行时长（秒）</div>
+            <div style={{ height: 240 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={durationChartData} margin={{ top: 8, right: 8, left: 0, bottom: 20 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="name" hide />
+                  <YAxis />
+                  <ChartTooltip />
+                  <Bar dataKey="seconds" name="执行时长" fill="#1677ff" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </Col>
+          <Col xs={24} lg={8}>
+            <div className="font-medium mb-3">Agent 交付文件数</div>
+            <div style={{ height: 240 }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={outputChartData} margin={{ top: 8, right: 8, left: 0, bottom: 20 }}>
+                  <CartesianGrid strokeDasharray="3 3" />
+                  <XAxis dataKey="name" hide />
+                  <YAxis allowDecimals={false} />
+                  <ChartTooltip />
+                  <Bar dataKey="files" name="交付文件" fill="#722ed1" radius={[4, 4, 0, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+            </div>
+          </Col>
+        </Row>
       </Card>
 
       {/* 创建 Agent 弹窗 */}

@@ -21,7 +21,17 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List
 
-from core.database import kv_set, kv_get, kv_delete, kv_keys_prefix, kv_many_set
+from core.database import (
+    compare_and_swap_phase_plan,
+    get_phase_plan_commit,
+    initialize_phase_plan_commit,
+    list_phase_plan_commits,
+    kv_delete,
+    kv_get,
+    kv_keys_prefix,
+    kv_many_set,
+    kv_set,
+)
 from core.secret_storage import clear_sensitive_values, protect_config, restore_config
 
 logger = logging.getLogger(__name__)
@@ -198,8 +208,99 @@ def save_phase_managers(data: Dict[str, Any]) -> None:
     kv_set("phase_managers", data)
 
 
+_COMMITTED_PHASE_PLAN_FIELDS = {
+    "description",
+    "tech_stack",
+    "technical_requirements",
+    "technical_overrides",
+    "roles_needed",
+    "execution_roles",
+    "task_contract",
+    "expert_requirements",
+    "expert_assignments",
+    "expert_pool_revision",
+    "assigned_expert_bindings",
+    "phase_requirements_snapshot",
+    "phase_requirements_revision",
+    "phase_requirements_digest",
+    "phase_plan_revision",
+    "phase_plan",
+    "phase_plan_version",
+    "plan_status",
+    "plan_generated",
+    "plan_contract_validated",
+    "plan_generated_at",
+    "plan_generation_attempts",
+    "plan_generation_mode",
+    "plan_validation",
+    "plan_artifact_metadata",
+    "project_contract",
+}
+
+
 def load_phase_managers() -> Dict[str, Any]:
-    return kv_get("phase_managers", {})
+    managers = kv_get("phase_managers", {})
+    if not isinstance(managers, dict):
+        return managers
+    for commit in list_phase_plan_commits():
+        manager = managers.get(commit["project_id"])
+        if not isinstance(manager, dict):
+            continue
+        phases = manager.get("phases")
+        if not isinstance(phases, list):
+            continue
+        for index, phase in enumerate(phases):
+            if isinstance(phase, dict) and str(phase.get("phase_id") or "") == commit["phase_id"]:
+                # phase_plan_commits is authoritative for planning data only.
+                # Replacing the whole phase discards execution coordinator,
+                # receipts and QC state written later to phase_managers, so a
+                # successful phase becomes unverifiable after process restart.
+                committed_phase = commit["phase"]
+                if isinstance(committed_phase, dict):
+                    merged = dict(phase)
+                    for field in _COMMITTED_PHASE_PLAN_FIELDS:
+                        if field in committed_phase:
+                            merged[field] = committed_phase[field]
+                        else:
+                            merged.pop(field, None)
+                    phases[index] = merged
+                manager["project_contract"] = commit["project_contract"]
+                break
+    return managers
+
+
+def load_phase_plan_commit(project_id: str, phase_id: str) -> Dict[str, Any] | None:
+    return get_phase_plan_commit(project_id, phase_id)
+
+
+def cas_phase_plan_commit(
+    project_id: str,
+    phase_id: str,
+    expected_revision: int,
+    phase: Dict[str, Any],
+    project_contract: Dict[str, Any],
+    phase_manager: Dict[str, Any] | None = None,
+) -> Dict[str, Any]:
+    return compare_and_swap_phase_plan(
+        project_id,
+        phase_id,
+        expected_revision,
+        phase,
+        project_contract,
+        phase_manager=phase_manager,
+    )
+
+
+def migrate_phase_plan_commit(
+    project_id: str,
+    phase_id: str,
+    revision: int,
+    phase: Dict[str, Any],
+    project_contract: Dict[str, Any],
+) -> Dict[str, Any]:
+    return initialize_phase_plan_commit(
+        project_id, phase_id, revision, phase, project_contract
+    )
 
 
 # ─── 监督 Leader 状态持久化 ───────────────────────────────────────────────────

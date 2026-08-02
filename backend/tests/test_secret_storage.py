@@ -3,7 +3,7 @@ import json
 import pytest
 from cryptography.fernet import Fernet
 
-from core import database, persistence
+from core import auth, database, persistence
 from core.secret_storage import (
     ENCRYPTED_PREFIX,
     SecretStorageUnavailable,
@@ -50,15 +50,14 @@ def test_random_32_byte_encryption_secret_is_derived_and_round_trips(monkeypatch
     assert restored.value == config
 
 
-def test_missing_key_clears_secrets_before_persistence(monkeypatch):
+def test_missing_key_fails_closed_before_persistence(monkeypatch):
     monkeypatch.delenv("METIS_DATA_ENCRYPTION_KEY", raising=False)
     monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.setattr(auth, "JWT_SECRET", "")
     config = {"api_key": "must-not-persist", "model": "safe", "headers": {"Authorization": "Bearer secret"}}
 
-    stored = protect_config(config)
-
-    assert stored == {"api_key": "", "model": "safe", "headers": {"Authorization": ""}}
-    assert "must-not-persist" not in repr(stored)
+    with pytest.raises(SecretStorageUnavailable):
+        protect_config(config)
 
 
 def test_encrypted_config_is_retained_but_not_loaded_without_key(monkeypatch):
@@ -67,6 +66,7 @@ def test_encrypted_config_is_retained_but_not_loaded_without_key(monkeypatch):
     stored = protect_config({"api_key": "recoverable-secret"})
     monkeypatch.delenv("METIS_DATA_ENCRYPTION_KEY", raising=False)
     monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.setattr(auth, "JWT_SECRET", "")
 
     with pytest.raises(SecretStorageUnavailable):
         restore_config(stored)
@@ -93,18 +93,15 @@ def test_legacy_plaintext_is_migrated_to_ciphertext(isolated_db, monkeypatch):
     assert "legacy-secret" not in raw
 
 
-def test_legacy_plaintext_is_cleared_when_key_is_missing(isolated_db, monkeypatch):
+def test_legacy_plaintext_is_rejected_when_key_is_missing(isolated_db, monkeypatch):
     monkeypatch.delenv("METIS_DATA_ENCRYPTION_KEY", raising=False)
     monkeypatch.delenv("JWT_SECRET", raising=False)
+    monkeypatch.setattr(auth, "JWT_SECRET", "")
     database.kv_set("user_api_configs", {"user-1": {"api_key": "legacy-secret", "model": "m"}})
 
-    loaded = persistence.load_user_api_configs()
-    raw = database.kv_get("user_api_configs")
-
-    expected = {"user-1": {"api_key": "", "model": "m"}}
-    assert loaded == expected
-    assert raw == expected
-    assert "legacy-secret" not in repr(raw)
+    with pytest.raises(SecretStorageUnavailable):
+        persistence.load_user_api_configs()
+    assert database.kv_get("user_api_configs")["user-1"]["api_key"] == "legacy-secret"
 
 
 def test_atomic_application_state_encrypts_all_config_buckets(isolated_db, monkeypatch):

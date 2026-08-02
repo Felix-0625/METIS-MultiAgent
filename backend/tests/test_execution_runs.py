@@ -195,6 +195,7 @@ def test_cancel_unleased_is_versioned_and_never_cancels_a_live_lease(run_db):
         timeout_seconds=60,
     )
     blocked = registry.block(blocked["run_id"], reason="stale attempt")
+    assert blocked["last_error"] == "stale attempt"
     cancelled = registry.cancel_unleased(
         blocked["run_id"],
         reason="parent superseded",

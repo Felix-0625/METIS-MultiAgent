@@ -82,6 +82,7 @@ class ProjectContext:
         # Supervisor QA runs are the durable transition/evidence authority.
         # qc_results remains only the latest reviewer read-model.
         self.supervisor_quality_runs: Dict[str, Dict] = {}
+        self.signoff_receipt: Optional[Dict] = None
 
     def to_dict(self) -> Dict:
         merged_subprojects = copy.deepcopy(self.subprojects)
@@ -346,8 +347,6 @@ class ProjectContext:
 
     def to_persist(self) -> Dict:
         """序列化为可持久化的字典（不含 Agent 实例）"""
-        self.record_version += 1
-        self.updated_at = time.time()
         return {
             "project_id": self.project_id,
             "name": self.name,
@@ -363,4 +362,5 @@ class ProjectContext:
             "agents": self.agents,
             "qc_results": self.qc_results,
             "supervisor_quality_runs": self.supervisor_quality_runs,
+            "signoff_receipt": copy.deepcopy(self.signoff_receipt),
         }

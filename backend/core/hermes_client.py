@@ -22,6 +22,7 @@ from typing import Optional, Dict, List, Any, Callable, Tuple
 from dataclasses import dataclass, field
 from enum import Enum
 import os
+from core.llm_usage import current_llm_scope, record_llm_usage
 
 try:
     import httpx
@@ -220,6 +221,8 @@ class HermesClient:
         # 统计信息
         self.total_tokens = 0
         self.total_requests = 0
+        self.usage_user_id = ""
+        self.usage_project_id = ""
 
         # ── 本地缓存层（Reasonix 风格）────────────────────────────────────────
         # 结构：{cache_key: {"result": {...}, "expires_at": float, "hits": int}}
@@ -521,6 +524,8 @@ class HermesClient:
             exact_key = self._compute_exact_key(messages, cache_model, cache_profile)
             cached = self._get_cache(exact_key)
             if cached:
+                scope = current_llm_scope.get() or {}
+                record_llm_usage(user_id=self.usage_user_id or scope.get("user_id", ""), project_id=self.usage_project_id or scope.get("project_id", ""), model=effective_model, cache_lookup=True, cache_hit=True)
                 return {**cached, "cache_hit": "exact"}
 
             # Layer 2: 语义缓存白名单（仅低风险类型）
@@ -530,6 +535,8 @@ class HermesClient:
                 )
                 cached = self._get_cache(sem_key)
                 if cached:
+                    scope = current_llm_scope.get() or {}
+                    record_llm_usage(user_id=self.usage_user_id or scope.get("user_id", ""), project_id=self.usage_project_id or scope.get("project_id", ""), model=effective_model, cache_lookup=True, cache_hit=True)
                     return {**cached, "cache_hit": "semantic"}
 
             # Layer 3: Prompt Cache（system prefix 匹配）
@@ -538,6 +545,8 @@ class HermesClient:
             )
             cached = self._get_cache(prompt_key)
             if cached:
+                scope = current_llm_scope.get() or {}
+                record_llm_usage(user_id=self.usage_user_id or scope.get("user_id", ""), project_id=self.usage_project_id or scope.get("project_id", ""), model=effective_model, cache_lookup=True, cache_hit=True)
                 return {**cached, "cache_hit": "prompt"}
 
         self._cache_misses += 1
@@ -567,6 +576,15 @@ class HermesClient:
                 timeout=request_timeout,
             )
         self.total_requests += 1
+        scope = current_llm_scope.get() or {}
+        if not response.get("error"):
+            record_llm_usage(
+                user_id=self.usage_user_id or scope.get("user_id", ""),
+                project_id=self.usage_project_id or scope.get("project_id", ""),
+                model=effective_model,
+                usage=response.get("usage") or {},
+                cache_lookup=bool(can_cache),
+            )
 
         # 写入三层缓存（只缓存成功响应，不缓存错误）
         if (

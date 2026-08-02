@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json
 import os
+import threading
 import time
 import uuid
 from pathlib import Path
@@ -430,6 +431,7 @@ class ExpertPool:
         # 内存缓存
         self._experts: Dict[str, ExpertProfile] = {}
         self._memories: Dict[str, ExpertProjectMemory] = {}  # key: "{expert_id}:{project_id}:{scope}"
+        self._lock = threading.RLock()
 
         self._load()
         # 首次启动时预置9类专家
@@ -527,7 +529,7 @@ class ExpertPool:
                 json.dump(pool_data, f, ensure_ascii=False, indent=2)
             os.replace(tmp_path, str(self._pool_file))
         except Exception:
-            os.unlink(tmp_path, missing_ok=True)
+            Path(tmp_path).unlink(missing_ok=True)
             raise
 
         # 原子写入项目记忆文件
@@ -542,7 +544,31 @@ class ExpertPool:
                     json.dump(mem.to_dict(), f, ensure_ascii=False, indent=2)
                 os.replace(mem_tmp_path, str(mem_file))
             except Exception:
-                os.unlink(mem_tmp_path, missing_ok=True)
+                Path(mem_tmp_path).unlink(missing_ok=True)
+
+    def _reload_experts_after_failed_save(
+        self,
+        fallback: Dict[str, ExpertProfile],
+    ) -> None:
+        """Reconcile RAM with a committed file after a possible lost ack."""
+        try:
+            data = json.loads(self._pool_file.read_text(encoding="utf-8"))
+            restored = {
+                profile.expert_id: profile
+                for profile in (
+                    ExpertProfile.from_dict(item)
+                    for item in (data.get("experts") or [])
+                )
+            }
+        except Exception:
+            restored = fallback
+        self._experts = restored
+
+    def _expert_snapshot(self) -> Dict[str, ExpertProfile]:
+        return {
+            expert_id: ExpertProfile.from_dict(profile.to_dict())
+            for expert_id, profile in self._experts.items()
+        }
 
     @staticmethod
     def _mem_key(expert_id: str, project_id: str, scope: str = "project", phase_id: str = "") -> str:
@@ -554,31 +580,49 @@ class ExpertPool:
 
     def create_expert(self, profile: ExpertProfile) -> ExpertProfile:
         """创建专家档案"""
-        self._experts[profile.expert_id] = profile
-        self.save()
-        return profile
+        with self._lock:
+            before = self._expert_snapshot()
+            self._experts[profile.expert_id] = ExpertProfile.from_dict(profile.to_dict())
+            try:
+                self.save()
+            except Exception:
+                self._reload_experts_after_failed_save(before)
+                raise
+            return self._experts[profile.expert_id]
 
     def get_expert(self, expert_id: str) -> Optional[ExpertProfile]:
         return self._experts.get(expert_id)
 
     def update_expert(self, expert_id: str, updates: Dict) -> Optional[ExpertProfile]:
         """更新专家档案"""
-        profile = self._experts.get(expert_id)
-        if not profile:
-            return None
-        for k, v in updates.items():
-            if hasattr(profile, k):
-                setattr(profile, k, v)
-        profile.updated_at = time.time()
-        self.save()
-        return profile
+        with self._lock:
+            profile = self._experts.get(expert_id)
+            if not profile:
+                return None
+            before = self._expert_snapshot()
+            for k, v in updates.items():
+                if hasattr(profile, k):
+                    setattr(profile, k, v)
+            profile.updated_at = time.time()
+            try:
+                self.save()
+            except Exception:
+                self._reload_experts_after_failed_save(before)
+                raise
+            return profile
 
     def delete_expert(self, expert_id: str) -> bool:
-        if expert_id not in self._experts:
-            return False
-        del self._experts[expert_id]
-        self.save()
-        return True
+        with self._lock:
+            if expert_id not in self._experts:
+                return False
+            before = self._expert_snapshot()
+            del self._experts[expert_id]
+            try:
+                self.save()
+            except Exception:
+                self._reload_experts_after_failed_save(before)
+                raise
+            return True
 
     def list_experts(
         self,

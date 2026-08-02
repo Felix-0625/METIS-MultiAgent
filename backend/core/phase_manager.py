@@ -388,6 +388,13 @@ class PhaseManager:
     def from_dict(self, data: Dict) -> None:
         """从持久化数据恢复"""
         self.phases = data.get("phases", [])
+        # User confirmation is the durable acceptance milestone. Heal stale
+        # projections left by delayed background callbacks during restore.
+        for phase in self.phases:
+            if phase.get("user_confirmed"):
+                phase["status"] = "completed"
+                phase["progress"] = 100
+                phase["completed_at"] = phase.get("completed_at") or time.time()
         self.current_phase_index = data.get("current_phase_index", -1)
         self.phase_agents = data.get("phase_agents", {})
         self.file_registry = data.get("file_registry", {})

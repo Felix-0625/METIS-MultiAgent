@@ -22,7 +22,8 @@ import { normalizeSupervisorRun } from './PhaseBoard/supervisorRunModel';
 const API = API_BASE_URL;
 const { TextArea } = Input;
 const FINAL_QA_TERMINAL_STATES = new Set([
-  'passed', 'needs_manual', 'failed', 'infrastructure_blocked', 'interrupted',
+  'passed', 'needs_manual', 'awaiting_engineer_repair', 'failed_recovery',
+  'failed', 'infrastructure_blocked', 'interrupted',
   'quality_regressed', 'no_progress', 'qa_blocked', 'awaiting_manual_fix',
 ]);
 
@@ -133,7 +134,21 @@ const SupervisorLeaderPage: React.FC = () => {
       await loadFinalQA();
     } catch (e: any) {
       setFinalQARunning(false);
-      message.error(e.response?.data?.detail || '全项目质检启动失败');
+      const detail = e.response?.data?.detail;
+      if (detail?.code === 'FINAL_QA_PREREQUISITES_NOT_MET') {
+        Modal.warning({
+          title: detail.message || '最终验收前置条件未满足',
+          content: (
+            <ul style={{ margin: 0, paddingLeft: 20 }}>
+              {(detail.blockers || []).map((item: unknown, index: number) => (
+                <li key={`${index}-${String(item)}`}>{String(item)}</li>
+              ))}
+            </ul>
+          ),
+        });
+      } else {
+        message.error(typeof detail === 'string' ? detail : '全项目质检启动失败');
+      }
     }
   };
 
@@ -298,7 +313,7 @@ const SupervisorLeaderPage: React.FC = () => {
         {!allPhasesCompleted && <Alert style={{ marginTop: 10 }} type="warning" showIcon message="所有阶段确认完成后才能启动全项目质检" />}
         {finalQA.status !== 'not_started' && (
           <div style={{ marginTop: 10, display: 'flex', alignItems: 'center', gap: 8 }}>
-            <Tag color={finalQA.status === 'passed' ? 'success' : ['needs_manual', 'failed', 'infrastructure_blocked'].includes(finalQA.status) ? 'error' : 'processing'}>
+            <Tag color={finalQA.status === 'passed' ? 'success' : ['needs_manual', 'awaiting_engineer_repair', 'failed_recovery', 'failed', 'infrastructure_blocked'].includes(finalQA.status) ? 'error' : 'processing'}>
               {finalQA.status === 'infrastructure_blocked' ? '验收基础设施阻断' : finalQA.status}
             </Tag>
             <span style={{ fontSize: 12 }}>第 {finalQA.round || 0}/{finalQA.total_rounds || 5} 轮</span>

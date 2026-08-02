@@ -122,23 +122,34 @@ def _fernet() -> Fernet | None:
 
     jwt_secret = os.getenv(FALLBACK_KEY_ENV, "").strip()
     if not jwt_secret:
+        # Local installations persist their generated JWT signing secret before
+        # application configuration is restored.  Use that stable material
+        # through a domain-separated derivation, without conflating the two
+        # resulting keys or generating a key during a configuration write.
+        try:
+            from core import auth
+            jwt_secret = str(getattr(auth, "JWT_SECRET", "") or "").strip()
+        except ImportError:
+            jwt_secret = ""
+    if not jwt_secret:
         return None
     derived = hashlib.sha256(_JWT_DERIVATION_CONTEXT + jwt_secret.encode("utf-8")).digest()
     return Fernet(base64.urlsafe_b64encode(derived))
 
 
 def protect_config(value: Any, *, context: str = "configuration") -> Any:
-    """Encrypt a secret-bearing JSON value or clear secrets if no key exists."""
+    """Encrypt a secret-bearing JSON value and fail closed without a key."""
     if not _has_secret(value):
         return copy.deepcopy(value)
     fernet = _fernet()
     if fernet is None:
-        logger.warning(
-            "Sensitive %s values were not persisted because %s is unavailable",
+        logger.error(
+            "Sensitive %s values cannot be persisted because stable encryption material is unavailable",
             context,
-            ENCRYPTION_KEY_ENV,
         )
-        return clear_sensitive_values(value)
+        raise SecretStorageUnavailable(
+            f"sensitive {context} cannot be persisted without stable encryption material"
+        )
     encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode("utf-8")
     return ENCRYPTED_PREFIX + fernet.encrypt(encoded).decode("ascii")
 
@@ -147,7 +158,7 @@ def restore_config(value: Any, *, context: str = "configuration") -> RestoredCon
     """Decrypt an envelope and produce a replacement for legacy plaintext.
 
     A legacy plaintext object is immediately converted to encrypted storage
-    when a key exists, or to a secret-cleared object when it does not.
+    when a key exists.  Missing key material is a hard failure.
     """
     if isinstance(value, str) and value.startswith(ENCRYPTED_PREFIX):
         fernet = _fernet()

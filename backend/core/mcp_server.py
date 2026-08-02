@@ -117,9 +117,25 @@ def _err(msg: str) -> Dict:
 class MCPToolHandler:
     """将 MCP 工具调用转发到后端逻辑"""
 
-    def __init__(self, projects: Dict, global_sm_agent: Any):
+    def __init__(self, projects: Dict, global_sm_agent: Any, owner_user_id: str):
         self.projects = projects
         self.sm = global_sm_agent
+        self.owner_user_id = str(owner_user_id or "")
+
+    def _get_project(self, project_id: str):
+        ctx = self.projects.get(project_id)
+        if ctx is None:
+            return None
+        if str(getattr(ctx, "owner_user_id", "") or "") != self.owner_user_id:
+            return None
+        return ctx
+
+    def _owned_projects(self):
+        return (
+            (project_id, ctx)
+            for project_id, ctx in self.projects.items()
+            if str(getattr(ctx, "owner_user_id", "") or "") == self.owner_user_id
+        )
 
     # ── task_execute ──────────────────────────────────────────────────────────
 
@@ -139,7 +155,7 @@ class MCPToolHandler:
                     }
                 })
 
-            ctx = self.projects.get(project_id)
+            ctx = self._get_project(project_id)
             if ctx is None:
                 return _err(f"项目 {project_id} 不存在")
 
@@ -194,7 +210,7 @@ class MCPToolHandler:
         content = args.get("content", "")
 
         try:
-            ctx = self.projects.get(project_id)
+            ctx = self._get_project(project_id)
             if ctx is None:
                 return _err(f"项目 {project_id} 不存在")
 
@@ -230,7 +246,7 @@ class MCPToolHandler:
                     "projects": [
                         {"id": pid, "name": c.name, "status": c.status,
                          "agents_count": len(c.agents), "subprojects_count": len(c.subprojects)}
-                        for pid, c in self.projects.items()
+                        for pid, c in self._owned_projects()
                     ]
                 })
 
@@ -238,7 +254,7 @@ class MCPToolHandler:
                 skills = self.sm.get_skill_pool()
                 return _ok({"skills": skills, "count": len(skills)})
 
-            ctx = self.projects.get(project_id)
+            ctx = self._get_project(project_id)
             if ctx is None:
                 return _err(f"项目 {project_id} 不存在，请提供 project_id")
 

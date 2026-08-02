@@ -99,10 +99,17 @@ async def create_agent(project_id: str, request: AgentCreateRequest):
 @router.get("/projects/{project_id}/agents")
 async def list_agents(project_id: str):
     ctx = _get_project(project_id)
+    from core.expert_pool import get_expert_pool
+    expert_pool = get_expert_pool(str(getattr(ctx, "owner_user_id", "") or ""))
     # 附加 API 配置信息（隐藏 key）
     result = []
     for a in ctx.agents.values():
         a_copy = dict(a)
+        if not a_copy.get("skill_names") and a_copy.get("expert_id"):
+            profile = expert_pool.get_expert(str(a_copy["expert_id"]))
+            if profile:
+                a_copy["skill_names"] = [skill.name for skill in profile.skills]
+                a_copy["skills"] = list(profile.skill_ids)
         cfg = agents_api_config.get(a["id"], {})
         a_copy["api_config"] = {k: ("*****" if k == "api_key" and v else v) for k, v in cfg.items()}
         a_copy["has_custom_api"] = bool(cfg)

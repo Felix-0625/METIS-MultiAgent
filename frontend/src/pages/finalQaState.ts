@@ -1,6 +1,8 @@
 export const FINAL_QA_TERMINAL_STATUSES = new Set([
   'passed',
   'needs_manual',
+  'awaiting_engineer_repair',
+  'failed_recovery',
   'failed',
   'infrastructure_blocked',
   'interrupted',

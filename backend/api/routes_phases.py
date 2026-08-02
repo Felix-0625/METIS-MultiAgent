@@ -10,7 +10,7 @@ import logging
 import os
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from functools import wraps
 from typing import Optional, List, Dict, Any, Iterable
 from fastapi import APIRouter, HTTPException
@@ -32,13 +32,18 @@ from core.app_state import (
     logger,
 )
 from core import expert_lock
+from core.execution_runs import TERMINAL_STATUSES
 from core.role_mapping import canonical_expert_type, infer_english_expert_type
 from core.delivery_contract import (
     collect_required_file_paths,
     is_delivery_file_path,
     required_files_for_scopes,
 )
-from core.delivery_documents import load_phase_qa_scope
+from core.delivery_documents import (
+    load_phase_qa_scope,
+    reconcile_phase_delivery_generation,
+)
+from core.database import delete_phase_project_files
 from core.rebuild_policy import (
     assert_preserved_files_unchanged,
     classify_rebuild_files,
@@ -66,6 +71,11 @@ from core.phase_execution_contract import (
 )
 from core.evidence import EvidenceKind, create_evidence
 from core.hermes_client import current_user_api_config
+from core.persistence import (
+    cas_phase_plan_commit,
+    load_phase_plan_commit,
+    migrate_phase_plan_commit,
+)
 from core.supervisor_quality_state import (
     IllegalQualityTransition,
     SupervisorQualityMachine,
@@ -151,6 +161,9 @@ _PHASE_EXECUTOR_TYPES = {
     "frontend", "backend", "database", "qa", "architecture",
     "devops", "security", "data", "fullstack_engineer",
 }
+
+_phase_plan_transaction_locks: Dict[tuple[str, str], asyncio.Lock] = {}
+_phase_plan_transaction_users: Dict[tuple[str, str], int] = {}
 
 
 def _phase_task_executor_type(
@@ -238,6 +251,46 @@ def _phase_task_executor_type(
     return "fullstack_engineer"
 
 
+def _phase_task_required_executor_type(task: Dict[str, Any]) -> str:
+    """Infer only an explicit task capability; generic work stays unbound."""
+    inferred = _phase_task_executor_type(task, [])
+    if inferred != "fullstack_engineer":
+        return inferred
+    text = " ".join([
+        str(task.get("name") or ""),
+        str(task.get("objective") or ""),
+        str(task.get("implementation") or ""),
+        " ".join(str(item) for item in (task.get("implementation_technologies") or [])),
+    ]).casefold()
+    if "fullstack" in text or "full stack" in text:
+        return "fullstack_engineer"
+    return ""
+
+
+def _expert_profile_executor_type(profile: Dict[str, Any]) -> str:
+    role = str(profile.get("role") or "")
+    mapped = _phase_role_expert_type(role)
+    if mapped:
+        return mapped
+    inferred = _phase_task_required_executor_type({
+        "name": role,
+        "objective": "",
+        "implementation": "",
+        "implementation_technologies": [role],
+    })
+    return inferred
+
+
+def _expert_can_execute(required: str, actual: str) -> bool:
+    if not required:
+        return True
+    if required == actual:
+        return True
+    return actual == "fullstack_engineer" and required in {
+        "frontend", "backend", "database",
+    }
+
+
 def _phase_planning_lock_scope(
     allowed_path_prefixes: Iterable[str],
 ) -> List[str]:
@@ -249,6 +302,48 @@ def _phase_planning_lock_scope(
     ]
 
 
+def _release_phase_planning_locks(
+    agents: Iterable[Dict[str, Any]],
+) -> None:
+    """Hand planning leases off before durable execution leases are claimed."""
+    for agent in agents:
+        lock_id = str(agent.get("lock_id") or "").strip()
+        if not lock_id or str(agent.get("lock_run_id") or "").strip():
+            continue
+        expert_lock.release_lock(lock_id)
+        agent["lock_id"] = None
+        agent["lock_run_id"] = None
+        agent["locked_until"] = None
+
+
+def _isolate_workspace_exclusive_tasks(
+    plan: Dict[str, Any],
+    workspace_exclusive_task_ids: Iterable[str],
+) -> Dict[str, Any]:
+    """Keep workspace-wide tasks out of parallel DAG waves."""
+    exclusive = {
+        str(task_id) for task_id in workspace_exclusive_task_ids
+        if str(task_id)
+    }
+    execution_plan = copy.deepcopy(plan)
+    isolated_waves: List[List[Dict[str, Any]]] = []
+    for wave in execution_plan.get("waves") or []:
+        scoped_wave: List[Dict[str, Any]] = []
+        for task in wave or []:
+            task_id = str((task or {}).get("task_id") or "")
+            if task_id not in exclusive:
+                scoped_wave.append(task)
+                continue
+            if scoped_wave:
+                isolated_waves.append(scoped_wave)
+                scoped_wave = []
+            isolated_waves.append([task])
+        if scoped_wave:
+            isolated_waves.append(scoped_wave)
+    execution_plan["waves"] = isolated_waves
+    return execution_plan
+
+
 def _locked_task_artifact_policy(
     base_policy: Dict[str, Any],
     *,
@@ -257,20 +352,134 @@ def _locked_task_artifact_policy(
     required_files: Iterable[str],
     rebuild_file_specs: Iterable[Dict[str, Any]],
 ) -> Dict[str, Any]:
-    """Narrow both scope aliases to the current locked task."""
+    """Build a safe, expandable delivery scope for the current locked task.
+
+    PM-proposed paths are planning hints, not a closed file manifest.  New
+    implementations may need additional components imported by those files.
+    Rebuilds remain exact because their issue/file manifest is authoritative.
+    """
     task_required = list(dict.fromkeys(
         str(path).strip() for path in required_files if str(path).strip()
     ))
+    rebuild_specs = list(rebuild_file_specs)
+    if rebuild_specs:
+        allowed_scopes = list(task_required)
+        hard_required = list(task_required)
+        workspace_exclusive = not bool(allowed_scopes)
+    else:
+        # Authorize the smallest project subtree containing each planned file.
+        # A root-level planned file cannot identify a safe subtree, so serialize
+        # the task project-wide and let path traversal/symlink guards enforce the
+        # workspace boundary.
+        roots: List[str] = []
+        has_root_file = False
+        for raw_path in task_required:
+            normalized = str(raw_path).replace("\\", "/").strip("/")
+            if "/" not in normalized:
+                has_root_file = True
+                break
+            roots.append(normalized.split("/", 1)[0] + "/")
+        allowed_scopes = [] if has_root_file else list(dict.fromkeys(roots))
+        hard_required = []
+        workspace_exclusive = not bool(allowed_scopes)
     return {
         **dict(base_policy or {}),
         "task_id": task_id,
         "task_dependencies": list(task_dependencies),
-        "required_files": task_required,
-        "allowed_prefixes": list(task_required),
-        "allowed_path_prefixes": list(task_required),
-        "workspace_exclusive": not bool(task_required),
-        "rebuild_file_specs": list(rebuild_file_specs),
+        "planned_files": task_required,
+        "required_files": hard_required,
+        "allowed_prefixes": list(allowed_scopes),
+        "allowed_path_prefixes": list(allowed_scopes),
+        "workspace_exclusive": workspace_exclusive,
+        "dynamic_delivery_scope": not bool(rebuild_specs),
+        "rebuild_file_specs": rebuild_specs,
     }
+
+
+def _locked_tasks_artifact_kind(
+    default_kind: str,
+    locked_tasks: Iterable[Dict[str, Any]],
+) -> str:
+    """Classify explicit document deliverables without weakening source gates."""
+    if str(default_kind or "runnable") != "runnable":
+        return str(default_kind)
+    task_text = "\n".join(
+        json.dumps(task.get(field) or "", ensure_ascii=False)
+        for task in locked_tasks
+        if isinstance(task, dict)
+        for field in (
+            "name", "task_name", "objective", "task_description",
+            "implementation", "implementation_method", "acceptance",
+            "acceptance_criteria", "functional_details",
+        )
+    ).lower()
+    if re.search(r"(?:验收|测试|交付)?(?:文档|报告)|\b(?:documentation|report)\b", task_text):
+        return "documentation"
+    return "runnable"
+
+
+def _locked_task_required_files(
+    project_contract: Dict[str, Any],
+    phase_id: str,
+    task_id: str,
+    rebuild_files_by_task: Any = None,
+) -> List[str]:
+    required_files = [
+        str(item.get("path") or "")
+        for item in (project_contract.get("required_files") or [])
+        if isinstance(item, dict)
+        and str(item.get("phase_id") or "") == str(phase_id)
+        and str(item.get("task_id") or "") == str(task_id)
+        and item.get("required", True)
+    ]
+    if isinstance(rebuild_files_by_task, dict):
+        executable_paths = {
+            _normalized_rebuild_path(path)
+            for path in (rebuild_files_by_task.get(str(task_id)) or [])
+        }
+        required_files = [
+            path for path in required_files
+            if _normalized_rebuild_path(path) in executable_paths
+        ]
+    return list(dict.fromkeys(required_files))
+
+
+def _remove_legacy_keyword_inferred_files(
+    project_contract: Dict[str, Any], phase_id: str,
+) -> bool:
+    """Remove paths created by the retired technology-keyword heuristic."""
+    manifest = list(project_contract.get("required_files") or [])
+    removed_by_task: Dict[str, set[str]] = {}
+    retained = []
+    for item in manifest:
+        if (
+            isinstance(item, dict)
+            and str(item.get("phase_id") or "") == str(phase_id)
+            and item.get("source") == "locked-task-contract-inference"
+        ):
+            removed_by_task.setdefault(
+                str(item.get("task_id") or ""), set()
+            ).add(str(item.get("path") or ""))
+            continue
+        retained.append(item)
+    if not removed_by_task:
+        return False
+    project_contract["required_files"] = retained
+    for contract_phase in (project_contract.get("phases") or []):
+        if not isinstance(contract_phase, dict) or str(
+            contract_phase.get("phase_id") or ""
+        ) != str(phase_id):
+            continue
+        for task in (contract_phase.get("tasks") or []):
+            if not isinstance(task, dict):
+                continue
+            removed = removed_by_task.get(str(task.get("task_id") or ""), set())
+            if removed:
+                task["required_files"] = [
+                    path for path in (task.get("required_files") or [])
+                    if str(path) not in removed
+                ]
+    return True
 
 
 def _unsupported_phase_roles(phase: Dict[str, Any]) -> List[str]:
@@ -304,6 +513,10 @@ def _unsupported_phase_roles(phase: Dict[str, Any]) -> List[str]:
     ))
 
 
+class QualityCheckpointPersistenceError(RuntimeError):
+    """A durable quality checkpoint failed after its live projection rolled back."""
+
+
 def _quality_background_terminal(handler):
     """Force every uncaught background exit into a durable non-running state."""
     @wraps(handler)
@@ -311,6 +524,10 @@ def _quality_background_terminal(handler):
         key = f"{project_id}-{phase_id}"
         try:
             return await handler(project_id, phase_id, *args, **kwargs)
+        except QualityCheckpointPersistenceError:
+            # The checkpoint helper already restored the last durable live
+            # projection. Do not publish a synthetic failure over that state.
+            raise
         except asyncio.CancelledError:
             state = _auto_repair_states.get(key)
             if state is not None:
@@ -778,7 +995,22 @@ def _locked_phase_evidence_bundle(
         for task_id, task in locked_by_id.items():
             receipt = receipts.get(task_id) or {}
             result = receipt.get("result") or {}
-            required_files = list(receipt.get("required_files") or [])
+            planned_files = list(receipt.get("required_files") or [])
+            actual_delivery_files = list(dict.fromkeys(
+                str(item.get("path") or "").replace("\\", "/").strip()
+                for item in (
+                    (result.get("delivery_evidence") or {}).get("files") or []
+                )
+                if isinstance(item, dict) and str(item.get("path") or "").strip()
+            ))
+            # The runner-observed byte manifest is the authoritative delivery
+            # contract. PM paths remain traceable planning hints but must not
+            # claim ownership of a different task's file or reject a valid
+            # dynamically chosen implementation path.
+            required_files = actual_delivery_files or planned_files
+            if actual_delivery_files and actual_delivery_files != planned_files:
+                receipt.setdefault("planned_files", planned_files)
+                receipt["required_files"] = list(actual_delivery_files)
             assignments.append({
                 "agent_id": str(agent.get("id") or ""),
                 "required_role": str(
@@ -1464,6 +1696,57 @@ def _record_server_acceptance_evidence(
         })
 
 
+def _phase_acceptance_criterion_contracts(
+    phase_id: str,
+    raw_criteria: Any,
+) -> List[Dict[str, Any]]:
+    """Normalize the persisted string and structured phase criterion formats."""
+    if raw_criteria is None:
+        return []
+    if not isinstance(raw_criteria, (list, tuple)):
+        raise IllegalQualityTransition(
+            "phase.acceptance_criteria must be a list"
+        )
+    normalized: List[Any] = []
+    for index, raw in enumerate(raw_criteria):
+        path = f"phase.acceptance_criteria[{index}]"
+        if isinstance(raw, str):
+            text = raw.strip()
+            if not text:
+                raise IllegalQualityTransition(f"{path} must not be empty")
+            normalized.append(text)
+            continue
+        if not isinstance(raw, dict):
+            raise IllegalQualityTransition(
+                f"{path} must be a string or an object"
+            )
+        text = str(raw.get("criterion") or raw.get("text") or "").strip()
+        if not text:
+            raise IllegalQualityTransition(
+                f"{path} requires criterion or text"
+            )
+        criterion_id = str(raw.get("criterion_id") or "").strip()
+        legacy_id = str(raw.get("id") or "").strip()
+        if criterion_id and legacy_id and criterion_id != legacy_id:
+            raise IllegalQualityTransition(
+                f"{path} has conflicting criterion_id and id"
+            )
+        evidence_spec = raw.get("evidence_spec")
+        if evidence_spec is not None and not isinstance(evidence_spec, dict):
+            raise IllegalQualityTransition(
+                f"{path}.evidence_spec must be an object"
+            )
+        normalized.append({
+            "criterion_id": criterion_id or legacy_id,
+            "criterion": text,
+            **(
+                {"evidence_spec": copy.deepcopy(evidence_spec)}
+                if evidence_spec is not None else {}
+            ),
+        })
+    return acceptance_criterion_contracts(phase_id, normalized)
+
+
 def _record_supervisor_acceptance_evidence(
     ctx: ProjectContext,
     phase: Dict[str, Any],
@@ -1482,6 +1765,10 @@ def _record_supervisor_acceptance_evidence(
         is not True
     ):
         return
+    phase_contracts = _phase_acceptance_criterion_contracts(
+        phase_id,
+        phase.get("acceptance_criteria"),
+    )
     supervisor_run_id = str(supervisor_run.get("run_id") or "")
     scope = supervisor_run.get("scope") or {}
     artifact_digest = str(
@@ -1533,26 +1820,23 @@ def _record_supervisor_acceptance_evidence(
                     metadata["acceptance_observations"],
                 ))
     if not qa_evidence:
-        criteria = list(phase.get("acceptance_criteria") or [])
         reviewed = phase.get("reviewed") is True and phase.get("review_passed") is True
         if not reviewed:
             return
         qa_round_id = ""
         observations = []
-        pid = str(phase.get("phase_id", ""))
-        gen = str(phase.get("execution_generation") or "")
-        for criterion in criteria:
-            cid = str(criterion.get("id") or criterion.get("criterion_id") or "")
-            text = str(criterion.get("criterion") or criterion.get("text") or cid)
+        for contract in phase_contracts:
             observations.append({
-                "task_id": pid,
-                "task_run_id": "",
-                "execution_generation": gen,
-                "criterion_id": cid,
-                "criterion": text,
+                "task_id": phase_id,
+                "task_run_id": supervisor_run_id,
+                "execution_generation": generation,
+                "criterion_id": contract["criterion_id"],
+                "criterion": contract["criterion"],
                 "passed": True,
                 "observation": "Auto-repair QC confirmed acceptance criterion",
-                "observed_files": [],
+                "observed_files": sorted(scope_files),
+                "artifact_digest": artifact_digest,
+                "qa_round_id": qa_round_id,
             })
     elif len(qa_evidence) == 1:
         qa_round_id, observations = qa_evidence[0]
@@ -1620,6 +1904,7 @@ def _record_supervisor_acceptance_evidence(
             "qa_round_id": qa_round_id,
             "artifact_digest": artifact_digest,
             "criterion_id": criterion_id,
+            "criterion": str(contract["criterion"]),
             "observed_files": observation["observed_files"],
         }
         scope_digest = "sha256:" + hashlib.sha256(
@@ -1640,6 +1925,7 @@ def _record_supervisor_acceptance_evidence(
                 "observation_id": f"{qa_round_id}:{criterion_id}",
                 "scope_digest": scope_digest,
                 "covered_criterion_ids": [criterion_id],
+                "criterion": str(contract["criterion"]),
                 "task_id": task_id,
                 "task_run_id": task_run_id,
                 "execution_generation": generation,
@@ -1734,10 +2020,7 @@ def _record_supervisor_acceptance_evidence(
                 })
 
     phase_bindings = supervisor_run.setdefault("phase_evidence", [])
-    for contract in acceptance_criterion_contracts(
-        phase_id,
-        phase.get("acceptance_criteria") or [],
-    ):
+    for contract in phase_contracts:
         if (
             contract.get("source_class") != "semantic"
             or any(
@@ -2214,38 +2497,56 @@ def _verified_completed_task_ids(
             candidate.get("execution_evidence_bundle") or {}
         )
         try:
-            assignments, bundle = _locked_phase_evidence_bundle(
-                ctx, pm, candidate,
-            )
-            validation = validate_phase_execution_evidence(
-                candidate, assignments, bundle,
-            )
-        except Exception:
-            continue
-        bundle_digest = _phase_evidence_bundle_digest(bundle)
-        try:
             digest_version = int(
                 completion.get("bundle_digest_version") or 1
             )
         except (TypeError, ValueError):
             continue
         if digest_version >= 2:
-            digest_matches = (
-                str(completion.get("bundle_digest") or "")
-                == bundle_digest
-            )
+            # The completion receipt is immutable historical evidence.  A
+            # later phase may legitimately modify the same files, so rebuilding
+            # the old bundle from current workspace bytes would falsely revoke
+            # an accepted dependency.  Current bytes are checked by the active
+            # phase and final QA/QC instead.
+            digest_matches = bool(completion.get("bundle_digest"))
+            # Compatibility for old restored rows that retained the receipt
+            # but not its immutable bundle.  New receipts always persist the
+            # bundle, so only legacy rows rebuild current evidence here.
+            if digest_matches and not persisted_bundle:
+                try:
+                    legacy_assignments, legacy_bundle = (
+                        _locked_phase_evidence_bundle(ctx, pm, candidate)
+                    )
+                    digest_matches = bool(
+                        validate_phase_execution_evidence(
+                            candidate,
+                            legacy_assignments,
+                            legacy_bundle,
+                        ).valid
+                    )
+                except Exception:
+                    digest_matches = False
         else:
             digest_matches = bool(
                 persisted_bundle
                 and str(completion.get("bundle_digest") or "")
                 == _legacy_phase_evidence_bundle_digest(persisted_bundle)
-                and _phase_evidence_bundle_digest(persisted_bundle)
-                == bundle_digest
             )
-        if (
-            not validation.valid
-            or not digest_matches
-        ):
+        expected_task_ids = {
+            str(task.get("task_id") or "")
+            for task in phase_task_contract(candidate)
+            if str(task.get("task_id") or "")
+        }
+        receipt_task_ids = {
+            str(task_id)
+            for task_id in (completion.get("task_ids") or [])
+            if str(task_id)
+        }
+        # Legacy restored phases can lack the expanded task contract while the
+        # signed receipt still carries the immutable accepted task set.
+        if not expected_task_ids:
+            expected_task_ids = set(receipt_task_ids)
+        if not digest_matches or receipt_task_ids != expected_task_ids:
             continue
         completed_task_ids.extend(
             str(task_id)
@@ -2681,6 +2982,7 @@ async def phase_pm_chat(project_id: str, phase_id: str, request: PhasePMChatRequ
     phase = pm.get_phase(phase_id) if pm else None
     if not phase:
         raise HTTPException(status_code=404, detail=f"Phase {phase_id} not found")
+
     member = leader.get_member_for_phase(phase_id)
     if not member:
         member = leader.assign_phase_to_member(
@@ -2748,6 +3050,33 @@ def _assign_phase_pm_members(leader, phases: List[Dict[str, Any]], ctx) -> None:
         phase["pm_member_name"] = member.name
 
 
+def _restore_phase_init_leader(leader, snapshot: Dict[str, Any]) -> None:
+    """Restore the exact pre-transaction PM state without recovery migration."""
+    for field, value in snapshot.items():
+        if field != "members" and hasattr(leader, field):
+            setattr(leader, field, copy.deepcopy(value))
+    for member_id, member_state in (snapshot.get("members") or {}).items():
+        member = (getattr(leader, "members", {}) or {}).get(member_id)
+        if member is not None:
+            member.from_persist(copy.deepcopy(member_state))
+
+
+def _snapshot_phase_init_leader(leader) -> Dict[str, Any]:
+    if hasattr(leader, "to_persist"):
+        return copy.deepcopy(leader.to_persist())
+    snapshot = {
+        key: copy.deepcopy(value)
+        for key, value in vars(leader).items()
+        if key != "members"
+    }
+    snapshot["members"] = {
+        member_id: copy.deepcopy(member.to_persist())
+        for member_id, member in (getattr(leader, "members", {}) or {}).items()
+        if hasattr(member, "to_persist")
+    }
+    return snapshot
+
+
 @router.post("/projects/{project_id}/phases/init")
 async def init_project_phases(project_id: str):
     """Initialize phases from PM confirmed plan"""
@@ -2755,11 +3084,11 @@ async def init_project_phases(project_id: str):
     pm_leader = _pm_teams.get(project_id)
     if not pm_leader or not pm_leader.final_plan:
         raise HTTPException(status_code=400, detail="PM plan not confirmed yet")
+    leader_snapshot = _snapshot_phase_init_leader(pm_leader)
     pm = _phase_managers.get(project_id)
     created_manager = pm is None
     if not pm:
         pm = PhaseManager(project_id, ctx.workspace)
-        _phase_managers[project_id] = pm
     manager_snapshot = (
         None if created_manager else copy.deepcopy(pm.to_dict())
     )
@@ -2820,19 +3149,28 @@ async def init_project_phases(project_id: str):
                     "必须创建新的干净阶段管理器"
                 ),
             )
-        _assign_phase_pm_members(pm_leader, pm.phases, ctx)
-        await _persist_all_async()
+        try:
+            _assign_phase_pm_members(pm_leader, pm.phases, ctx)
+            await _persist_all_async()
+        except Exception:
+            _restore_phase_init_leader(pm_leader, leader_snapshot)
+            if manager_snapshot is not None:
+                pm.from_dict(copy.deepcopy(manager_snapshot))
+            raise
         return {
             "success": True,
             "status": "already_initialized",
             "validation": validation_data,
             "phases": pm.to_dict(),
         }
+    if created_manager:
+        _phase_managers[project_id] = pm
     try:
         pm.init_phases_from_plan(final_plan)
         _assign_phase_pm_members(pm_leader, pm.phases, ctx)
         await _persist_all_async()
     except Exception:
+        _restore_phase_init_leader(pm_leader, leader_snapshot)
         if created_manager:
             if _phase_managers.get(project_id) is pm:
                 _phase_managers.pop(project_id, None)
@@ -2945,6 +3283,41 @@ def _expert_pool_snapshot(pool) -> Dict[str, Any]:
     return {"revision": revision, "experts": experts}
 
 
+def _expert_binding_snapshot(expert: Dict[str, Any]) -> Dict[str, Any]:
+    stable = {
+        "expert_id": str(expert.get("expert_id") or ""),
+        "role": str(expert.get("role") or ""),
+        "agent_type": str(expert.get("agent_type") or ""),
+        "domains": sorted(str(item) for item in (expert.get("domains") or [])),
+        "skills": sorted(str(item) for item in (expert.get("skills") or [])),
+        "status": str(expert.get("status") or ""),
+        "updated_at": expert.get("updated_at"),
+    }
+    stable["digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            stable, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    return stable
+
+
+def _assigned_expert_bindings(
+    execution_tasks: Iterable[Dict[str, Any]],
+    expert_snapshot: Dict[str, Any],
+) -> Dict[str, Dict[str, Any]]:
+    referenced = {
+        str(expert_id)
+        for task in execution_tasks
+        for expert_id in (task.get("assigned_expert_ids") or [])
+        if str(expert_id)
+    }
+    return {
+        str(expert.get("expert_id")): _expert_binding_snapshot(expert)
+        for expert in (expert_snapshot.get("experts") or [])
+        if str(expert.get("expert_id") or "") in referenced
+    }
+
+
 def _phase_v1_expert_binding_issues(
     phase: Dict[str, Any],
     expert_snapshot: Dict[str, Any],
@@ -2984,6 +3357,44 @@ def _phase_v1_expert_binding_issues(
             expected=sorted(available_ids),
             actual=unavailable,
         ))
+    saved_bindings = phase.get("assigned_expert_bindings")
+    if not isinstance(saved_bindings, dict):
+        if unavailable:
+            return issues
+        current_by_id = {
+            str(expert.get("expert_id") or ""): expert
+            for expert in (expert_snapshot.get("experts") or [])
+            if isinstance(expert, dict)
+        }
+        phase["assigned_expert_bindings"] = {
+            expert_id: _expert_binding_snapshot(current_by_id[expert_id])
+            for expert_id in sorted(assigned_ids)
+            if expert_id in current_by_id
+        }
+        phase["expert_pool_revision"] = str(
+            expert_snapshot.get("revision") or ""
+        )
+        return issues
+    current_by_id = {
+        str(expert.get("expert_id") or ""): expert
+        for expert in (expert_snapshot.get("experts") or [])
+        if isinstance(expert, dict)
+    }
+    drifted = []
+    for expert_id in sorted(assigned_ids & set(current_by_id)):
+        saved = saved_bindings.get(expert_id)
+        if not isinstance(saved, dict):
+            drifted.append(expert_id)
+            continue
+        current = _expert_binding_snapshot(current_by_id[expert_id])
+        if str(saved.get("digest") or "") != current["digest"]:
+            drifted.append(expert_id)
+    if drifted:
+        issues.append(_phase_plan_issue(
+            "expert_pool_revision_mismatch", "$.assigned_expert_bindings",
+            "a referenced expert profile changed; regenerate the phase plan",
+            actual=drifted,
+        ))
     return issues
 
 
@@ -2998,7 +3409,11 @@ def _phase_requirements_snapshot(
     total_plan = (leader.final_plan if leader else None) or {}
     snapshot = {
         "schema_version": "phase-requirements/v1",
-        "revision": int(phase.get("phase_requirements_revision") or 0) + 1,
+        "revision": int(
+            phase.get("phase_plan_revision")
+            or phase.get("phase_requirements_revision")
+            or 0
+        ) + 1,
         "project_id": project_id,
         "project_name": project_name,
         "project_requirements": {
@@ -3146,11 +3561,12 @@ def _validate_phase_plan_v1(
                 expected=inherited, actual=effective,
             ))
 
-    expert_ids = {
-        str(item.get("expert_id") or "")
+    expert_by_id = {
+        str(item.get("expert_id") or ""): item
         for item in (expert_snapshot.get("experts") or [])
         if isinstance(item, dict) and item.get("expert_id")
     }
+    expert_ids = set(expert_by_id)
     if str(plan.get("expert_pool_revision") or "") != str(
         expert_snapshot.get("revision") or ""
     ):
@@ -3169,7 +3585,7 @@ def _validate_phase_plan_v1(
     allowed_task_fields = {
         "task_id", "name", "objective", "functional_details",
         "implementation", "implementation_technologies",
-        "dependencies", "acceptance_criteria",
+        "dependencies", "acceptance_criteria", "required_files",
     }
     task_ids: List[str] = []
     phase_id = str(phase.get("phase_id") or "")
@@ -3179,7 +3595,9 @@ def _validate_phase_plan_v1(
             issues.append(_phase_plan_issue("task_invalid", path, "task must be an object"))
             continue
         unexpected = sorted(set(task) - allowed_task_fields)
-        missing_task = sorted(allowed_task_fields - set(task))
+        missing_task = sorted(
+            (allowed_task_fields - {"required_files"}) - set(task)
+        )
         if unexpected:
             issues.append(_phase_plan_issue(
                 "unexpected_task_fields", path,
@@ -3225,6 +3643,11 @@ def _validate_phase_plan_v1(
                     "task_string_array", f"{path}.{field}",
                     f"{field} must be a valid string array",
                 ))
+        if "required_files" in task and not string_array(task.get("required_files")):
+            issues.append(_phase_plan_issue(
+                "task_required_files_invalid", f"{path}.required_files",
+                "required_files must be a string array when supplied",
+            ))
         invalid_dependencies = [
             dependency
             for dependency in (
@@ -3250,6 +3673,7 @@ def _validate_phase_plan_v1(
         ))
         assignments = []
     assigned_tasks: set[str] = set()
+    assignment_rows: set[tuple[str, str]] = set()
     assigned_experts_by_task: Dict[str, set[str]] = {
         task_id: set() for task_id in task_ids
     }
@@ -3286,6 +3710,26 @@ def _validate_phase_plan_v1(
                 "assignment references unknown tasks",
                 expected=task_ids, actual=unknown_tasks,
             ))
+        for task_id in assignment_tasks:
+            binding = (expert_id, str(task_id))
+            if binding in assignment_rows:
+                issues.append(_phase_plan_issue(
+                    "duplicate_assignment", f"{path}.task_ids",
+                    "the same expert/task binding may appear only once",
+                    actual={"expert_id": expert_id, "task_id": str(task_id)},
+                ))
+            assignment_rows.add(binding)
+            if task_id not in task_ids or expert_id not in expert_by_id:
+                continue
+            task = tasks[task_ids.index(task_id)]
+            required_type = _phase_task_required_executor_type(task)
+            actual_type = _expert_profile_executor_type(expert_by_id[expert_id])
+            if not _expert_can_execute(required_type, actual_type):
+                issues.append(_phase_plan_issue(
+                    "expert_role_mismatch", f"{path}.expert_id",
+                    "assigned expert capability does not match the task",
+                    expected=required_type, actual=actual_type or expert_id,
+                ))
         if not isinstance(assignment.get("responsibility"), str) or not assignment["responsibility"].strip():
             issues.append(_phase_plan_issue(
                 "assignment_responsibility_empty", f"{path}.responsibility",
@@ -3314,9 +3758,240 @@ def _validate_phase_plan_v1(
     return issues
 
 
+def _phase_discussion_task_rows(content: str) -> List[Dict[str, str]]:
+    """Extract agreed task rows from the latest phase-PM markdown plan."""
+    rows: List[Dict[str, str]] = []
+    for line in str(content or "").splitlines():
+        if not line.strip().startswith("|"):
+            continue
+        columns = [part.strip() for part in line.strip().strip("|").split("|")]
+        if len(columns) < 3:
+            continue
+        if all(not part.strip("-: ") for part in columns):
+            continue
+        name = re.sub(r"^\d+\s*[.、]\s*", "", columns[0]).strip()
+        if name.casefold() in {"任务", "task"}:
+            continue
+        if re.fullmatch(r"\d+[.)]?", columns[0]):
+            task_name = columns[1].strip()
+            acceptance = columns[2].strip()
+            if task_name and acceptance:
+                rows.append({
+                    "name": task_name,
+                    "objective": task_name,
+                    "acceptance": acceptance,
+                })
+            continue
+        if name.casefold() in {"#", "no", "序号", "编号"}:
+            continue
+        objective = columns[1].strip()
+        acceptance = columns[2].strip()
+        if name and objective and acceptance:
+            rows.append({
+                "name": name,
+                "objective": objective,
+                "acceptance": acceptance,
+            })
+    if rows:
+        return rows
+
+    # Phase PMs commonly return numbered Markdown sections such as
+    # ``1. **Task name**`` rather than a table. Parse that representation
+    # locally so a formatting choice cannot block an otherwise valid plan.
+    numbered_section_pattern = re.compile(
+        r"^\s*(?:#{1,6}\s*)?\*{0,2}(?:(?:\u4efb\u52a1|task)\s*)?"
+        r"\d+\s*[.\u3001)\-\uff1a:]\s*(.+?)\*{0,2}\s*$",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    numbered_matches = list(numbered_section_pattern.finditer(str(content or "")))
+    for index, match in enumerate(numbered_matches):
+        section_end = (
+            numbered_matches[index + 1].start()
+            if index + 1 < len(numbered_matches)
+            else len(content)
+        )
+        section = str(content or "")[match.end():section_end]
+        details: List[str] = []
+        acceptance_items: List[str] = []
+        for item in re.findall(r"^\s*[-*]\s+(.+?)\s*$", section, flags=re.MULTILINE):
+            value = item.strip()
+            acceptance_match = re.match(
+                r"^(?:\u9a8c\u6536|acceptance)\s*[\uff1a:]\s*(.+)$",
+                value,
+                flags=re.IGNORECASE,
+            )
+            if acceptance_match:
+                acceptance_items.append(acceptance_match.group(1).strip())
+            elif value:
+                details.append(value)
+        name = match.group(1).strip().strip("*").strip()
+        if name:
+            rows.append({
+                "name": name,
+                "objective": "; ".join(details) or name,
+                "acceptance": "; ".join(acceptance_items) or "Complete the agreed task",
+            })
+    if rows:
+        return rows
+
+    section_pattern = re.compile(
+        r"^\s*\*{0,2}(?:任务|task)\s*\d+\s*[：:.\-]\s*(.+?)\*{0,2}\s*$",
+        flags=re.IGNORECASE | re.MULTILINE,
+    )
+    matches = list(section_pattern.finditer(str(content or "")))
+    for index, match in enumerate(matches):
+        section_end = matches[index + 1].start() if index + 1 < len(matches) else len(content)
+        section = str(content or "")[match.end():section_end]
+        details: List[str] = []
+        acceptance_items: List[str] = []
+        for item in re.findall(r"^\s*[-*]\s+(.+?)\s*$", section, flags=re.MULTILINE):
+            value = item.strip()
+            acceptance_match = re.match(r"^(?:验收|acceptance)\s*[：:]\s*(.+)$", value, flags=re.IGNORECASE)
+            if acceptance_match:
+                acceptance_items.append(acceptance_match.group(1).strip())
+            elif value:
+                details.append(value)
+        name = match.group(1).strip().strip("*").strip()
+        if name:
+            rows.append({
+                "name": name,
+                "objective": "；".join(details) or name,
+                "acceptance": "；".join(acceptance_items) or "Complete the agreed task",
+            })
+    return rows
+
+
+def _latest_phase_pm_content(content: str) -> str:
+    """Return the latest assistant planning response from the phase dialogue."""
+    matches = re.findall(
+        r"(?:^|\n)assistant:\s*\n(.*?)(?=\n(?:user|assistant):\s*\n|\Z)",
+        str(content or ""),
+        flags=re.DOTALL,
+    )
+    return matches[-1].strip() if matches else ""
+
+
+def _deterministic_phase_plan_v1(
+    *,
+    phase: Dict[str, Any],
+    requirements_snapshot: Dict[str, Any],
+    expert_snapshot: Dict[str, Any],
+) -> Dict[str, Any]:
+    """Build a contract-safe plan when a provider cannot return valid JSON."""
+    experts = [
+        item for item in (expert_snapshot.get("experts") or [])
+        if isinstance(item, dict) and str(item.get("expert_id") or "").strip()
+    ]
+    discussion_content = str(
+        requirements_snapshot.get("phase_user_requirements") or ""
+    )
+    latest_pm_content = _latest_phase_pm_content(discussion_content)
+    discussion_rows = _phase_discussion_task_rows(
+        latest_pm_content or discussion_content
+    )
+    if discussion_rows:
+        task_rows = discussion_rows
+    else:
+        # Once the phase PM conversation exists it is authoritative. Falling
+        # back to the older total-plan work_items would silently discard later
+        # additions, removals, and technical decisions. Leave the task list
+        # empty so validation reports an explicit normalization failure.
+        task_rows = [] if latest_pm_content else [
+            {
+                "name": str(item).strip(),
+                "objective": str(item).strip(),
+                "acceptance": "",
+            }
+            for item in (phase.get("work_items") or [])
+            if str(item).strip()
+        ]
+    if not task_rows and not latest_pm_content:
+        fallback_item = str(
+            phase.get("objective")
+            or phase.get("description")
+            or phase.get("name")
+            or "Complete the current phase"
+        ).strip()
+        task_rows = [{"name": fallback_item, "objective": fallback_item, "acceptance": ""}]
+
+    technologies = [
+        str(item).strip()
+        for item in (
+            requirements_snapshot.get("inherited_technical_requirements") or []
+        )
+        if str(item).strip()
+    ]
+    implementation_technologies = technologies or ["project technology stack"]
+    tasks: List[Dict[str, Any]] = []
+    assignments: List[Dict[str, Any]] = []
+    phase_id = str(phase.get("phase_id") or "")
+
+    for index, task_row in enumerate(task_rows):
+        work_item = task_row["name"]
+        objective = task_row.get("objective") or work_item
+        acceptance = task_row.get("acceptance") or (
+            f"The result for '{work_item}' is implemented and independently verifiable"
+        )
+        task_id = f"{phase_id}-task-{index + 1}"
+        task = {
+            "task_id": task_id,
+            "name": work_item,
+            "objective": objective,
+            "functional_details": [objective],
+            "implementation": f"Implement and verify: {objective}",
+            "implementation_technologies": list(implementation_technologies),
+            # The deterministic fallback intentionally executes tasks in order.
+            # Record the complete predecessor set so delivery ownership checks
+            # recognize legitimate edits to artifacts created earlier in the
+            # same phase instead of treating transitive dependencies as peers.
+            "dependencies": [item["task_id"] for item in tasks],
+            "acceptance_criteria": [acceptance],
+        }
+        required_type = _phase_task_required_executor_type(task)
+        compatible = [
+            expert for expert in experts
+            if _expert_can_execute(
+                required_type, _expert_profile_executor_type(expert)
+            )
+        ]
+        if not compatible:
+            compatible = experts
+        if not compatible:
+            break
+        selected = sorted(
+            compatible,
+            key=lambda item: str(item.get("expert_id") or ""),
+        )[0]
+        tasks.append(task)
+        assignments.append({
+            "expert_id": str(selected.get("expert_id") or ""),
+            "task_ids": [task_id],
+            "responsibility": f"Own implementation and verification of: {work_item}",
+        })
+
+    return {
+        "schema_version": PHASE_PLAN_SCHEMA_VERSION,
+        "phase_id": phase_id,
+        "summary": str(
+            phase.get("objective")
+            or phase.get("description")
+            or phase.get("name")
+            or "Current phase plan"
+        ).strip(),
+        "effective_technical_requirements": technologies,
+        "technical_overrides": [],
+        "tasks": tasks,
+        "assignments": assignments,
+        "expert_pool_revision": str(expert_snapshot.get("revision") or ""),
+    }
+
+
 def _phase_plan_execution_tasks(
     plan: Dict[str, Any],
     expert_snapshot: Dict[str, Any],
+    *,
+    project_contract: Optional[Dict[str, Any]] = None,
+    phase_id: str = "",
 ) -> List[Dict[str, Any]]:
     experts = {
         str(item.get("expert_id") or ""): item
@@ -3327,6 +4002,16 @@ def _phase_plan_execution_tasks(
     for assignment in plan.get("assignments") or []:
         for task_id in assignment.get("task_ids") or []:
             assignments_by_task.setdefault(str(task_id), []).append(assignment)
+    files_by_task: Dict[str, List[str]] = {}
+    for row in ((project_contract or {}).get("required_files") or []):
+        if not isinstance(row, dict):
+            continue
+        if str(row.get("phase_id") or "") != str(phase_id or plan.get("phase_id") or ""):
+            continue
+        task_id = str(row.get("task_id") or "")
+        path = _normalized_rebuild_path(row.get("path"))
+        if task_id and path and row.get("required", True):
+            files_by_task.setdefault(task_id, []).append(path)
     normalized = []
     for task in plan.get("tasks") or []:
         task_id = str(task.get("task_id") or "")
@@ -3365,10 +4050,10 @@ def _phase_plan_execution_tasks(
                 task.get("acceptance_criteria") or []
             ),
             "dependencies": list(task.get("dependencies") or []),
-            # Actual paths are selected by the ExecutionAgent and recorded
-            # after a successful write; phase planning does not pre-allocate
-            # file ownership.
-            "required_files": [],
+            "required_files": list(dict.fromkeys(
+                files_by_task.get(task_id, [])
+                or task.get("required_files", [])
+            )),
         })
     return normalized
 
@@ -3572,6 +4257,13 @@ def _phase_plan_v1_messages(
         '"assignments":[{"expert_id":"expert-id","task_ids":["phase-1-task-1"],'
         '"responsibility":"人员职责"}],"expert_pool_revision":"sha256:..."}'
     )
+    system += (
+        "\nFor each task, also include optional required_files with the concrete "
+        "workspace-relative source files that the executor must deliver. These paths "
+        "become the single contract used by generation, self-review, and hard validation. "
+        "Do not invent runtime data files. Example: "
+        "\"required_files\":[\"backend/main.py\"]."
+    )
     user = json.dumps(
         {
             "phase_requirements_file": requirements_snapshot,
@@ -3615,6 +4307,20 @@ def _apply_phase_plan_v1(
 ) -> None:
     contract = json.loads(json.dumps(pm.project_contract or {}, ensure_ascii=False))
     phase_id = str(phase.get("phase_id") or "")
+    for task in execution_tasks:
+        task_id = str(task.get("task_id") or "")
+        confirmed_files = [
+            _normalized_rebuild_path(item.get("path"))
+            for item in (contract.get("required_files") or [])
+            if isinstance(item, dict)
+            and str(item.get("phase_id") or "") == phase_id
+            and str(item.get("task_id") or "") == task_id
+            and item.get("required", True)
+            and _normalized_rebuild_path(item.get("path"))
+        ]
+        task["required_files"] = list(dict.fromkeys([
+            *(task.get("required_files") or []), *confirmed_files,
+        ]))
     contract_phases = [
         item for item in (contract.get("phases") or [])
         if isinstance(item, dict) and str(item.get("phase_id") or "") != phase_id
@@ -3673,21 +4379,33 @@ def _apply_phase_plan_v1(
         for role in (item.get("roles") or [])
         if str(role).strip()
     ))
+    prior_phase_files = [
+        copy.deepcopy(item)
+        for item in (contract.get("required_files") or [])
+        if isinstance(item, dict) and str(item.get("phase_id") or "") == phase_id
+    ]
     contract["required_files"] = [
         item for item in (contract.get("required_files") or [])
         if isinstance(item, dict) and str(item.get("phase_id") or "") != phase_id
     ]
     for task in execution_tasks:
         for path in task["required_files"]:
-            contract["required_files"].append({
-                "path": path,
-                "required": True,
-                "phase_id": phase_id,
-                "task_id": task["task_id"],
-                "owner_role": task["required_role"],
-                "owner_type": task["executor_type"],
-                "source": "phase-plan/v1",
-            })
+            preserved = next((
+                item for item in prior_phase_files
+                if str(item.get("task_id") or "") == str(task["task_id"])
+                and _normalized_rebuild_path(item.get("path")) == path
+            ), None)
+            contract["required_files"].append(
+                preserved if preserved is not None else {
+                    "path": path,
+                    "required": True,
+                    "phase_id": phase_id,
+                    "task_id": task["task_id"],
+                    "owner_role": task["required_role"],
+                    "owner_type": task["executor_type"],
+                    "source": "phase-plan/v1",
+                }
+            )
     phase.update({
         "description": str(plan.get("summary") or phase.get("description") or ""),
         "tech_stack": list(plan.get("effective_technical_requirements") or []),
@@ -3703,8 +4421,12 @@ def _apply_phase_plan_v1(
         "expert_requirements": copy.deepcopy(execution_tasks),
         "expert_assignments": copy.deepcopy(plan.get("assignments") or []),
         "expert_pool_revision": expert_snapshot["revision"],
+        "assigned_expert_bindings": _assigned_expert_bindings(
+            execution_tasks, expert_snapshot,
+        ),
         "phase_requirements_snapshot": copy.deepcopy(requirements_snapshot),
         "phase_requirements_revision": requirements_snapshot["revision"],
+        "phase_plan_revision": requirements_snapshot["revision"],
         "phase_requirements_digest": requirements_snapshot["digest"],
         "phase_plan": copy.deepcopy(plan),
         "phase_plan_version": PHASE_PLAN_SCHEMA_VERSION,
@@ -3726,6 +4448,87 @@ async def _generate_phase_plan_v1(
     leader,
     phase_user_requirements: str,
 ) -> Dict[str, Any]:
+    """Commit a phase plan with durable CAS; the local lock is optimization only."""
+    key = (str(project_id), str(phase.get("phase_id") or ""))
+    lock = _phase_plan_transaction_locks.setdefault(key, asyncio.Lock())
+    _phase_plan_transaction_users[key] = (
+        _phase_plan_transaction_users.get(key, 0) + 1
+    )
+    try:
+        async with lock:
+            for _ in range(5):
+                durable = await asyncio.to_thread(
+                    load_phase_plan_commit, project_id, key[1]
+                )
+                legacy_revision = int(
+                    phase.get("phase_plan_revision")
+                    or phase.get("phase_requirements_revision")
+                    or 0
+                )
+                if durable is None and legacy_revision > 0:
+                    if not isinstance(phase.get("phase_plan"), dict):
+                        raise HTTPException(
+                            status_code=409,
+                            detail={
+                                "status": "conflict",
+                                "code": "legacy_phase_plan_incomplete",
+                                "message": "legacy phase plan cannot be migrated safely",
+                            },
+                        )
+                    durable = await asyncio.to_thread(
+                        migrate_phase_plan_commit,
+                        project_id,
+                        key[1],
+                        legacy_revision,
+                        copy.deepcopy(phase),
+                        copy.deepcopy(pm.project_contract),
+                    )
+                expected_revision = int((durable or {}).get("revision") or 0)
+                if durable is not None:
+                    phase.clear()
+                    phase.update(copy.deepcopy(durable["phase"]))
+                    pm.project_contract = copy.deepcopy(
+                        durable["project_contract"]
+                    )
+                result = await _generate_phase_plan_v1_transaction(
+                    project_id=project_id,
+                    ctx=ctx,
+                    pm=pm,
+                    phase=phase,
+                    leader=leader,
+                    phase_user_requirements=phase_user_requirements,
+                    expected_revision=expected_revision,
+                )
+                if result is not None:
+                    return result
+            raise HTTPException(
+                status_code=409,
+                detail={
+                    "status": "conflict",
+                    "code": "phase_plan_revision_conflict",
+                    "message": "phase plan changed repeatedly; regenerate",
+                },
+            )
+    finally:
+        remaining = _phase_plan_transaction_users.get(key, 1) - 1
+        if remaining <= 0:
+            _phase_plan_transaction_users.pop(key, None)
+            if _phase_plan_transaction_locks.get(key) is lock:
+                _phase_plan_transaction_locks.pop(key, None)
+        else:
+            _phase_plan_transaction_users[key] = remaining
+
+
+async def _generate_phase_plan_v1_transaction(
+    *,
+    project_id: str,
+    ctx,
+    pm,
+    phase: Dict[str, Any],
+    leader,
+    phase_user_requirements: str,
+    expected_revision: int,
+) -> Optional[Dict[str, Any]]:
     from core.expert_pool import get_expert_pool
 
     requirements_snapshot = _phase_requirements_snapshot(
@@ -3752,7 +4555,9 @@ async def _generate_phase_plan_v1(
     previous_output = ""
     issues: List[Dict[str, Any]] = []
     plan: Optional[Dict[str, Any]] = None
-    for attempt in range(2):
+    # One semantic generation attempt is enough. Provider formatting defects are
+    # compiled locally below and must not consume another model request.
+    for attempt in range(1):
         messages = _phase_plan_v1_messages(
             requirements_snapshot=requirements_snapshot,
             expert_snapshot=expert_snapshot,
@@ -3820,6 +4625,43 @@ async def _generate_phase_plan_v1(
             "issues": issues,
         })
     if plan is None:
+        fallback_plan = _deterministic_phase_plan_v1(
+            phase=phase,
+            requirements_snapshot=requirements_snapshot,
+            expert_snapshot=expert_snapshot,
+        )
+        fallback_issues = _validate_phase_plan_v1(
+            fallback_plan,
+            phase=phase,
+            requirements_snapshot=requirements_snapshot,
+            expert_snapshot=expert_snapshot,
+            reserved_files=reserved_files,
+        )
+        attempts.append({
+            "attempt": len(attempts) + 1,
+            "status": (
+                "deterministic_fallback"
+                if not fallback_issues else "fallback_validation_failed"
+            ),
+            "issues": fallback_issues,
+        })
+        if not fallback_issues:
+            logger.warning(
+                "phase-plan/v1 provider output invalid; deterministic fallback "
+                "used project=%s phase=%s issue_codes=%s",
+                project_id,
+                phase.get("phase_id"),
+                sorted({
+                    str(issue.get("code") or "")
+                    for attempt_row in attempts[:-1]
+                    for issue in (attempt_row.get("issues") or [])
+                    if isinstance(issue, dict)
+                }),
+            )
+            plan = fallback_plan
+        else:
+            issues = fallback_issues
+    if plan is None:
         raise HTTPException(
             status_code=422,
             detail={
@@ -3829,34 +4671,87 @@ async def _generate_phase_plan_v1(
                 "attempts": attempts,
             },
         )
-    execution_tasks = _phase_plan_execution_tasks(plan, expert_snapshot)
+    execution_tasks = _phase_plan_execution_tasks(
+        plan,
+        expert_snapshot,
+        project_contract=pm.project_contract,
+        phase_id=str(phase.get("phase_id") or ""),
+    )
+    requirements_snapshot["revision"] = expected_revision + 1
+    requirements_snapshot["digest"] = "sha256:" + hashlib.sha256(
+        json.dumps(
+            {key: value for key, value in requirements_snapshot.items() if key != "digest"},
+            ensure_ascii=False,
+            sort_keys=True,
+            separators=(",", ":"),
+        ).encode("utf-8")
+    ).hexdigest()
+    candidate_pm = copy.copy(pm)
+    candidate_pm.project_contract = copy.deepcopy(pm.project_contract)
+    candidate_phase = copy.deepcopy(phase)
     _apply_phase_plan_v1(
-        pm,
-        phase,
+        candidate_pm,
+        candidate_phase,
         plan,
         execution_tasks,
         requirements_snapshot,
         expert_snapshot,
     )
-    phase["plan_generation_attempts"] = attempts
-    phase["plan_generation_mode"] = (
+    candidate_phase["plan_generation_attempts"] = attempts
+    candidate_phase["plan_generation_mode"] = (
         "model" if len(attempts) == 1 else "model_repaired"
     )
-    phase["plan_validation"] = {
+    candidate_phase["plan_validation"] = {
         "valid": True,
         "artifact_type": "phase_plan",
         "schema_version": PHASE_PLAN_SCHEMA_VERSION,
         "issues": [],
     }
-    phase["plan_artifact_metadata"] = {
+    candidate_phase["plan_artifact_metadata"] = {
         "artifact_type": "phase_plan",
         "schema_version": PHASE_PLAN_SCHEMA_VERSION,
-        "source": phase["plan_generation_mode"],
+        "source": candidate_phase["plan_generation_mode"],
         "saved_at": time.time(),
         "requirements_digest": requirements_snapshot["digest"],
         "expert_pool_revision": expert_snapshot["revision"],
     }
+    candidate_manager = copy.deepcopy(
+        pm.to_dict()
+        if hasattr(pm, "to_dict")
+        else {
+            "project_id": project_id,
+            "phases": [phase],
+            "project_contract": pm.project_contract,
+        }
+    )
+    candidate_manager["project_contract"] = copy.deepcopy(
+        candidate_pm.project_contract
+    )
+    candidate_manager["phases"] = [
+        copy.deepcopy(candidate_phase)
+        if str(item.get("phase_id") or "") == str(candidate_phase.get("phase_id") or "")
+        else copy.deepcopy(item)
+        for item in (candidate_manager.get("phases") or [])
+        if isinstance(item, dict)
+    ]
+    # Exercise the normal persistence boundary while memory still represents
+    # the pre-transaction state. The authoritative plan and its aggregate
+    # PhaseManager mirror are committed together by the CAS below.
     await _persist_all_async()
+    cas_result = await asyncio.to_thread(
+        cas_phase_plan_commit,
+        project_id,
+        str(candidate_phase.get("phase_id") or ""),
+        expected_revision,
+        candidate_phase,
+        candidate_pm.project_contract,
+        candidate_manager,
+    )
+    if not cas_result["applied"]:
+        return None
+    phase.clear()
+    phase.update(candidate_phase)
+    pm.project_contract = candidate_pm.project_contract
     return {
         "success": True,
         "status": "saved",
@@ -3866,9 +4761,9 @@ async def _generate_phase_plan_v1(
         "count": len(execution_tasks),
         "requirements_snapshot": requirements_snapshot,
         "expert_pool_revision": expert_snapshot["revision"],
-        "generation_mode": phase["plan_generation_mode"],
+        "generation_mode": candidate_phase["plan_generation_mode"],
         "model_status": "generated",
-        "validation": phase["plan_validation"],
+        "validation": candidate_phase["plan_validation"],
         "attempts": attempts,
         "warnings": [],
         "auto_corrected": len(attempts) > 1,
@@ -4160,7 +5055,25 @@ async def get_phase_files(project_id: str, phase_id: str):
     if not pm:
         return {"phase_id": phase_id, "files": []}
     files = pm.get_files_by_phase(phase_id) if hasattr(pm, "get_files_by_phase") else []
-    return {"phase_id": phase_id, "files": files, "count": len(files)}
+    qc_entry = (getattr(ctx, "qc_results", {}).get(phase_id) or {}).get("qa", {})
+    manual_by_path: Dict[str, List[Dict[str, Any]]] = {}
+    for issue in qc_entry.get("issues_detail", []) if isinstance(qc_entry, dict) else []:
+        if str(issue.get("status") or "").lower() != "needs_manual":
+            continue
+        path = _normalized_rebuild_path(issue.get("file_path"))
+        if path:
+            manual_by_path.setdefault(path, []).append(copy.deepcopy(issue))
+    enriched = []
+    for item in files:
+        record = dict(item) if isinstance(item, dict) else {"path": str(item)}
+        path = _normalized_rebuild_path(record.get("path") or record.get("file_path"))
+        pending = manual_by_path.get(path, [])
+        enriched.append({
+            **record,
+            "quality_tag": "待修" if pending else "",
+            "quality_issues": pending,
+        })
+    return {"phase_id": phase_id, "files": enriched, "count": len(enriched)}
 
 
 async def _start_phase_quality_after_execution(
@@ -4180,7 +5093,15 @@ async def _start_phase_quality_after_execution(
             ctx.project_id,
             phase_id,
         )
-        phase["status"] = "qa_pending"
+        # A delayed quality bootstrap must not reopen a phase that the user
+        # has already accepted.  Confirmation is the durable milestone and
+        # wins over stale/background execution callbacks.
+        if phase.get("user_confirmed"):
+            phase["status"] = "completed"
+            phase["progress"] = 100
+            phase["completed_at"] = phase.get("completed_at") or time.time()
+        else:
+            phase["status"] = "qa_pending"
         phase["quality_start_error"] = {
             "error_code": type(exc).__name__,
             "recorded_at": time.time(),
@@ -4252,6 +5173,24 @@ async def _resume_locked_phase_coordinator(
     rebuild_files_by_task = (
         (phase.get("rebuild_file_manifest") or {}).get("by_task_id")
     )
+    workspace_exclusive_task_ids = set()
+    for planned_task_id in (plan.get("task_ids") or []):
+        planned_task_id = str(planned_task_id)
+        planned_files = _locked_task_required_files(
+            project_contract, phase_id, planned_task_id,
+            rebuild_files_by_task,
+        )
+        if not rebuild_files_by_task or not planned_files:
+            workspace_exclusive_task_ids.add(planned_task_id)
+    execution_plan = _isolate_workspace_exclusive_tasks(
+        plan, workspace_exclusive_task_ids,
+    )
+    _release_phase_planning_locks(
+        ctx.agents[agent_id]
+        for agent_id in specs_by_agent
+        if agent_id in ctx.agents
+    )
+    await _persist_all_async()
     await _assert_phase_coordinator_lease(
         coordinator_run_id, coordinator_owner,
     )
@@ -4265,23 +5204,9 @@ async def _resume_locked_phase_coordinator(
         agent = ctx.agents.get(agent_id)
         if agent is None or agent_id not in specs_by_agent:
             return {"success": False, "status": "failed"}
-        required_files = [
-            str(item.get("path") or "")
-            for item in (project_contract.get("required_files") or [])
-            if isinstance(item, dict)
-            and str(item.get("phase_id") or "") == str(phase_id)
-            and str(item.get("task_id") or "") == task_id
-            and item.get("required", True)
-        ]
-        if isinstance(rebuild_files_by_task, dict):
-            executable_task_paths = {
-                _normalized_rebuild_path(path)
-                for path in (rebuild_files_by_task.get(task_id) or [])
-            }
-            required_files = [
-                path for path in required_files
-                if _normalized_rebuild_path(path) in executable_task_paths
-            ]
+        required_files = _locked_task_required_files(
+            project_contract, phase_id, task_id, rebuild_files_by_task,
+        )
         receipts = agent.setdefault("task_execution_receipts", {})
         prior = receipts.get(task_id) or {}
         prior_run: Dict[str, Any] = {}
@@ -4334,6 +5259,12 @@ async def _resume_locked_phase_coordinator(
         async with locks[agent_id]:
             payload = dict(specs_by_agent[agent_id])
             payload.pop("expert_type", None)
+            rebuild_file_specs = [
+                copy.deepcopy(spec)
+                for spec in (agent.get("rebuild_file_specs") or [])
+                if isinstance(spec, dict)
+                and str(spec.get("path") or "") in required_files
+            ]
             payload.update({
                 "phase_id": str(phase_id),
                 "task_id": task_id,
@@ -4343,17 +5274,13 @@ async def _resume_locked_phase_coordinator(
                 "artifact_baseline_digest": baseline_digest,
                 "phase_coordinator_run_id": coordinator_run_id,
                 "dispatch_attempt_digest": coordinator_attempt_digest,
-                "artifact_policy": {
-                    **dict(payload.get("artifact_policy") or {}),
-                    "required_files": list(required_files),
-                    "allowed_path_prefixes": list(required_files),
-                    "rebuild_file_specs": [
-                        copy.deepcopy(spec)
-                        for spec in (agent.get("rebuild_file_specs") or [])
-                        if isinstance(spec, dict)
-                        and str(spec.get("path") or "") in required_files
-                    ],
-                },
+                "artifact_policy": _locked_task_artifact_policy(
+                    dict(payload.get("artifact_policy") or {}),
+                    task_id=task_id,
+                    task_dependencies=task.get("dependencies") or [],
+                    required_files=required_files,
+                    rebuild_file_specs=rebuild_file_specs,
+                ),
                 "description": (
                     str(payload.get("description") or "")
                     + "\n\nRECOVERED CURRENT LOCKED TASK "
@@ -4427,6 +5354,22 @@ async def _resume_locked_phase_coordinator(
             receipt["status"] = str(run.get("status") or "pending")
             await _persist_all_async()
             active = routes_execution._active_run_tasks.get(run_id)
+            if active is None and str(run.get("status") or "") == "pending":
+                # During restart recovery the coordinator and its pending child
+                # are reclaimed in the same event-loop turn. The coordinator
+                # may observe the child before the global recovery scheduler
+                # installs its task; start it here instead of treating a
+                # durable pending run as a failed execution result.
+                active = _safe_create_task(
+                    routes_execution._execute_durable_agent_run(
+                        run_id,
+                        agent_id=agent_id,
+                        project_id=project_id,
+                        description=str(payload.get("description") or ""),
+                    ),
+                    name=f"phase-recovered-run-{run_id}",
+                )
+                routes_execution._active_run_tasks[run_id] = active
             if active is not None:
                 await active
             await _assert_phase_coordinator_lease(
@@ -4445,6 +5388,13 @@ async def _resume_locked_phase_coordinator(
                 "status": finished.get("status"),
                 "result": copy.deepcopy(finished.get("result") or {}),
             })
+            finished_error = str(
+                finished.get("last_error")
+                or (finished.get("result") or {}).get("error")
+                or ""
+            )
+            if finished_error:
+                receipt["error"] = finished_error
             if force_repair and finished.get("status") == "succeeded":
                 finished_payload = finished.get("payload") or {}
                 if (
@@ -4493,7 +5443,7 @@ async def _resume_locked_phase_coordinator(
 
     try:
         dispatch_result = await execute_phase_dispatch_plan(
-            plan, execute_attempt,
+            execution_plan, execute_attempt,
         )
         await _assert_phase_coordinator_lease(
             coordinator_run_id, coordinator_owner,
@@ -5393,6 +6343,9 @@ async def start_phase(project_id: str, phase_id: str):
     if not phase:
         raise HTTPException(status_code=404, detail=f"Phase {phase_id} not found")
     project_contract = getattr(pm, "project_contract", {}) or {}
+    if _remove_legacy_keyword_inferred_files(project_contract, phase_id):
+        phase["project_contract"] = project_contract
+        await _persist_all_async()
     pm_leader = _pm_teams.get(project_id)
     if project_contract.get("locked") and pm_leader is not None:
         if (
@@ -5871,6 +6824,12 @@ async def start_phase(project_id: str, phase_id: str):
         phase write ``src/`` at the repository root while the next phase owns
         ``frontend/src/``, producing two incompatible applications.
         """
+        if (
+            expert_type == "frontend"
+            and (Path(ctx.workspace) / "src").is_dir()
+            and not (Path(ctx.workspace) / "frontend").is_dir()
+        ):
+            return ["src/"]
         return list(parallel_scopes.get(expert_type, [f"src/{expert_type}/"]))
 
     role_responsibilities = {
@@ -6244,6 +7203,9 @@ async def start_phase(project_id: str, phase_id: str):
             "required_files": list(required_delivery_files),
             "allowed_prefixes": list(allowed_path_prefixes),
         }
+        artifact_policy["kind"] = _locked_tasks_artifact_kind(
+            str(artifact_policy["kind"]), assigned_locked_tasks,
+        )
         same_type_count = sum(
             1 for candidate in target_sp
             if expert_type_for_subproject(candidate) == matched_type
@@ -6273,6 +7235,9 @@ async def start_phase(project_id: str, phase_id: str):
             planned_phase_scopes,
             subproject_id=str(sp.get("id") or ""),
         )
+        if artifact_policy["kind"] == "documentation":
+            allowed_path_prefixes = ["docs/"]
+            artifact_policy["allowed_prefixes"] = ["docs/"]
 
         # 从专家池匹配
         assigned_expert_id = str(sp.get("assigned_expert_id") or "")
@@ -6326,9 +7291,19 @@ async def start_phase(project_id: str, phase_id: str):
         if matches:
             expert = matches[0]
             agent_id = f"agent-{uuid.uuid4().hex[:6]}"
-            expert_skill_ids = []
+            expert_profile = expert_pool.get_expert(str(expert["expert_id"]))
+            expert_skill_ids = list(getattr(expert_profile, "skill_ids", []) or [])
+            expert_skill_names = [
+                skill.name for skill in (getattr(expert_profile, "skills", []) or [])
+            ]
             if matched_type in ("pm", "supervisor", "hr", "pg", "ccb"):
-                expert_skill_ids = ctx.skill_manager.get_skill_ids_for_agent_type(matched_type)
+                expert_skill_ids = list(dict.fromkeys(
+                    expert_skill_ids + ctx.skill_manager.get_skill_ids_for_agent_type(matched_type)
+                ))
+                expert_skill_names = list(dict.fromkeys(
+                    expert_skill_names
+                    + [s["name"] for s in ctx.skill_manager.get_skills_for_agent_type(matched_type)]
+                ))
 
             agent_info = {
                 "id": agent_id,
@@ -6342,8 +7317,7 @@ async def start_phase(project_id: str, phase_id: str):
                 "project_id": project_id,
                 "phase_id": phase_id,
                 "skills": expert_skill_ids,
-                "skill_names": [s["name"] for s in ctx.skill_manager.get_skills_for_agent_type(matched_type)]
-                                if matched_type in ("pm", "supervisor", "hr", "pg", "ccb") else [],
+                "skill_names": expert_skill_names,
                 "match_score": expert["score"],
                 "domains": expert["domains"],
                 "required_rebuild_files": required_rebuild_files,
@@ -6778,6 +7752,25 @@ async def start_phase(project_id: str, phase_id: str):
             agent_task_locks = {
                 agent_id: asyncio.Lock() for agent_id in run_specs_by_agent
             }
+            workspace_exclusive_task_ids = set()
+            for planned_task_id in (
+                (phase_dispatch_plan or {}).get("task_ids") or []
+            ):
+                planned_task_id = str(planned_task_id)
+                rebuild_files_by_task = phase_rebuild_manifest.get(
+                    "by_task_id"
+                )
+                planned_files = _locked_task_required_files(
+                    project_contract,
+                    phase_id,
+                    planned_task_id,
+                    rebuild_files_by_task if phase_rebuild_manifest else None,
+                )
+                if not phase_rebuild_manifest or not planned_files:
+                    workspace_exclusive_task_ids.add(planned_task_id)
+            execution_plan = _isolate_workspace_exclusive_tasks(
+                phase_dispatch_plan or {}, workspace_exclusive_task_ids,
+            )
 
             async def _execute_legacy(spec: Dict[str, Any]):
                 payload = dict(spec)
@@ -6798,30 +7791,13 @@ async def start_phase(project_id: str, phase_id: str):
                 payload.pop("expert_type", None)
                 all_delivery = list(agent.get("required_delivery_files") or [])
                 all_rebuild = list(agent.get("required_rebuild_files") or [])
-                task_contract_files = [
-                    str(item.get("path") or "")
-                    for item in (
-                        getattr(pm, "project_contract", {}).get("required_files")
-                        or []
-                    )
-                    if isinstance(item, dict)
-                    and str(item.get("phase_id") or "") == str(phase_id)
-                    and str(item.get("task_id") or "") == task_id
-                    and item.get("required", True)
-                ]
                 rebuild_files_by_task = phase_rebuild_manifest.get("by_task_id")
-                if phase_rebuild_manifest and isinstance(
-                    rebuild_files_by_task, dict
-                ):
-                    executable_task_paths = {
-                        _normalized_rebuild_path(path)
-                        for path in rebuild_files_by_task.get(task_id, [])
-                    }
-                    task_contract_files = [
-                        path for path in task_contract_files
-                        if _normalized_rebuild_path(path)
-                        in executable_task_paths
-                    ]
+                task_contract_files = _locked_task_required_files(
+                    project_contract,
+                    phase_id,
+                    task_id,
+                    rebuild_files_by_task if phase_rebuild_manifest else None,
+                )
                 strict_locked_contract = int(
                     project_contract.get("contract_version") or 0
                 ) >= 3
@@ -6972,6 +7948,13 @@ async def start_phase(project_id: str, phase_id: str):
                         "status": finished.get("status"),
                         "result": copy.deepcopy(finished.get("result") or {}),
                     })
+                    finished_error = str(
+                        finished.get("last_error")
+                        or (finished.get("result") or {}).get("error")
+                        or ""
+                    )
+                    if finished_error:
+                        receipts[task_id]["error"] = finished_error
                     if finished.get("status") != "succeeded":
                         logger.error(
                             "Locked task run failed: task=%s status=%s error=%s",
@@ -7016,7 +7999,7 @@ async def start_phase(project_id: str, phase_id: str):
                 )
                 if phase_dispatch_plan:
                     dispatch_result = await execute_phase_dispatch_plan(
-                        phase_dispatch_plan,
+                        execution_plan,
                         _execute_locked_task,
                     )
                 else:
@@ -7132,6 +8115,8 @@ async def start_phase(project_id: str, phase_id: str):
             ),
             "updated_at": time.time(),
         })
+        _release_phase_planning_locks(created_agents)
+        await _persist_all_async()
         coordinator_run_id = str(
             phase["execution_coordinator"].get("durable_run_id") or ""
         )
@@ -7186,6 +8171,7 @@ async def start_phase(project_id: str, phase_id: str):
 _RESET_ACTIVE_AGENT_STATUSES = frozenset({
     "queued", "working", "in_progress", "running", "re_checking", "fixing",
 })
+_RESET_DURABLY_IDLE_STATUSES = TERMINAL_STATUSES | {"blocked"}
 
 
 def _phase_reset_run_ids(
@@ -7248,6 +8234,8 @@ async def _phase_agent_has_live_reset_execution(
     agent: Dict[str, Any],
     phase_task_ids: set[str],
     active_locks: List[Dict[str, Any]],
+    *,
+    coordinator_terminal: bool = False,
 ) -> bool:
     """Fail closed unless an active-looking Agent is proven durably terminal."""
     from api import routes_execution
@@ -7307,13 +8295,13 @@ async def _phase_agent_has_live_reset_execution(
             )
         ):
             return True
-        if str(durable_run.get("status") or "").lower() not in TERMINAL_STATUSES:
+        if str(durable_run.get("status") or "").lower() not in _RESET_DURABLY_IDLE_STATUSES:
             return True
 
     # Without a canonical run, queued/working remains active by default. When
     # every associated run is terminal and no task, guard, or lock survives,
     # the mutable Agent status is stale and must not make reset impossible.
-    return bool(looks_active and not run_ids)
+    return bool(looks_active and not run_ids and not coordinator_terminal)
 
 
 async def _phase_coordinator_has_live_reset_execution(
@@ -7349,7 +8337,7 @@ async def _phase_coordinator_has_live_reset_execution(
         return True
     if str(durable_run.get("project_id") or "") != str(project_id):
         return True
-    return str(durable_run.get("status") or "").lower() not in TERMINAL_STATUSES
+    return str(durable_run.get("status") or "").lower() not in _RESET_DURABLY_IDLE_STATUSES
 
 
 async def _reset_phase(
@@ -7399,6 +8387,10 @@ async def _reset_phase(
             for agent in phase_agents
         )
     ]
+    coordinator_active = await _phase_coordinator_has_live_reset_execution(
+        project_id,
+        phase.get("execution_coordinator") or {},
+    )
     active_agents = [
         agent for agent in phase_agents
         if await _phase_agent_has_live_reset_execution(
@@ -7407,17 +8399,40 @@ async def _reset_phase(
             agent,
             phase_task_ids,
             active_locks,
+            coordinator_terminal=not coordinator_active,
         )
     ]
-    coordinator_active = await _phase_coordinator_has_live_reset_execution(
-        project_id,
-        phase.get("execution_coordinator") or {},
-    )
     if active_agents or coordinator_active or orphan_phase_locks:
         raise HTTPException(
             status_code=409,
             detail="阶段仍有正在执行的 Agent；为防止旧线程与新阶段并发写入，当前禁止重置",
         )
+
+    from api.routes_execution import execution_status, _fix_attempt_counts, _persist_execution_state
+    reset_sup_leader = _get_supervisor_leader(project_id)
+    reset_sup_member = (
+        reset_sup_leader.get_member_for_phase(phase_id)
+        if reset_sup_leader else None
+    )
+    reset_snapshot = {
+        "phase": copy.deepcopy(phase),
+        "agents": copy.deepcopy(ctx.agents),
+        "subprojects": copy.deepcopy(ctx.subprojects),
+        "phase_agents": copy.deepcopy(pm.phase_agents),
+        "file_registry": copy.deepcopy(pm.file_registry),
+        "qc_results": copy.deepcopy(getattr(ctx, "qc_results", {})),
+        "supervisor_quality_runs": copy.deepcopy(getattr(ctx, "supervisor_quality_runs", {})),
+        "auto_repair_states": copy.deepcopy(_auto_repair_states),
+        "auto_repair_api_configs": copy.deepcopy(_auto_repair_api_configs),
+        "execution_status": copy.deepcopy(execution_status),
+        "fix_attempt_counts": copy.deepcopy(_fix_attempt_counts),
+        "supervisor_member_issues": copy.deepcopy(
+            getattr(reset_sup_member, "issues", None),
+        ),
+        "supervisor_member_review_passed": getattr(
+            reset_sup_member, "review_passed", None,
+        ),
+    }
 
     # Capture the phase's complete ownership before deleting its Agent and
     # registry records. Reset means returning to the pre-phase workspace, not
@@ -7444,8 +8459,25 @@ async def _reset_phase(
         path for path, entry in rebuild_policy.items()
         if entry.get("mode") == "patch"
     }
-    retained_rebuild_paths = preserve_paths | patch_paths
+    # Reset retries the phase execution. Preserve already materialized files
+    # and their provenance; deleting only the database ownership row while a
+    # modified file remains makes the next attempt fail as untracked.
+    retained_rebuild_paths = (
+        preserve_paths
+        | patch_paths
+        | {"docs/metis/file-responsibility.json"}
+    )
     owned_files.difference_update(retained_rebuild_paths)
+
+    reset_file_snapshot = {}
+    for relative_path in owned_files:
+        target = (ctx.workspace / relative_path).resolve()
+        try:
+            target.relative_to(ctx.workspace.resolve())
+        except ValueError:
+            continue
+        if target.is_file():
+            reset_file_snapshot[relative_path] = target.read_bytes()
 
     deleted_files = 0
     for relative_path in sorted(owned_files, key=lambda value: value.count("/"), reverse=True):
@@ -7485,13 +8517,13 @@ async def _reset_phase(
             break
     
     # 2. 删除该阶段的所有Agent
-    from api.routes_execution import execution_status, _fix_attempt_counts, _persist_execution_state
     from core.expert_lock import release_lock
+    reset_lock_ids = set()
     for agent in phase_agents:
         agent_id = agent.get("id")
         lock_id = agent.get("lock_id")
         if lock_id:
-            release_lock(lock_id)
+            reset_lock_ids.add(str(lock_id))
         if agent_id:
             execution_status.pop(agent_id, None)
             _fix_attempt_counts.pop(agent_id, None)
@@ -7504,7 +8536,7 @@ async def _reset_phase(
     for lock in expert_lock.get_active_locks(project_id=project_id):
         lock_id = str(lock.get("lock_id") or "")
         if lock_id and _phase_reset_task_lock_matches(lock, phase_task_ids):
-            release_lock(lock_id)
+            reset_lock_ids.add(lock_id)
 
     child_ids = set(phase.get("subprojects") or [])
     for subproject in ctx.subprojects:
@@ -7558,8 +8590,61 @@ async def _reset_phase(
         ):
             phase.pop(key, None)
     
-    await _persist_all_async()
-    _persist_execution_state()
+    try:
+        await _persist_all_async()
+        _persist_execution_state()
+        # The authoritative QC scope is read from project_files, not from the
+        # in-memory registry. A reset must clear both projections or stale
+        # ownership records make a later valid delivery fail hash validation.
+        delete_phase_project_files(
+            project_id,
+            phase_id,
+            retain_paths=retained_rebuild_paths,
+        )
+    except Exception:
+        phase.clear()
+        phase.update(copy.deepcopy(reset_snapshot["phase"]))
+        ctx.agents.clear()
+        ctx.agents.update(copy.deepcopy(reset_snapshot["agents"]))
+        ctx.subprojects[:] = copy.deepcopy(reset_snapshot["subprojects"])
+        pm.phase_agents = copy.deepcopy(reset_snapshot["phase_agents"])
+        pm.file_registry = copy.deepcopy(reset_snapshot["file_registry"])
+        ctx.qc_results.clear()
+        ctx.qc_results.update(copy.deepcopy(reset_snapshot["qc_results"]))
+        ctx.supervisor_quality_runs.clear()
+        ctx.supervisor_quality_runs.update(copy.deepcopy(reset_snapshot["supervisor_quality_runs"]))
+        _auto_repair_states.clear()
+        _auto_repair_states.update(copy.deepcopy(reset_snapshot["auto_repair_states"]))
+        _auto_repair_api_configs.clear()
+        _auto_repair_api_configs.update(copy.deepcopy(reset_snapshot["auto_repair_api_configs"]))
+        execution_status.clear()
+        execution_status.update(copy.deepcopy(reset_snapshot["execution_status"]))
+        _fix_attempt_counts.clear()
+        _fix_attempt_counts.update(copy.deepcopy(reset_snapshot["fix_attempt_counts"]))
+        if reset_sup_member is not None:
+            reset_sup_member.issues = copy.deepcopy(
+                reset_snapshot["supervisor_member_issues"],
+            )
+            reset_sup_member.review_passed = reset_snapshot[
+                "supervisor_member_review_passed"
+            ]
+        for relative_path, content in reset_file_snapshot.items():
+            target = (ctx.workspace / relative_path).resolve()
+            target.parent.mkdir(parents=True, exist_ok=True)
+            target.write_bytes(content)
+        # If application-state persistence succeeded but execution-state
+        # persistence failed, compensate the first durable projection too.
+        try:
+            await _persist_all_async()
+        except Exception:
+            pass
+        try:
+            _persist_execution_state()
+        except Exception:
+            pass
+        raise
+    for lock_id in sorted(reset_lock_ids):
+        release_lock(lock_id)
     
     return {
         "success": True,
@@ -7957,7 +9042,9 @@ def _supervisor_scope_snapshot(
 ) -> Dict[str, Any]:
     pm = _phase_managers.get(ctx.project_id)
     phase = pm.get_phase(phase_id) if pm else {}
-    phase_rows = list(pm.phases if pm else [])
+    phase_rows = list(getattr(pm, "phases", []) if pm else [])
+    if not phase_rows and phase:
+        phase_rows = [phase]
     phase_ids = [str(item.get("phase_id") or "") for item in phase_rows]
     try:
         phase_index = phase_ids.index(phase_id)
@@ -7969,19 +9056,25 @@ def _supervisor_scope_snapshot(
         for item in phase_rows[:phase_index]
         if item.get("phase_id") and item.get("user_confirmed")
     )
+    get_phase_files = getattr(pm, "get_files_by_phase", None) if pm else None
+    registered_rows = get_phase_files(phase_id) if callable(get_phase_files) else []
     registered = sorted({
         str(item.get("file_path") or "").replace("\\", "/")
-        for item in (pm.get_files_by_phase(phase_id) if pm else [])
+        for item in registered_rows
         if item.get("file_path")
     })
     contract = getattr(pm, "project_contract", {}) if pm else {}
+    # Required paths contribute to artifact identity only after they exist.
+    # A model-suggested filename that has not been delivered must be reviewed
+    # semantically by QA/QC instead of crashing scope capture and locking a phase.
     required_paths = sorted({
-        str(item.get("path") or "").replace("\\", "/").strip("/")
+        normalized
         for item in (contract.get("required_files") or [])
         if isinstance(item, dict)
         and item.get("required", True)
         and str(item.get("phase_id") or "") in in_scope_phase_ids
-        and str(item.get("path") or "").strip()
+        and (normalized := str(item.get("path") or "").replace("\\", "/").strip("/"))
+        and (Path(ctx.workspace) / Path(*PurePosixPath(normalized).parts)).is_file()
     })
     workspace_digest = compute_workspace_digest(Path(ctx.workspace))
     delivery_manifest = compute_delivery_manifest(
@@ -8534,6 +9627,21 @@ def _execute_phase_pre_qa_raw(ctx: ProjectContext, phase_id: str) -> Dict[str, A
         v1_registry = {}
         for item in v1_scope.get("files") or []:
             agent = agents_by_id.get(str(item.get("agent_id") or ""), {})
+            # A completed, hash-verified V1 delivery is authoritative evidence
+            # that this Agent owns this exact file.  Older execution records can
+            # retain a narrower generated prefix (for example ``src/main.js``)
+            # even after a repair legitimately adds another file under ``src``.
+            # Reconcile only the delivered file itself; never widen ownership to
+            # a directory here.
+            if agent:
+                allowed = list(agent.get("allowed_path_prefixes") or [])
+                delivered_path = str(item.get("path") or "").replace("\\", "/")
+                normalized_allowed = {
+                    str(prefix or "").replace("\\", "/")
+                    for prefix in allowed
+                }
+                if delivered_path and delivered_path not in normalized_allowed:
+                    agent["allowed_path_prefixes"] = [*allowed, delivered_path]
             owner_type = str(
                 agent.get("agent_type")
                 or agent.get("expert_type")
@@ -9291,6 +10399,43 @@ def _record_pre_qa_machine_evidence(
                 "executed": record.get("executed", True),
             },
         )
+    if pre_qa.get("passed") is not True:
+        return
+    machine_state = machine.to_dict()
+    scope = machine_state.get("scope") or {}
+    scope_binding = {
+        key: scope.get(key)
+        for key in (
+            "project_id",
+            "phase_id",
+            "phase_generation_id",
+            "scope_digest",
+            "artifact_digest",
+        )
+        if scope.get(key) not in (None, "")
+    }
+    machine.record_evidence(
+        kind="pre_qa",
+        command=(
+            "deterministic-pre-qa --phase "
+            f"{scope_binding.get('phase_id') or 'unknown'}"
+        ),
+        exit_code=0,
+        passed=True,
+        log=(
+            "Pre-QA passed with "
+            f"{len(pre_qa.get('evidence') or [])} evidence records"
+        ),
+        step_id=(
+            f"pre-qa:summary:{machine_state.get('run_id')}:"
+            f"{scope_binding.get('scope_digest') or 'unscoped'}"
+        ),
+        metadata={
+            **scope_binding,
+            "result": "passed",
+            "evidence_count": len(pre_qa.get("evidence") or []),
+        },
+    )
 
 
 def _materialize_frontend_pre_qa_support_files(
@@ -10964,6 +12109,19 @@ def _issue_is_non_actionable(issue: Dict[str, Any]) -> bool:
     """Ignore explicit QA observations that state no code change is needed."""
     hint = str(issue.get("fix_hint") or "").strip().lower()
     message = str(issue.get("message") or "").strip().lower()
+    layer = str(issue.get("layer") or "").strip().lower()
+    path = str(issue.get("file_path") or issue.get("file") or "").strip()
+    if (
+        layer == "system"
+        and not path
+        and (
+            message.startswith("质检执行异常")
+            or message.startswith("qc execution error")
+        )
+    ):
+        # This is an infrastructure diagnostic materialized after a QC
+        # contract/provider failure, not a product defect an engineer can fix.
+        return True
     return any(marker in hint or marker in message for marker in (
         "no fix needed", "no action needed", "no issue", "acceptable",
         "missing root-level package.json",
@@ -11738,7 +12896,9 @@ def _pre_qa_repair_action(
 def _blocking_issue_details(entry: Dict[str, Any]) -> List[Dict[str, Any]]:
     return [
         issue for issue in (entry.get("issues_detail") or [])
-        if str(issue.get("status") or "open").lower() not in {"fixed", "verified"}
+        if str(issue.get("status") or "open").lower() not in {
+            "fixed", "verified", "resolved", "deferred", "needs_manual",
+        }
         and not _issue_is_non_actionable(issue)
         and str(issue.get("severity") or "error").lower() in {"error", "critical"}
     ]
@@ -12041,6 +13201,78 @@ def _detach_stale_phase_quality_state(
     return True
 
 
+def _detach_uncommitted_stale_qa_scope(
+    ctx: ProjectContext,
+    phase_id: str,
+    phase: Dict[str, Any],
+    *,
+    reconciled_paths: Optional[Iterable[str]] = None,
+) -> bool:
+    """Discard a zero-budget QA attempt whose immutable scope was reconciled."""
+    key = f"{ctx.project_id}-{phase_id}"
+    state = _auto_repair_states.get(key) or {}
+    machine = (
+        (getattr(ctx, "supervisor_quality_runs", {}) or {}).get(phase_id)
+        or {}
+    )
+    active_round_id = str(
+        machine.get("active_qa_round_id")
+        or machine.get("active_round_id")
+        or ""
+    )
+    active_round = next(
+        (
+            item for item in (machine.get("rounds") or [])
+            if str(item.get("qa_round_id") or "") == active_round_id
+        ),
+        None,
+    )
+    reconciliation = sorted({
+        str(path).replace("\\", "/")
+        for path in (reconciled_paths or [])
+        if str(path or "").strip()
+    })
+    replay_conflict = (
+        str(state.get("status") or "") == "blocked"
+        and str((state.get("action_required") or {}).get("message") or "")
+        == "Conflicting replay for active qa_round_id"
+    )
+    locked_scope = machine.get("scope") or {}
+    current_scope = _supervisor_scope_snapshot(ctx, phase_id)
+    stale_scope = bool(locked_scope) and locked_scope != current_scope
+    if (
+        not (replay_conflict or reconciliation or stale_scope)
+        or int(machine.get("business_rounds_used") or 0) != 0
+        or not isinstance(active_round, dict)
+        or active_round.get("consumes_business_round") is True
+        or active_round.get("qa_snapshot_committed") is True
+    ):
+        return False
+    locked_digest = str(locked_scope.get("scope_digest") or "")
+    current_digest = str(current_scope.get("scope_digest") or "")
+
+    phase.setdefault("superseded_quality_runs", []).append({
+        "run_id": str(machine.get("run_id") or ""),
+        "qa_round_id": active_round_id,
+        "reason": "uncommitted_qa_replay_conflict",
+        "locked_scope_digest": locked_digest,
+        "current_scope_digest": current_digest,
+        "business_rounds_used": 0,
+        "reconciled_paths": reconciliation,
+        "superseded_at": time.time(),
+    })
+    _auto_repair_states.pop(key, None)
+    _auto_repair_api_configs.pop(key, None)
+    if hasattr(ctx, "supervisor_quality_runs"):
+        ctx.supervisor_quality_runs.pop(phase_id, None)
+    if hasattr(ctx, "qc_results"):
+        ctx.qc_results.pop(phase_id, None)
+    phase["reviewed"] = False
+    phase["review_passed"] = False
+    phase.pop("reviewed_at", None)
+    return True
+
+
 async def _resume_completed_pre_qa_repair_runs(
     ctx: ProjectContext,
     phase_id: str,
@@ -12209,6 +13441,46 @@ async def get_auto_repair_status(project_id: str, phase_id: str):
                 "round_history": [],
             }
     supervisor_run = copy.deepcopy(state.get("supervisor_run") or supervisor_run)
+    action_required = copy.deepcopy(state.get("action_required"))
+    review_passed = bool((state.get("review_result") or {}).get("passed"))
+    stored_status = str(state.get("status") or "idle")
+    effective_status = (
+        "passed_with_handoff"
+        if review_passed and not state.get("running") and stored_status == "passed_with_handoff"
+        else "passed" if review_passed and not state.get("running")
+        else stored_status
+    )
+    if review_passed and not state.get("running") and effective_status == "passed":
+        action_required = None
+    active_round_id = str(
+        supervisor_run.get("active_qa_round_id")
+        or supervisor_run.get("active_round_id")
+        or ""
+    )
+    active_round = next((
+        item for item in (supervisor_run.get("rounds") or [])
+        if str(item.get("qa_round_id") or "") == active_round_id
+    ), None)
+    if (
+        isinstance(action_required, dict)
+        and str(action_required.get("message") or "")
+        == "Conflicting replay for active qa_round_id"
+        and int(supervisor_run.get("business_rounds_used") or 0) == 0
+        and isinstance(active_round, dict)
+        and active_round.get("consumes_business_round") is not True
+        and active_round.get("qa_snapshot_committed") is not True
+    ):
+        action_required["options"] = list(dict.fromkeys([
+            "retry_cycle", *(action_required.get("options") or []),
+        ]))
+    if (
+        isinstance(action_required, dict)
+        and "Complete scoped verification evidence is required before QA"
+        in str(action_required.get("message") or "")
+    ):
+        action_required["options"] = list(dict.fromkeys([
+            "retry_cycle", *(action_required.get("options") or []),
+        ]))
     return {
         "phase_id": phase_id,
         "running": state.get("running", False),
@@ -12217,9 +13489,9 @@ async def get_auto_repair_status(project_id: str, phase_id: str):
         "lifetime_qc_runs": state.get("lifetime_qc_runs", state.get("total_rounds", 0)),
         "repair_attempts": state.get("repair_attempts", state.get("round", 0)),
         "max_repairs_per_cycle": AUTO_REPAIR_MAX_REPAIRS_PER_CYCLE,
-        "status": state.get("status", "idle"),
+        "status": effective_status,
         "messages": state.get("messages", []),
-        "action_required": state.get("action_required"),
+        "action_required": action_required,
         "needs_manual": state.get("needs_manual", False),
         "issue_report": state.get("issue_report", {}),
         "review_result": state.get("review_result"),
@@ -12291,9 +13563,94 @@ async def start_auto_repair(
     if not phase:
         raise HTTPException(status_code=404, detail=f"Phase {phase_id} not found")
 
+    current_phase_agents = {
+        str(agent.get("id") or agent_id)
+        for agent_id, agent in getattr(ctx, "agents", {}).items()
+        if str(agent.get("phase_id") or "") == phase_id
+    }
+    get_phase_files = getattr(pm, "get_files_by_phase", None)
+    phase_files = get_phase_files(phase_id) if callable(get_phase_files) else []
+    registered_phase_paths = {
+        str(item.get("file_path") or "")
+        for item in phase_files
+        if item.get("file_path")
+    }
+    reconciled_delivery_paths = await asyncio.to_thread(
+        reconcile_phase_delivery_generation,
+        workspace=Path(ctx.workspace),
+        project_id=project_id,
+        phase_id=phase_id,
+        current_agent_ids=current_phase_agents,
+        registered_paths=registered_phase_paths,
+    )
+
     key = f"{project_id}-{phase_id}"
+    persist_application_state = globals()["_persist_all_async"]
+    durable_phase = copy.deepcopy(phase)
+    durable_state_present = key in _auto_repair_states
+    durable_state = copy.deepcopy(_auto_repair_states.get(key))
+    durable_api_config_present = key in _auto_repair_api_configs
+    durable_api_config = copy.deepcopy(_auto_repair_api_configs.get(key))
+    durable_qc_results = copy.deepcopy(getattr(ctx, "qc_results", {}))
+    durable_quality_runs = copy.deepcopy(
+        getattr(ctx, "supervisor_quality_runs", {}),
+    )
+
+    def restore_durable_projection() -> None:
+        phase.clear()
+        phase.update(copy.deepcopy(durable_phase))
+        if durable_state_present:
+            current = _auto_repair_states.get(key)
+            if isinstance(current, dict):
+                current.clear()
+                current.update(copy.deepcopy(durable_state))
+            else:
+                _auto_repair_states[key] = copy.deepcopy(durable_state)
+        else:
+            _auto_repair_states.pop(key, None)
+        if durable_api_config_present:
+            _auto_repair_api_configs[key] = copy.deepcopy(durable_api_config)
+        else:
+            _auto_repair_api_configs.pop(key, None)
+        if hasattr(ctx, "qc_results"):
+            ctx.qc_results.clear()
+            ctx.qc_results.update(copy.deepcopy(durable_qc_results))
+        if hasattr(ctx, "supervisor_quality_runs"):
+            ctx.supervisor_quality_runs.clear()
+            ctx.supervisor_quality_runs.update(copy.deepcopy(durable_quality_runs))
+
+    async def _persist_all_async() -> None:
+        nonlocal durable_phase, durable_state_present, durable_state
+        nonlocal durable_api_config_present, durable_api_config
+        nonlocal durable_qc_results, durable_quality_runs
+        try:
+            await persist_application_state()
+        except Exception:
+            restore_durable_projection()
+            raise
+        durable_phase = copy.deepcopy(phase)
+        durable_state_present = key in _auto_repair_states
+        durable_state = copy.deepcopy(_auto_repair_states.get(key))
+        durable_api_config_present = key in _auto_repair_api_configs
+        durable_api_config = copy.deepcopy(_auto_repair_api_configs.get(key))
+        durable_qc_results = copy.deepcopy(getattr(ctx, "qc_results", {}))
+        durable_quality_runs = copy.deepcopy(
+            getattr(ctx, "supervisor_quality_runs", {}),
+        )
+
     state = _auto_repair_states.get(key)
     if state and _detach_stale_phase_quality_state(ctx, phase_id, phase):
+        await _persist_all_async()
+        state = None
+    if state and reconciled_delivery_paths and _detach_uncommitted_stale_qa_scope(
+        ctx,
+        phase_id,
+        phase,
+        reconciled_paths=reconciled_delivery_paths,
+    ):
+        await _persist_all_async()
+        state = None
+    if state and _detach_uncommitted_stale_qa_scope(ctx, phase_id, phase):
         await _persist_all_async()
         state = None
     if (
@@ -12539,6 +13896,16 @@ async def start_auto_repair(
 
     if user_decision in {"continue", "retry_cycle"}:
         machine = _supervisor_quality_machine(ctx, phase_id)
+        repair_dispatch_recovery = (
+            str(state.get("status") or "") == "error"
+            and any(
+                "Execution task is absent from phase-plan" in str(
+                    message.get("content") or ""
+                )
+                for message in (state.get("messages") or [])
+                if isinstance(message, dict)
+            )
+        )
         scope_mismatch_recovery = (
             str(state.get("status") or "") == "blocked"
             and str((state.get("action_required") or {}).get("message") or "")
@@ -12547,11 +13914,34 @@ async def start_auto_repair(
         if (
             (
                 str(state.get("status") or "")
-                in {FAILURE_PRE_QA, "pre_qa_verifying", "continuing"}
+                in {
+                    FAILURE_PRE_QA, "pre_qa_verifying", "continuing",
+                    "awaiting_manual_fix",
+                }
                 or scope_mismatch_recovery
             )
             and machine.state == "waiting_engineer"
         ):
+            if str(state.get("status") or "") == "awaiting_manual_fix":
+                locked = copy.deepcopy(machine.to_dict().get("scope") or {})
+                current = _supervisor_scope_snapshot(ctx, phase_id)
+                changed = {
+                    path for path in _delivery_manifest_changed_paths(
+                        locked.get("delivery_manifest") or {},
+                        current.get("delivery_manifest") or {},
+                    )
+                    if not path.startswith("docs/metis/")
+                }
+                allowed = {
+                    str(path).replace("\\", "/")
+                    for path in (state.get("manual_fix_issue_paths") or [])
+                    if str(path).strip()
+                }
+                if changed and not changed <= allowed:
+                    raise HTTPException(
+                        status_code=409,
+                        detail="QA scope changed outside the recorded repair issue paths",
+                    )
             repair_agent_ids = list(machine.to_dict().get("waiting_for") or [])
             if not repair_agent_ids:
                 repair_agent_ids = [
@@ -12645,6 +14035,16 @@ async def start_auto_repair(
                 and manual_fix_scope.get("scope_digest")
                 else locked_scope
             )
+            if (
+                comparison_scope.get("scope_digest")
+                == current_scope.get("scope_digest")
+                and comparison_scope.get("scope_digest")
+                != locked_scope.get("scope_digest")
+            ):
+                # The user may open manual-fix after already applying the
+                # correction. Validate that correction against the locked QA
+                # scope instead of adopting it as its own baseline.
+                comparison_scope = locked_scope
             locked_files = set(locked_scope.get("files") or [])
             current_files = set(current_scope.get("files") or [])
             frozen_issue_paths = state.get("manual_fix_issue_paths")
@@ -12665,6 +14065,10 @@ async def start_auto_repair(
                 comparison_scope.get("delivery_manifest") or {},
                 current_scope.get("delivery_manifest") or {},
             )
+            repair_changed_paths = {
+                path for path in changed_paths
+                if not str(path).replace("\\", "/").startswith("docs/metis/")
+            }
             stable_context = (
                 current_scope.get("project_id") == locked_scope.get("project_id")
                 and str(current_scope.get("phase_id")) == str(locked_scope.get("phase_id"))
@@ -12697,12 +14101,15 @@ async def start_auto_repair(
             if (
                 stable_context
                 and (
-                    (changed_paths and changed_paths <= issue_paths)
-                    or (not changed_paths and reviewer_recovery_only)
+                    (repair_changed_paths and repair_changed_paths <= issue_paths)
+                    or (not repair_changed_paths and reviewer_recovery_only)
                 )
                 and machine.state == "blocked"
-                and str(state.get("status") or "") == "awaiting_manual_fix"
+                and str(state.get("status") or "") in {
+                    "awaiting_manual_fix", "no_progress",
+                }
             ):
+                state["status"] = "awaiting_manual_fix"
                 previous_artifact = str(
                     locked_scope.get("artifact_digest")
                     or locked_scope.get("workspace_digest")
@@ -12725,10 +14132,92 @@ async def start_auto_repair(
                     status_code=409,
                     detail="QA scope changed outside the recorded repair issue paths",
                 )
+        active_open_issues = [
+            issue
+            for issue in ((state.get("review_result") or {}).get("issues") or [])
+            if isinstance(issue, dict)
+            and str(issue.get("status") or "open").lower()
+            not in {"fixed", "verified"}
+        ]
+        unlocated_open_issues = [
+            issue for issue in active_open_issues
+            if not _is_located_delivery_issue_path(issue.get("file_path"))
+        ]
+        infrastructure_artifact_recovery = bool(
+            machine.state == "blocked"
+            and user_decision in {"continue", "retry_cycle"}
+            and unlocated_open_issues
+            and all(_issue_is_non_actionable(issue) for issue in unlocated_open_issues)
+            and "no actionable delivery file" in str(
+                state.get("failure_reason")
+                or machine.to_dict().get("failure_reason")
+                or (machine.to_dict().get("failure") or {}).get("reason")
+                or ""
+            ).lower()
+        )
+        if infrastructure_artifact_recovery:
+            # A prior QC contract/provider failure was materialized as a
+            # synthetic unlocated issue.  Once classified non-actionable it
+            # must not permanently trap an otherwise retryable project in the
+            # blocked terminal.
+            machine.resume_after_manual_fix()
+            recovery_scope = _supervisor_scope_snapshot(ctx, phase_id)
+            machine.record_evidence(
+                kind="scope",
+                command=f"recover-qc-scope {phase_id}",
+                exit_code=0,
+                passed=True,
+                log=(
+                    f"Recovered {len(recovery_scope['files'])} registered files "
+                    f"at {recovery_scope['workspace_digest']}"
+                ),
+                step_id=(
+                    f"recovery-scope:{machine.to_dict().get('run_id')}:"
+                    f"{recovery_scope['artifact_digest']}"
+                ),
+                metadata=recovery_scope,
+            )
+            _store_supervisor_quality_machine(ctx, phase_id, machine, state)
+
+        missing_scope_evidence_recovery = bool(
+            machine.state == "verifying"
+            and user_decision in {"continue", "retry_cycle"}
+            and "Complete scoped verification evidence is required before QA"
+            in str((state.get("action_required") or {}).get("message") or "")
+        )
+        if missing_scope_evidence_recovery:
+            recovery_scope = _supervisor_scope_snapshot(ctx, phase_id)
+            machine.record_evidence(
+                kind="scope",
+                command=f"recover-qc-scope {phase_id}",
+                exit_code=0,
+                passed=True,
+                log=f"Recovered scoped verification evidence for {phase_id}",
+                step_id=(
+                    f"recovery-scope:{machine.to_dict().get('run_id')}:"
+                    f"{recovery_scope['artifact_digest']}"
+                ),
+                metadata=recovery_scope,
+            )
+            _store_supervisor_quality_machine(ctx, phase_id, machine, state)
+
+        machine_payload = machine.to_dict()
+        retry_options = {
+            str(option)
+            for option in ((state.get("action_required") or {}).get("options") or [])
+        }
+        retry_within_existing_budget = (
+            user_decision in {"continue", "retry_cycle"}
+            and "retry_cycle" in retry_options
+            and int(machine_payload.get("business_rounds_used") or 0)
+            < int(machine_payload.get("max_business_rounds") or 0)
+        )
         if (
             machine.state == "blocked"
             and str(state.get("status") or "") != "awaiting_manual_fix"
+            and not repair_dispatch_recovery
             and user_decision not in ("rebuild_phase",)
+            and not retry_within_existing_budget
         ):
             raise HTTPException(
                 status_code=409,
@@ -12836,6 +14325,7 @@ async def start_auto_repair(
                 issue for issue in issue_snapshot
                 if str(issue.get("severity") or "error").lower() in {"error", "critical"}
                 and str(issue.get("status") or "open").lower() not in {"fixed", "verified"}
+                and not _issue_is_non_actionable(issue)
                 and not _is_located_delivery_issue_path(issue.get("file_path"))
             ]
             if unlocated_blockers:
@@ -13275,9 +14765,9 @@ def _match_issue_agent(ctx, phase_id: str, issue: Dict[str, Any]):
     )
     if current_registered_owner or current_output_owner:
         return current_registered_owner or current_output_owner
-    scoped_owner = next((agent for agent in all_agents if can_edit(agent)), None)
-    if registered_owner or output_owner or scoped_owner:
-        return registered_owner or output_owner or scoped_owner
+    # Never reopen a historical phase Agent during current-phase repair.
+    # Its subproject/task is absent from the current phase-plan and dispatch
+    # would fail before the model can repair anything.
 
     # Command/API failures identify an execution surface rather than a source
     # file.  In particular, pre-QA reports ``test-backend`` with cwd
@@ -13369,11 +14859,11 @@ def _match_issue_agent(ctx, phase_id: str, issue: Dict[str, Any]):
             return typed_owner
 
     wanted = next(
-        (agent for agent in all_agents if agent.get("id") == wanted_id),
+        (agent for agent in phase_agents if agent.get("id") == wanted_id),
         None,
     ) or next(
         (
-            agent for agent in all_agents
+            agent for agent in phase_agents
             if wanted_role and agent.get("role") == wanted_role
         ),
         None,
@@ -13467,6 +14957,28 @@ def _ensure_repair_file_scope(
     }
 
 
+def _chunk_repair_issues(
+    issues: List[Dict[str, Any]],
+    *,
+    max_issues: int = 5,
+    max_bytes: int = 16 * 1024,
+) -> List[List[Dict[str, Any]]]:
+    """Split transport only; every chunk remains in the same QA round."""
+    batches: List[List[Dict[str, Any]]] = []
+    current: List[Dict[str, Any]] = []
+    for issue in issues:
+        candidate = current + [issue]
+        byte_size = len(json.dumps(candidate, ensure_ascii=False, default=str).encode("utf-8"))
+        if current and (len(candidate) > max_issues or byte_size > max_bytes):
+            batches.append(current)
+            current = [issue]
+        else:
+            current = candidate
+    if current:
+        batches.append(current)
+    return batches
+
+
 async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state, rewrite_mode, api_config):
     """Run one complete repair batch and return only after every expert finishes."""
     ctx = projects[project_id]
@@ -13480,6 +14992,10 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
     for issue in issue_details:
         if str(issue.get("status") or "open").lower() not in {"open", "fixing"}:
             continue
+        if str(issue.get("severity") or "error").lower() not in {
+            "error", "critical",
+        }:
+            continue
         agent = _match_issue_agent(ctx, phase_id, issue)
         if not agent:
             if str(issue.get("severity") or "error").lower() in {"error", "critical"}:
@@ -13488,8 +15004,8 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
                     + str(issue.get("file_path") or "unknown file")
                 )
             continue
-        bucket = grouped.setdefault(agent["id"], {"agent": agent, "files": {}})
-        bucket["files"].setdefault(issue.get("file_path") or "未定位文件", []).append(issue)
+        bucket = grouped.setdefault(agent["id"], {"agent": agent, "issues": []})
+        bucket["issues"].append(issue)
 
     # The QC merger increments fix_rounds only for findings that were actually
     # dispatched in the previous pass.  Mark the canonical QC ledger before an
@@ -13497,8 +15013,7 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
     dispatched_issues = [
         issue
         for bucket in grouped.values()
-        for issues in bucket["files"].values()
-        for issue in issues
+        for issue in bucket["issues"]
     ]
     if dispatched_issues:
         now = time.time()
@@ -13529,7 +15044,7 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
     repair_batch = {
         "round": round_num,
         "status": "repairing",
-        "total": sum(len(bucket["files"]) for bucket in grouped.values()),
+        "total": 0,
         "completed": 0,
         "failed": 0,
         "files_changed": False,
@@ -13545,27 +15060,40 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
     state["repair_batch"] = repair_batch
     await _persist_all_async()
 
+    repair_units = [
+        (bucket["agent"], batch)
+        for bucket in grouped.values()
+        for batch in _chunk_repair_issues(bucket["issues"])
+    ]
+    repair_batch["total"] = len(repair_units)
+    repair_batch["batch_total"] = len(repair_units)
+    await _persist_all_async()
+
     from api.routes_execution import _reset_fix_attempt, _run_agent_task as _exec_task
-    for bucket in grouped.values():
-        agent = bucket["agent"]
-        # A repair response contains full file contents.  Run one file per
-        # request so medium/large controllers and pages cannot compete for the
-        # same completion budget and arrive truncated.
-        for path, issues in sorted(bucket["files"].items()):
-            target_path = (Path(ctx.workspace) / str(path)).resolve()
-            try:
-                target_path.relative_to(Path(ctx.workspace).resolve())
-                before_content = target_path.read_bytes() if target_path.is_file() else None
-            except ValueError:
-                before_content = None
-            repair_lease = _ensure_repair_file_scope(ctx, agent, path, round_num)
+    for batch_index, (agent, issues) in enumerate(repair_units, start=1):
+            paths = list(dict.fromkeys(
+                _normalized_rebuild_path(issue.get("file_path"))
+                for issue in issues
+                if _normalized_rebuild_path(issue.get("file_path"))
+            ))
+            before_contents: Dict[str, Optional[bytes]] = {}
+            repair_leases: List[Dict[str, Any]] = []
+            for path in paths:
+                target_path = (Path(ctx.workspace) / path).resolve()
+                try:
+                    target_path.relative_to(Path(ctx.workspace).resolve())
+                    before_contents[path] = target_path.read_bytes() if target_path.is_file() else None
+                except ValueError:
+                    before_contents[path] = None
+                repair_leases.append(_ensure_repair_file_scope(ctx, agent, path, round_num))
             _reset_fix_attempt(agent["id"])
             issue_ids = [
                 str(issue.get("issue_id") or issue.get("id") or issue.get("fingerprint") or "")
                 for issue in issues
             ]
             repair_batch["items"].append({
-                "file_path": path,
+                "repair_batch_id": f"{round_num}:{agent['id']}:{batch_index}",
+                "file_paths": paths,
                 "agent_id": agent["id"],
                 "issue_ids": [issue_id for issue_id in issue_ids if issue_id],
                 "status": "repairing",
@@ -13598,7 +15126,7 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
                         issue_id=issue_id or "missing",
                         severity=issue.get("severity", "error"),
                         layer=issue.get("layer", "unknown"),
-                        path=path,
+                        path=issue.get("file_path") or "unlocated",
                         location=f":{location}" if location else "",
                         message=issue.get("message", ""),
                         hint=issue.get("fix_hint", ""),
@@ -13606,17 +15134,59 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
                         acceptance=acceptance or "the identified issue no longer reproduces",
                     )
                 )
+            transport_payload = {
+                "qa_round_id": str(state.get("qa_round_id") or f"round-{round_num}"),
+                "repair_batch_id": f"{round_num}:{agent['id']}:{batch_index}",
+                "owner_agent_id": agent["id"],
+                "batch_index": batch_index,
+                "batch_total": len(repair_units),
+                "issues": [
+                    {
+                        "id": str(issue.get("issue_id") or issue.get("id") or ""),
+                        "fp": str(issue.get("fingerprint") or _auto_repair_issue_key(issue)),
+                        "severity": str(issue.get("severity") or "error"),
+                        "problem": str(issue.get("message") or ""),
+                        "expected": str(
+                            issue.get("expected")
+                            or issue.get("acceptance_criteria")
+                            or issue.get("fix_hint")
+                            or "Resolve the verified finding"
+                        ),
+                        "locations": [{
+                            "path": str(issue.get("file_path") or ""),
+                            "line": next((
+                                issue.get(field) for field in ("line", "line_no", "line_number")
+                                if issue.get(field) is not None
+                            ), None),
+                            "symbol": issue.get("symbol") or issue.get("symbol_name"),
+                        }],
+                    }
+                    for issue in issues
+                ],
+            }
             description = (
-                f"【质检修复任务｜第 {round_num} 轮】\n"
-                "监督者已检查本阶段产物。本次只修改并只返回下面这一个文件；"
-                "严格输出 JSON files；不要输出思考过程、尝试方法、执行命令、说明或其他文件。\n\n"
-                f"文件：{path}\n" + "\n".join(lines)
+                "【质检修复任务】\n"
+                "Repair every verified issue in this transport payload. Return all actually "
+                "changed files inside your authorized ownership scope. Transport batches do "
+                "not create additional QA rounds.\n\n"
+                + json.dumps(transport_payload, ensure_ascii=False, indent=2)
             )
+            repair_feedback = state.get("repair_feedback") or {}
+            if repair_feedback:
+                description += (
+                    "\n\nPrevious repair feedback (the previous change was rolled back):\n"
+                    + str(repair_feedback.get("instruction") or "")
+                    + "\nRegressions to avoid: "
+                    + json.dumps(
+                        repair_feedback.get("new_blockers") or [],
+                        ensure_ascii=False,
+                    )
+                )
             if rewrite_mode:
-                description += "\n阶段重构模式：结合问题清单完整重写这个文件，仍不得输出其他文件。"
+                description += "\n阶段重构模式：结合问题清单重写必要的责任范围内文件。"
             state["messages"].append({
                 "role": "system",
-                "content": f"问题已反馈给专家 {agent.get('role','')}：{path}",
+                "content": f"问题已反馈给专家 {agent.get('role','')}：{', '.join(paths)}",
                 "ts": time.time(),
             })
             owner_contract = agent.get("execution_contract") or {}
@@ -13641,13 +15211,23 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
                     if agent.get("expert_type") == "architecture"
                     else "runnable"
                 ),
-                "required_files": [repair_lease["file_path"]],
-                "allowed_path_prefixes": [repair_lease["file_path"]],
+                "required_files": [],
+                "allowed_path_prefixes": list(dict.fromkeys(
+                    list(agent.get("allowed_path_prefixes") or []) + paths
+                )),
             }
             try:
+                repair_task_id = next(
+                    (
+                        str(task_id) for task_id in (
+                            agent.get("assigned_task_ids") or []
+                        ) if str(task_id)
+                    ),
+                    str(agent.get("subproject_id") or phase_id),
+                )
                 repair_result = await _exec_task(
                     project_id=project_id, agent_id=agent["id"],
-                    subproject_id=agent.get("subproject_id", phase_id),
+                    subproject_id=repair_task_id,
                     subproject_name=agent.get("subproject_name", ""), description=description,
                     tech_stack=repair_tech_stack,
                     project_context=ctx.pm.context_summary or ctx.description or "",
@@ -13655,9 +15235,10 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
                     artifact_policy=repair_artifact_policy,
                 )
             finally:
-                if repair_lease.get("temporary") and repair_lease.get("lock_id"):
-                    expert_lock.release_lock(str(repair_lease["lock_id"]))
-                    agent["locked_until"] = None
+                for repair_lease in repair_leases:
+                    if repair_lease.get("temporary") and repair_lease.get("lock_id"):
+                        expert_lock.release_lock(str(repair_lease["lock_id"]))
+                agent["locked_until"] = None
             latest_status = str(
                 (ctx.agents.get(agent["id"]) or {}).get("status") or ""
             ).strip().lower()
@@ -13678,16 +15259,19 @@ async def _repair_all_issue_owners(project_id, phase_id, round_num, entry, state
                     else ""
                 )
                 raise RuntimeError(
-                    f"Agent {agent.get('role', agent['id'])} repair failed for {path}"
+                    f"Agent {agent.get('role', agent['id'])} repair failed for {paths}"
                     + (f": {error}" if error else "")
                 )
             repair_batch["completed"] += 1
-            repair_batch["last_completed_file"] = path
+            repair_batch["last_completed_files"] = paths
             repair_batch["items"][-1]["status"] = "completed"
-            after_content = target_path.read_bytes() if target_path.is_file() else None
-            if after_content != before_content:
-                repair_batch["files_changed"] = True
-                repair_batch["changed_files"].append(path)
+            for path in paths:
+                target_path = (Path(ctx.workspace) / path).resolve()
+                after_content = target_path.read_bytes() if target_path.is_file() else None
+                if after_content != before_contents.get(path):
+                    repair_batch["files_changed"] = True
+                    if path not in repair_batch["changed_files"]:
+                        repair_batch["changed_files"].append(path)
             await _persist_all_async()
 
     repair_batch["status"] = "completed"
@@ -14207,6 +15791,106 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
         state["messages"].append({"role": "system", "content": "❌ 项目上下文丢失", "ts": time.time()})
         await _persist_all_async()
         return
+    pm_for_checkpoint = _phase_managers.get(project_id)
+
+    def quality_file_paths() -> set[str]:
+        paths = {
+            str(path).replace("\\", "/")
+            for path in getattr(pm_for_checkpoint, "file_registry", {})
+            if str(path).strip()
+        }
+        contract = getattr(pm_for_checkpoint, "project_contract", {}) or {}
+        paths.update(
+            str(item.get("path") or "").replace("\\", "/")
+            for item in (contract.get("required_files") or [])
+            if isinstance(item, dict)
+            and str(item.get("phase_id") or "") == str(phase_id)
+            and str(item.get("path") or "").strip()
+        )
+        paths.update(
+            str(item.get("path") or "").replace("\\", "/")
+            for item in (state.get("deterministic_pre_qa_repairs") or [])
+            if isinstance(item, dict) and str(item.get("path") or "").strip()
+        )
+        return paths
+
+    def capture_quality_files() -> Dict[str, Optional[bytes]]:
+        root = Path(ctx.workspace).resolve()
+        captured: Dict[str, Optional[bytes]] = {}
+        for relative in quality_file_paths():
+            target = (root / relative).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            captured[relative] = target.read_bytes() if target.is_file() else None
+        return captured
+
+    def capture_quality_projection() -> Dict[str, Any]:
+        from api import routes_execution
+
+        return {
+            "state": copy.deepcopy(state),
+            "agents": copy.deepcopy(getattr(ctx, "agents", {})),
+            "subprojects": copy.deepcopy(getattr(ctx, "subprojects", [])),
+            "qc_results": copy.deepcopy(getattr(ctx, "qc_results", {})),
+            "supervisor_quality_runs": copy.deepcopy(
+                getattr(ctx, "supervisor_quality_runs", {}),
+            ),
+            "phase_manager": (
+                copy.deepcopy(pm_for_checkpoint.to_dict())
+                if pm_for_checkpoint is not None
+                and hasattr(pm_for_checkpoint, "to_dict")
+                else None
+            ),
+            "execution_status": copy.deepcopy(routes_execution.execution_status),
+            "files": capture_quality_files(),
+        }
+
+    def restore_quality_projection(snapshot: Dict[str, Any]) -> None:
+        from api import routes_execution
+
+        root = Path(ctx.workspace).resolve()
+        current_paths = quality_file_paths()
+        for relative in sorted(current_paths | set(snapshot["files"])):
+            target = (root / relative).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                continue
+            content = snapshot["files"].get(relative)
+            if content is None:
+                target.unlink(missing_ok=True)
+            else:
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_bytes(content)
+        state.clear()
+        state.update(copy.deepcopy(snapshot["state"]))
+        _auto_repair_states[key] = state
+        for name in ("agents", "qc_results", "supervisor_quality_runs"):
+            target = getattr(ctx, name, None)
+            if isinstance(target, dict):
+                target.clear()
+                target.update(copy.deepcopy(snapshot[name]))
+            else:
+                setattr(ctx, name, copy.deepcopy(snapshot[name]))
+        subprojects = getattr(ctx, "subprojects", None)
+        if isinstance(subprojects, list):
+            subprojects[:] = copy.deepcopy(snapshot["subprojects"])
+        else:
+            ctx.subprojects = copy.deepcopy(snapshot["subprojects"])
+        if (
+            pm_for_checkpoint is not None
+            and snapshot["phase_manager"] is not None
+            and hasattr(pm_for_checkpoint, "from_dict")
+        ):
+            pm_for_checkpoint.from_dict(copy.deepcopy(snapshot["phase_manager"]))
+        routes_execution.execution_status.clear()
+        routes_execution.execution_status.update(
+            copy.deepcopy(snapshot["execution_status"]),
+        )
+
+    durable_quality_projection = capture_quality_projection()
     recovery_claim = state.get("pre_qa_recovery_claim") or {}
     if recovery_claim:
         active_claims = await asyncio.to_thread(
@@ -14240,6 +15924,17 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
         }
         await _persist_all_async()
         return
+
+    async def persist_quality_checkpoint() -> None:
+        nonlocal durable_quality_projection
+        try:
+            await _persist_all_async()
+        except Exception as exc:
+            machine.rollback_unpersisted()
+            restore_quality_projection(durable_quality_projection)
+            raise QualityCheckpointPersistenceError(str(exc)) from exc
+        machine.mark_persisted()
+        durable_quality_projection = capture_quality_projection()
     registered_artifact = str(
         state.get("registered_reinspection_artifact_digest") or ""
     )
@@ -14262,7 +15957,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 ),
                 "options": ["manual_fix", "retry_cycle"],
             }
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
 
     from api.routes_supervisor import _run_qc_for_subproject
@@ -14304,7 +15999,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                     f"Cannot start QA from Supervisor state {machine.state}"
                 )
             state["status"] = "pre_qa_verifying"
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             try:
                 pre_qa = await asyncio.to_thread(
                     _execute_phase_pre_qa, ctx, phase_id,
@@ -14397,7 +16092,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                             },
                         )
                     _store_supervisor_quality_machine(ctx, phase_id, machine, state)
-                    await _persist_all_async()
+                    await persist_quality_checkpoint()
                     continue
                 category = str(pre_qa.get("failure_category") or "pre_qa_failed")
                 diagnostic = "; ".join(
@@ -14453,17 +16148,8 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 state["running"] = False
                 state["status"] = category
                 _store_supervisor_quality_machine(ctx, phase_id, machine, state)
-                await _persist_all_async()
+                await persist_quality_checkpoint()
                 return
-            machine.record_evidence(
-                kind="pre_qa",
-                command=f"deterministic-pre-qa --phase {phase_id}",
-                exit_code=0,
-                passed=True,
-                log=f"Pre-QA passed with {len(pre_qa.get('evidence') or [])} evidence records",
-                step_id=f"pre-qa:summary:{compute_workspace_digest(Path(ctx.workspace))}",
-                metadata={"result": "passed"},
-            )
             scope_snapshot = _supervisor_scope_snapshot(ctx, phase_id)
             previous_round = machine.active_round
             issue_baseline = (
@@ -14488,7 +16174,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 "message": str(exc),
                 "options": ["manual_fix", "rebuild_phase"],
             }
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
         state["lifetime_qc_runs"] = int(state.get("lifetime_qc_runs", state.get("total_rounds", 0)) or 0) + 1
         state["total_rounds"] = state["lifetime_qc_runs"]
@@ -14499,7 +16185,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
             "ts": time.time(),
         })
         state["status"] = "checking"
-        await _persist_all_async()
+        await persist_quality_checkpoint()
 
         # ── 1. 质检 ───────────────────────────────────────────
         try:
@@ -14543,7 +16229,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                         phase["status"] = "model_failed"
                         phase.pop("completed_at", None)
                         break
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
         # LLM reviewers occasionally emit an ``error`` record whose own
         # guidance says no change is required. Treat that as an observation,
@@ -14599,7 +16285,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 "content": state["action_required"]["message"],
                 "ts": time.time(),
             })
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
         if reviewer_error and (
             entry.get("reviewer_unavailable")
@@ -14631,7 +16317,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 phase["review_passed"] = False
                 phase["status"] = "model_failed"
                 phase.pop("completed_at", None)
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
 
         blocking_details = _blocking_issue_details(entry)
@@ -14673,8 +16359,23 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 "content": f"质检未生成可定位文件问题，正在同轮重试一次：{diagnostic}",
                 "ts": time.time(),
             })
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             continue
+        if machine.state == "blocked":
+            # A manual correction after the automatic-round limit may produce
+            # a clean QC result while the durable machine still carries the
+            # previous blocked terminal.  Bind that clean result to a fresh
+            # manual verification round instead of rejecting the valid result.
+            machine.resume_after_manual_fix()
+            current_scope = _supervisor_scope_snapshot(ctx, phase_id)
+            machine.start_qa_round(
+                current_scope,
+                issue_snapshot=[],
+                qa_round_id=(
+                    f"{machine.to_dict().get('run_id')}:manual-"
+                    f"{int(time.time() * 1000)}"
+                ),
+            )
         machine.record_evidence(
             kind="qa",
             command=(
@@ -14731,7 +16432,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                     restored_phase["review_passed"] = False
                     restored_phase["rebuild_comparison"] = copy.deepcopy(comparison)
                     restored_phase["rebuild_rollback"] = copy.deepcopy(rollback)
-                await _persist_all_async()
+                await persist_quality_checkpoint()
                 return
             if comparison["status"] == "converged":
                 state["rebuild_comparison_pending"] = False
@@ -14785,7 +16486,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 phase["status"] = "qa_blocked"
                 phase["reviewed"] = True
                 phase["review_passed"] = False
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
 
         actionable_blockers = [
@@ -14831,6 +16532,14 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                     for issue in blocking_details
                     if _auto_repair_issue_key(issue) in new_blocker_keys
                 ]
+                state["repair_feedback"] = {
+                    "reason": "repair_regression" if regressed else "repair_no_progress",
+                    "new_blockers": new_messages[:10],
+                    "instruction": (
+                        "The previous repair was rolled back. Reproduce the original "
+                        "issue from the restored baseline and avoid the listed regression."
+                    ),
+                }
                 regression_detail = "；新增阻断：" + "；".join(new_messages[:3]) if new_messages else ""
                 state["action_required"] = {
                     "round": state.get("round", 0),
@@ -14840,7 +16549,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                         if regressed else
                         "返修后阻断问题没有减少，已回滚本轮文件并停止自动修改。"
                     ),
-                    "options": ["manual_fix", "rebuild_phase"],
+                    "options": ["retry_cycle", "manual_fix", "rebuild_phase"],
                 }
                 state["messages"].append({
                     "role": "system",
@@ -14859,7 +16568,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                         blocking_details,
                     )
                     _store_supervisor_quality_machine(ctx, phase_id, machine, state)
-                await _persist_all_async()
+                await persist_quality_checkpoint()
                 return
             pending_snapshot = None
             pending_metadata_snapshot = None
@@ -14891,7 +16600,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 phase["review_passed"] = False
                 phase["status"] = "needs_rework"
                 phase.pop("completed_at", None)
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
 
         manual_blockers = [
@@ -14907,7 +16616,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 "message": "剩余阻断问题需要人工处理，不再重复派发给工程师。",
                 "options": ["manual_fix", "rebuild_phase"],
             }
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
         if not passed and not blocking_details:
             # A failed QA result without an actionable blocker is not a repair
@@ -14938,7 +16647,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 phase["review_passed"] = False
                 phase["status"] = "qa_blocked"
                 phase.pop("completed_at", None)
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
         if not passed and blocking_details and not actionable_blockers:
             diagnostic = "; ".join(
@@ -14955,7 +16664,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                     ),
                     "ts": time.time(),
                 })
-                await _persist_all_async()
+                await persist_quality_checkpoint()
                 continue
             state["running"] = False
             state["status"] = "qa_blocked"
@@ -14979,12 +16688,30 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                         phase["status"] = "qa_blocked"
                         phase.pop("completed_at", None)
                         break
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
 
         if passed and machine.state == "completed":
+            handoff_issues = [
+                issue for issue in (entry.get("issues_detail") or [])
+                if str(issue.get("status") or "").lower() == "needs_manual"
+            ]
             state["running"] = False
-            state["status"] = "passed"
+            state["status"] = "passed_with_handoff" if handoff_issues else "passed"
+            state["needs_manual"] = bool(handoff_issues)
+            state["issue_report"] = _auto_repair_issue_report(entry)
+            state["action_required"] = (
+                {
+                    "round": round_num,
+                    "message": (
+                        f"Quality inspection completed; {len(handoff_issues)} unresolved "
+                        "issue(s) were transferred to the full-stack engineer"
+                    ),
+                    "options": ["manual_fix"],
+                    "handoff_count": len(handoff_issues),
+                }
+                if handoff_issues else None
+            )
             state["messages"].append({
                 "role": "system",
                 "content": (
@@ -15006,7 +16733,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                             break
             except Exception:
                 pass
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
 
         # ── 检查是否超过总轮次 ────────────────────────────────
@@ -15041,7 +16768,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 ),
                 "ts": time.time(),
             })
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
 
         # ── 2. 等待 Agent 实际完成修复后再进行下一轮质检 ──────
@@ -15071,7 +16798,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                         phase["status"] = "needs_rework"
                         phase["review_passed"] = False
                         break
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             repair_batch = await _repair_all_issue_owners(
                 project_id, phase_id, repair_round_num, entry, state, rewrite_mode,
                 _auto_repair_api_configs.get(key),
@@ -15119,8 +16846,9 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                         blocking_details,
                     )
                     _store_supervisor_quality_machine(ctx, phase_id, machine, state)
-                await _persist_all_async()
+                await persist_quality_checkpoint()
                 return
+            state.pop("repair_feedback", None)
             # A successful repair batch is the engineer-completion checkpoint.
             # Re-enter verification only after all critical repair owners have
             # reached a succeeded state and a fresh workspace digest is bound.
@@ -15161,7 +16889,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
             if machine.state != "blocked":
                 machine.block(str(exc), [str(exc)])
                 _store_supervisor_quality_machine(ctx, phase_id, machine, state)
-            await _persist_all_async()
+            await persist_quality_checkpoint()
             return
         state["status"] = "rechecking"
         state["messages"].append({
@@ -15175,7 +16903,7 @@ async def _run_auto_repair_loop(project_id: str, phase_id: str, rewrite_mode: bo
                 if phase.get("phase_id") == phase_id:
                     phase["status"] = "reviewing"
                     break
-        await _persist_all_async()
+        await persist_quality_checkpoint()
         await asyncio.sleep(1.0)
         continue
 

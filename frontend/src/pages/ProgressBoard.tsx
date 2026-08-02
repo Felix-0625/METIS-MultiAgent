@@ -10,7 +10,7 @@
 import React, { useEffect, useState, useRef } from 'react';
 import {
   Card, Table, Tag, Progress, Statistic, Row, Col, Button, Spin, Empty,
-  Tooltip, List, Alert, Badge, Collapse, Modal, message,
+  Tooltip, List, Alert, Collapse, Modal, message,
 } from 'antd';
 import {
   CheckCircleOutlined, ClockCircleOutlined, ExclamationCircleOutlined,
@@ -35,12 +35,30 @@ const statusConfig: Record<string, { color: string; text: string }> = {
   failed:      { color: 'error',      text: '失败'   },
 };
 
+type AgentDisplayState = 'waiting' | 'executing' | 'completed' | 'failed';
+
+const normalizeAgentState = (value?: string): AgentDisplayState => {
+  const status = String(value || '').toLowerCase();
+  if (['completed', 'succeeded', 'success', 'done'].includes(status)) return 'completed';
+  if (['failed', 'error', 'blocked', 'cancelled', 'canceled', 'timeout'].includes(status)) return 'failed';
+  if (['working', 'running', 'in_progress', 'executing', 'fixing', 're_checking'].includes(status)) return 'executing';
+  return 'waiting';
+};
+
+const agentStateMeta: Record<AgentDisplayState, { color: string; text: string }> = {
+  waiting: { color: 'default', text: '等待' },
+  executing: { color: 'blue', text: '执行中' },
+  completed: { color: 'success', text: '已完成' },
+  failed: { color: 'error', text: '失败' },
+};
+
 const ProgressBoard: React.FC = () => {
   const { id: projectId } = useParams<{ id: string }>();
   const navigate = useNavigate();
   const [loading, setLoading] = useState(false);
   const [project, setProject] = useState<any>(null);
   const [tasks, setTasks] = useState<any[]>([]);
+  const [phases, setPhases] = useState<any[]>([]);
   const [supervisorLog, setSupervisorLog] = useState<string>('');
   // 每个 agent 的执行状态（含 output_files）
   const [agentStatuses, setAgentStatuses] = useState<Record<string, any>>({});
@@ -53,14 +71,16 @@ const ProgressBoard: React.FC = () => {
     if (!projectId) return;
     if (showLoading) setLoading(true);
     try {
-      const [projectData, taskData, fileData] = await Promise.all([
+      const [projectData, taskData, fileData, phaseData] = await Promise.all([
         apiClient.get(`/projects/${projectId}`),
         apiClient.get(`/projects/${projectId}/tasks/list`).catch(() => ({ tasks: [] })),
         apiClient.get(`/projects/${projectId}/files`).catch(() => ({ tree: [] })),
+        apiClient.get(`/projects/${projectId}/phases`).catch(() => ({ phases: [] })),
       ]);
       setProject(projectData);
       setTasks((taskData as any).tasks || []);
       setFileTree((fileData as any).tree || []);
+      setPhases((phaseData as any).phases || []);
 
       // 拉取每个 agent 的执行状态
       const agents: Record<string, any> = (projectData as any).agents || {};
@@ -107,14 +127,43 @@ const ProgressBoard: React.FC = () => {
     return () => { if (intervalRef.current) clearInterval(intervalRef.current); };
   }, [projectId, project?.status]);
 
-  const subprojects: any[] = project?.subprojects || [];
+  const subprojects: any[] = Array.from(
+    new Map(
+      (project?.subprojects || []).map((task: any) => [String(task.id || ''), task]),
+    ).values(),
+  );
   const agents: Record<string, any> = project?.agents || {};
+  const phaseIds = new Set(
+    phases.map(phase => String(phase.phase_id || phase.id || '')),
+  );
+  // phase-1/phase-2 等记录是阶段容器，只负责分组，不是需要分配专家的任务。
+  const workItems = subprojects.filter(task => {
+    const taskId = String(task.id || '');
+    const phaseId = String(task.phase_id || '');
+    return !(taskId === phaseId && phaseIds.has(taskId));
+  }).map(task => {
+    const execStatus = task.agent_id ? agentStatuses[task.agent_id] : undefined;
+    const agent = task.agent_id ? agents[task.agent_id] : undefined;
+    const authoritativeStatus = execStatus?.status || agent?.status || task.status;
+    const displayState = normalizeAgentState(authoritativeStatus);
+    const progress = execStatus?.progress !== undefined
+      ? Number(execStatus.progress)
+      : agent?.progress !== undefined
+        ? Number(agent.progress)
+        : Number(task.progress || 0);
+    return {
+      ...task,
+      status: displayState === 'executing' ? 'in_progress' : displayState === 'waiting' ? 'pending' : displayState,
+      progress: displayState === 'completed' ? 100 : Math.max(0, Math.min(progress, 99)),
+      _agentDisplayState: displayState,
+    };
+  });
 
-  const total = subprojects.length;
-  const completed = subprojects.filter(s => s.status === 'completed').length;
-  const inProgress = subprojects.filter(s => ['in_progress', 'executing'].includes(s.status)).length;
-  const failed = subprojects.filter(s => s.status === 'failed').length;
-  const failedDetails = subprojects
+  const total = workItems.length;
+  const completed = workItems.filter(s => s.status === 'completed').length;
+  const inProgress = workItems.filter(s => ['in_progress', 'executing'].includes(s.status)).length;
+  const failed = workItems.filter(s => s.status === 'failed').length;
+  const failedDetails = workItems
     .filter(s => s.status === 'failed')
     .map(s => {
       const agentStatus = s.agent_id ? agentStatuses[s.agent_id] : undefined;
@@ -122,8 +171,40 @@ const ProgressBoard: React.FC = () => {
       return `${s.name || s.id}: ${reason || '未返回具体错误，请查看执行日志'}`;
     });
   const overallProgress = total > 0
-    ? Math.round(subprojects.reduce((acc, s) => acc + (s.progress || 0), 0) / total)
+    ? Math.round(workItems.reduce((acc, s) => acc + (s.progress || 0), 0) / total)
     : 0;
+  const phaseGroups = (() => {
+    const known = phases.map((phase, index) => ({
+      id: String(phase.phase_id || phase.id || `phase-${index + 1}`),
+      name: phase.name || `阶段 ${index + 1}`,
+      status: String(phase.status || 'pending'),
+      order: index,
+    }));
+    const knownIds = new Set(known.map(phase => phase.id));
+    const unknownIds = [...new Set(
+      workItems.map(task => String(task.phase_id || 'unassigned')),
+    )].filter(id => !knownIds.has(id));
+    return [
+      ...known,
+      ...unknownIds.map((id, index) => ({
+        id,
+        name: id === 'unassigned' ? '未分配阶段' : id,
+        status: 'pending',
+        order: known.length + index,
+      })),
+    ].map(phase => {
+      const phaseTasks = workItems.filter(
+        task => String(task.phase_id || 'unassigned') === phase.id,
+      );
+      const done = phaseTasks.filter(
+        task => task.status === 'completed' || Number(task.progress || 0) >= 100,
+      ).length;
+      const progress = phaseTasks.length
+        ? Math.round(phaseTasks.reduce((sum, task) => sum + Number(task.progress || 0), 0) / phaseTasks.length)
+        : 0;
+      return { ...phase, tasks: phaseTasks, done, progress };
+    }).filter(phase => phase.tasks.length > 0 || phase.id !== 'unassigned');
+  })();
 
   // 子项目全部完成时弹出提示（只弹一次）
   useEffect(() => {
@@ -191,8 +272,10 @@ const ProgressBoard: React.FC = () => {
     },
     {
       title: '状态', dataIndex: 'status', key: 'status', width: 100,
-      render: (status: string) => {
-        const cfg = statusConfig[status] || statusConfig['pending'];
+      render: (status: string, record: any) => {
+        const state = (record._agentDisplayState || normalizeAgentState(status)) as AgentDisplayState;
+        const meta = agentStateMeta[state];
+        const cfg = { color: meta.color, text: meta.text };
         return <Tag color={cfg.color}>{cfg.text}</Tag>;
       },
     },
@@ -206,16 +289,10 @@ const ProgressBoard: React.FC = () => {
       title: '负责 Agent', dataIndex: 'agent_id', key: 'agent_id', width: 140,
       render: (agentId: string) => {
         const agent = agents[agentId];
-        const execStatus = agentStatuses[agentId];
-        const status = execStatus?.status || agent?.status || 'idle';
         if (!agent) return <span className="text-gray-400 text-xs">未分配</span>;
         return (
           <div>
             <div className="text-xs font-medium">{agent.role}</div>
-            <Badge
-              status={status === 'working' ? 'processing' : status === 'completed' ? 'success' : status === 'failed' ? 'error' : 'default'}
-              text={<span className="text-xs">{status === 'working' ? '执行中' : status === 'completed' ? '完成' : status === 'failed' ? '失败' : '待机'}</span>}
-            />
           </div>
         );
       },
@@ -357,16 +434,42 @@ const ProgressBoard: React.FC = () => {
           {subprojects.length === 0 ? (
             <Empty description="暂无子项目，请先与 PM Agent 完成规划并点击「启动项目 →」" />
           ) : (
-            <Table
-              dataSource={subprojects}
-              columns={columns}
-              rowKey="id"
-              pagination={false}
+            <Collapse
+              key={phaseGroups.map(phase => phase.id).join('|')}
+              defaultActiveKey={phaseGroups
+                .filter(phase => phase.status !== 'completed')
+                .map(phase => phase.id)}
               size="small"
-              expandable={{
+            >
+              {phaseGroups.map(phase => (
+                <Panel
+                  key={phase.id}
+                  header={(
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12, width: '100%' }}>
+                      <strong style={{ minWidth: 220 }}>{phase.name}</strong>
+                      <Tag color={phase.status === 'completed' ? 'success' : 'processing'}>
+                        {phase.done}/{phase.tasks.length} 已完成
+                      </Tag>
+                      <Progress
+                        percent={phase.progress}
+                        size="small"
+                        style={{ maxWidth: 260, margin: 0 }}
+                      />
+                    </div>
+                  )}
+                >
+                  <Table
+                    dataSource={phase.tasks}
+                    columns={columns}
+                    rowKey="id"
+                    pagination={false}
+                    size="small"
+                    expandable={{
                 expandedRowRender: (record: any) => {
                   const agent = agents[record.agent_id];
                   const execStatus = agentStatuses[record.agent_id];
+                  const state = normalizeAgentState(execStatus?.status || agent?.status || record.status);
+                  const meta = agentStateMeta[state];
                   const outputFiles = getOutputFiles(record.agent_id);
                   const logs: string[] = execStatus?.logs || [];
                   const summary: string = execStatus?.summary || '';
@@ -375,9 +478,9 @@ const ProgressBoard: React.FC = () => {
                       {/* Agent 信息 */}
                       <div className="flex items-center gap-2">
                         <span className="text-sm font-medium">负责 Agent：{agent?.role || '未分配'}</span>
-                        {execStatus?.status && (
-                          <Tag color={execStatus.status === 'completed' ? 'success' : execStatus.status === 'working' ? 'blue' : execStatus.status === 'failed' ? 'error' : 'default'}>
-                            {execStatus.status === 'completed' ? '✅ 已完成' : execStatus.status === 'working' ? '⏳ 执行中' : execStatus.status === 'failed' ? '❌ 失败' : execStatus.status}
+                        {(execStatus?.status || agent?.status) && (
+                          <Tag color={meta.color}>
+                            {meta.text}
                           </Tag>
                         )}
                         {execStatus?.progress !== undefined && execStatus.progress > 0 ? (
@@ -450,8 +553,11 @@ const ProgressBoard: React.FC = () => {
                     </div>
                   );
                 },
-              }}
-            />
+                    }}
+                  />
+                </Panel>
+              ))}
+            </Collapse>
           )}
         </Card>
 

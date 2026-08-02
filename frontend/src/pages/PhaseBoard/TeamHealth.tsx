@@ -120,6 +120,14 @@ const TeamHealth: React.FC = () => {
   });
 
   const disconnectedExperts = teamData?.execution_layer.filter(e => e.locks.some(l => isDisconnected(l))) || [];
+  const activeQcDimensions = qcDimensions.filter(dim => qcStats[dim].total > 0);
+  const qualityMetrics = projectMetrics?.quality || {};
+  const efficiencyMetrics = projectMetrics?.efficiency || {};
+  const executedQcTotal = activeQcDimensions.reduce((sum, dim) => sum + qcStats[dim].total, 0);
+  const executedQcPassed = activeQcDimensions.reduce((sum, dim) => sum + qcStats[dim].passed, 0);
+  const executedQcScore = executedQcTotal > 0
+    ? Math.round(activeQcDimensions.reduce((sum, dim) => sum + qcStats[dim].avgScore * qcStats[dim].total, 0) / executedQcTotal)
+    : 0;
 
   return (
     <div className="space-y-4">
@@ -153,16 +161,19 @@ const TeamHealth: React.FC = () => {
           </div>
           <Row gutter={[12, 12]}>
             <Col xs={12} sm={12} md={6}>
-              <Card size="small" hoverable><Statistic title="质量总问题数" value={projectMetrics.issues?.total || 0} valueStyle={{ color: projectMetrics.issues?.total > 0 ? '#ff4d4f' : '#52c41a' }} prefix={<BarChartOutlined />} /></Card>
+              <Card size="small" hoverable><Statistic title="质量总问题数" value={qualityMetrics.total_issues || 0} valueStyle={{ color: qualityMetrics.total_issues > 0 ? '#ff4d4f' : '#52c41a' }} prefix={<BarChartOutlined />} /></Card>
             </Col>
             <Col xs={12} sm={12} md={6}>
-              <Card size="small" hoverable><Statistic title="质量修复循环" value={projectMetrics.qc_fix_cycles_by_phase ? (Object.values(projectMetrics.qc_fix_cycles_by_phase) as number[]).reduce((a, b) => a + b, 0) : 0} valueStyle={{ color: '#fa8c16' }} prefix={<ReloadOutlined />} suffix="次" /></Card>
+              <Card size="small" hoverable><Statistic title="质量修复循环" value={efficiencyMetrics.qc_fix_cycles_by_phase ? (Object.values(efficiencyMetrics.qc_fix_cycles_by_phase) as number[]).reduce((a, b) => a + b, 0) : 0} valueStyle={{ color: '#fa8c16' }} prefix={<ReloadOutlined />} suffix="次" /></Card>
             </Col>
             <Col xs={12} sm={12} md={6}>
-              <Card size="small" hoverable><Statistic title="人工介入次数" value={projectMetrics.manual_interventions || 0} valueStyle={{ color: projectMetrics.manual_interventions > 0 ? '#ff4d4f' : '#52c41a' }} prefix={<UserOutlined />} suffix="次" /></Card>
+              <Card size="small" hoverable><Statistic title="阶段一次性通过率" value={qualityMetrics.first_pass_rate != null ? Math.round(qualityMetrics.first_pass_rate * 100) : 0} valueStyle={{ color: (qualityMetrics.first_pass_rate || 0) >= 0.8 ? '#52c41a' : '#fa8c16' }} prefix={qualityMetrics.first_pass_rate >= 0.8 ? <RiseOutlined /> : <FallOutlined />} suffix="%" /></Card>
             </Col>
             <Col xs={12} sm={12} md={6}>
-              <Card size="small" hoverable><Statistic title="阶段一次性通过率" value={projectMetrics.first_pass_rate != null ? Math.round(projectMetrics.first_pass_rate * 100) : 0} valueStyle={{ color: (projectMetrics.first_pass_rate || 0) >= 0.8 ? '#52c41a' : '#fa8c16' }} prefix={projectMetrics.first_pass_rate >= 0.8 ? <RiseOutlined /> : <FallOutlined />} suffix="%" /></Card>
+              <Card size="small" hoverable>
+                <Statistic title="已执行质检" value={executedQcScore} valueStyle={{ color: executedQcScore >= 80 ? '#52c41a' : '#fa8c16' }} prefix={<AimOutlined />} suffix="分" />
+                <div style={{ fontSize: 11, color: '#8c8c8c', marginTop: 4 }}>{executedQcPassed}/{executedQcTotal} 项通过</div>
+              </Card>
             </Col>
           </Row>
         </Card>
@@ -218,32 +229,6 @@ const TeamHealth: React.FC = () => {
         )}
       </Card>
 
-      {/* 四层质检维度统计 (如有数据) */}
-      {qcResultsSummary?.subprojects?.length > 0 && (
-        <Card size="small" title={<span><AimOutlined style={{ marginRight: 8 }} />四层质检维度统计</span>} style={{ borderRadius: 8 }}>
-          <Row gutter={[8, 8]}>
-            {qcDimensions.map(dim => {
-              const stat = qcStats[dim];
-              return (
-                <Col xs={12} sm={12} md={6} key={dim}>
-                  <Card size="small" style={{ textAlign: 'center', background: stat.total > 0 ? '#fafafa' : '#f5f5f5' }}>
-                    <div style={{ fontSize: 20, color: qcDimColors[dim], marginBottom: 4 }}>{qcDimIcons[dim]}</div>
-                    <div style={{ fontSize: 11, fontWeight: 600, marginBottom: 4 }}>{qcDimLabels[dim]}</div>
-                    {stat.total > 0 ? (
-                      <>
-                        <div style={{ fontSize: 18, fontWeight: 700, color: stat.avgScore >= 80 ? '#52c41a' : '#ff4d4f' }}>{stat.avgScore}分</div>
-                        <div style={{ fontSize: 10, color: '#8c8c8c', marginTop: 2 }}>{stat.passed}/{stat.total} 通过</div>
-                      </>
-                    ) : (
-                      <Tag color="default" style={{ fontSize: 10 }}>未触发</Tag>
-                    )}
-                  </Card>
-                </Col>
-              );
-            })}
-          </Row>
-        </Card>
-      )}
     </div>
   );
 };

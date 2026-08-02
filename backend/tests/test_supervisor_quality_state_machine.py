@@ -18,6 +18,9 @@ from core.supervisor_quality_state import (
 
 
 SCOPE = {
+    "project_id": "project-1",
+    "phase_id": "phase-1",
+    "phase_generation_id": "generation-1",
     "scope_digest": "scope-v1",
     "artifact_digest": "artifact-v1",
     "tests": ["pytest -q"],
@@ -167,6 +170,81 @@ def test_qa_scope_must_match_the_scope_locked_at_run_start() -> None:
             issue_snapshot=[],
             qa_round_id="qa-scope-bypass",
         )
+
+
+@pytest.mark.parametrize("pre_qa_metadata", [
+    {},
+    {"scope_digest": "scope-v1", "artifact_digest": "artifact-old"},
+    {"scope_digest": "scope-old", "artifact_digest": "artifact-v1"},
+    {
+        "project_id": "project-1",
+        "phase_id": "phase-1",
+        "phase_generation_id": "generation-old",
+        "scope_digest": "scope-v1",
+        "artifact_digest": "artifact-v1",
+    },
+])
+def test_pre_qa_evidence_must_bind_locked_scope(pre_qa_metadata: dict) -> None:
+    machine = SupervisorQualityMachine()
+    machine.start_run(
+        scope=copy.deepcopy(SCOPE),
+        idempotency_key="scoped-pre-qa",
+        dependencies_ready=True,
+        run_id="run-scoped-pre-qa",
+        required_evidence_kinds=["qa"],
+        required_pre_qa_evidence_kinds=["scope", "pre_qa"],
+    )
+    _finish_engineering(machine)
+    machine.start_verification()
+    for kind, metadata in (("scope", copy.deepcopy(SCOPE)), ("pre_qa", pre_qa_metadata)):
+        machine.record_evidence(
+            step_id=f"pre-{kind}",
+            kind=kind,
+            command=f"verify-{kind}",
+            exit_code=0,
+            passed=True,
+            log=f"{kind} passed",
+            metadata=metadata,
+        )
+
+    with pytest.raises(IllegalQualityTransition, match="scoped verification evidence"):
+        machine.start_qa_round(
+            scope_snapshot=copy.deepcopy(SCOPE),
+            issue_snapshot=[],
+            qa_round_id="qa-forged-pre-qa",
+        )
+
+
+def test_scoped_pre_qa_evidence_allows_qa_round() -> None:
+    machine = SupervisorQualityMachine()
+    machine.start_run(
+        scope=copy.deepcopy(SCOPE),
+        idempotency_key="valid-scoped-pre-qa",
+        dependencies_ready=True,
+        run_id="run-valid-scoped-pre-qa",
+        required_evidence_kinds=["qa"],
+        required_pre_qa_evidence_kinds=["scope", "pre_qa"],
+    )
+    _finish_engineering(machine)
+    machine.start_verification()
+    for kind in ("scope", "pre_qa"):
+        machine.record_evidence(
+            step_id=f"valid-{kind}",
+            kind=kind,
+            command=f"verify-{kind}",
+            exit_code=0,
+            passed=True,
+            log=f"{kind} passed",
+            metadata=copy.deepcopy(SCOPE),
+        )
+
+    machine.start_qa_round(
+        scope_snapshot=copy.deepcopy(SCOPE),
+        issue_snapshot=[],
+        qa_round_id="qa-valid-pre-qa",
+    )
+
+    assert machine.to_dict()["state"] == "qa_running"
 
 
 @pytest.mark.parametrize("status", ["pending", "running", "failed", "timeout", "blocked", "cancelled"])

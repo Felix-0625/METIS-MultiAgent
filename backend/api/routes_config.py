@@ -3,6 +3,7 @@ import asyncio
 import time
 import json
 import logging
+import threading
 from pathlib import Path
 from fastapi import APIRouter, HTTPException, UploadFile, File, Form, Depends
 from typing import Optional, List, Dict, Any
@@ -59,6 +60,13 @@ from models.schemas import (
 router = APIRouter(tags=["config"])
 
 _ROLE_TEMPERATURE_DEFAULTS = {"generator": 0.1, "reviewer": 0.0}
+_user_config_locks: Dict[str, threading.Lock] = {}
+_user_config_locks_guard = threading.Lock()
+
+
+def _user_config_lock(user_id: str) -> threading.Lock:
+    with _user_config_locks_guard:
+        return _user_config_locks.setdefault(user_id, threading.Lock())
 
 
 def _get_user_api_config(user_id: str) -> Dict[str, Any]:
@@ -165,7 +173,15 @@ async def test_api_connection(current_user: UserModel = Depends(get_current_user
             Message(role=MessageRole.USER, content="reply with the single word: ok")
         ])
         latency = int((_time.monotonic() - t0) * 1000)
-        content = _safe_api_message(resp.get("content", ""), test_key)
+        raw_content = resp.get("content") if isinstance(resp, dict) else None
+        if not isinstance(raw_content, str) or not raw_content.strip():
+            return {
+                "success": False,
+                "latency_ms": latency,
+                "model": user_cfg.get("model", ""),
+                "message": "API 返回格式无效",
+            }
+        content = _safe_api_message(raw_content, test_key)
         if content.startswith("⚠️") or content.startswith("❌"):
             return {"success": False, "latency_ms": latency, "model": user_cfg.get("model", ""), "message": content}
         return {"success": True, "latency_ms": latency, "model": user_cfg.get("model", ""), "message": f"连接成功，响应：{content[:60]}"}
@@ -184,6 +200,19 @@ async def update_default_api_config(
     request: DefaultApiConfigRequest,
     current_user: UserModel = Depends(get_current_user),
 ):
+    _get_user_api_config(current_user.user_id)
+    lock = _user_config_lock(current_user.user_id)
+    await asyncio.to_thread(lock.acquire)
+    try:
+        return await _update_default_api_config_locked(request, current_user)
+    finally:
+        lock.release()
+
+
+async def _update_default_api_config_locked(
+    request: DefaultApiConfigRequest,
+    current_user: UserModel,
+):
     """
     更新当前用户的 API 配置（按 user_id 独立隔离）。
     保存后只有当前用户的 Agent 调用使用这个配置，不影响其他用户。
@@ -192,7 +221,7 @@ async def update_default_api_config(
 
     # 获取或创建用户配置
     user_cfg = dict(
-        _get_user_api_config(user_id)
+        user_api_configs.get(user_id)
         or DEFAULT_API_CONFIG
     )
 
@@ -224,11 +253,19 @@ async def update_default_api_config(
     user_cfg.setdefault("temperature", DEFAULT_API_CONFIG["temperature"])
 
     user_cfg = _normalize_api_config(user_cfg)
+    user_cfg["revision"] = int(user_cfg.get("revision") or 0) + 1
 
     previous_cfg = user_api_configs.get(user_id)
     user_api_configs[user_id] = user_cfg
     try:
         await _persist_all_async()
+    except TimeoutError:
+        logger.warning(
+            "User API configuration commit acknowledgement was lost user=%s revision=%s",
+            user_id,
+            user_cfg["revision"],
+        )
+        raise
     except Exception:
         # Do not leave a configuration active only in memory when the API
         # reports that saving failed.  That made "save failed" immediately
@@ -247,5 +284,6 @@ async def update_default_api_config(
         "api_base": user_cfg["api_base"],
         "generator": user_cfg["generator"],
         "reviewer": user_cfg["reviewer"],
+        "revision": user_cfg["revision"],
         "message": f"你的 API 配置已更新为 {user_cfg['model']}，仅对你生效"
     }
